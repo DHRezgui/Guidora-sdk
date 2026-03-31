@@ -4,6 +4,7 @@ export * from './useFrictionScore';
 export * from './useOnboarding';
 export * from './useOnboardingDebug';
 export * from './useOnboardingSession';
+export * from './useRealtimeToursSync';
 export * from './useTour';
 export * from './useTourProgress';
 export * from './useTourTargetResolver';

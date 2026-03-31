@@ -69,3 +69,39 @@ Notes:
 
 - Si le dashboard ne prend pas les changements, relancer `npm run build` dans le SDK.
 - En cas de cache Next.js, redemarrer le serveur du dashboard.
+
+## Integration API backend et synchro temps reel
+
+Le SDK integre maintenant:
+
+- Recuperation des tours actifs via `GET /tours/active/url`.
+- Tracking unitaire via `POST /tracking/events`.
+- Tracking batch via `POST /tracking/events/batch`.
+- Flush best-effort a la fermeture de page via `fetch(..., { keepalive: true })`.
+- Synchronisation temps reel par polling + focus + reconnexion reseau.
+
+### Options SDK recommandees
+
+```ts
+initSDK({
+  apiKey: 'your-api-key',
+  apiUrl: 'http://localhost:3002/api/v1',
+  sdkToken: 'optional-jwt',
+
+  // Tracking
+  trackBatchSize: 20,
+  trackFlushIntervalMs: 5000,
+
+  // Realtime sync tours
+  syncEnabled: true,
+  syncIntervalMs: 15000,
+  syncOnFocus: true,
+  syncOnReconnect: true,
+});
+```
+
+### Hook realtime exporte
+
+```ts
+import { useRealtimeToursSync } from '@trustdev/onboarding-sdk-react';
+```

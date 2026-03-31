@@ -30,6 +30,10 @@ export interface SDKConfig {
   debug?: boolean;
   trackBatchSize?: number;
   trackFlushIntervalMs?: number;
+  syncEnabled?: boolean;
+  syncIntervalMs?: number;
+  syncOnFocus?: boolean;
+  syncOnReconnect?: boolean;
 }
 
 export interface NormalizedSDKConfig {
@@ -42,6 +46,10 @@ export interface NormalizedSDKConfig {
   debug: boolean;
   trackBatchSize: number;
   trackFlushIntervalMs: number;
+  syncEnabled: boolean;
+  syncIntervalMs: number;
+  syncOnFocus: boolean;
+  syncOnReconnect: boolean;
 }
 
 export interface SDKInitResult {

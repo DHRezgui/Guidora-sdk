@@ -20,6 +20,10 @@ function normalizeConfig(config: SDKConfig): NormalizedSDKConfig {
     debug: config.debug ?? false,
     trackBatchSize: config.trackBatchSize ?? 20,
     trackFlushIntervalMs: config.trackFlushIntervalMs ?? 5000,
+    syncEnabled: config.syncEnabled ?? true,
+    syncIntervalMs: config.syncIntervalMs ?? 15000,
+    syncOnFocus: config.syncOnFocus ?? true,
+    syncOnReconnect: config.syncOnReconnect ?? true,
   };
 }
 

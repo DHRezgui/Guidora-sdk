@@ -15,11 +15,7 @@ function buildHeaders(config: NormalizedSDKConfig): Record<string, string> {
   return headers;
 }
 
-async function request<T>(
-  config: NormalizedSDKConfig,
-  path: string,
-  init?: RequestInit,
-): Promise<T> {
+async function request<T>(config: NormalizedSDKConfig, path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${config.apiUrl}${path}`, {
     ...init,
     headers: {
@@ -33,7 +29,38 @@ async function request<T>(
     throw new Error(`[TrustDev SDK] API ${response.status}: ${text || response.statusText}`);
   }
 
+  if (response.status === 204) {
+    return {} as T;
+  }
+
   return (await response.json()) as T;
+}
+
+function sendKeepaliveBatch(config: NormalizedSDKConfig, events: TrackEventInput[]): void {
+  const body = JSON.stringify({ events });
+
+  if (typeof window === 'undefined') return;
+
+  if (typeof fetch === 'function') {
+    void fetch(`${config.apiUrl}/tracking/events/batch`, {
+      method: 'POST',
+      headers: buildHeaders(config),
+      body,
+      keepalive: true,
+    }).catch(() => {
+      // Fallback best effort when keepalive fails.
+      if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+        const blob = new Blob([body], { type: 'application/json' });
+        navigator.sendBeacon(`${config.apiUrl}/tracking/events/batch`, blob);
+      }
+    });
+    return;
+  }
+
+  if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+    const blob = new Blob([body], { type: 'application/json' });
+    navigator.sendBeacon(`${config.apiUrl}/tracking/events/batch`, blob);
+  }
 }
 
 export const sdkApiClient = {
@@ -54,5 +81,9 @@ export const sdkApiClient = {
       method: 'POST',
       body: JSON.stringify({ events }),
     });
+  },
+
+  trackBatchKeepalive(config: NormalizedSDKConfig, events: TrackEventInput[]): void {
+    sendKeepaliveBatch(config, events);
   },
 };

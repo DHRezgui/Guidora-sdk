@@ -17,29 +17,39 @@ export function useTrackBatch(config?: Partial<SDKConfig>): UseTrackBatchResult 
   const [isFlushing, setIsFlushing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const flushInternal = useCallback(
+    async (suppressError = false): Promise<TrackBatchResponse | null> => {
+      if (queueRef.current.length === 0 || isFlushing) return null;
+
+      setIsFlushing(true);
+      if (!suppressError) setError(null);
+
+      const batch = [...queueRef.current];
+      queueRef.current = [];
+      setPendingCount(0);
+
+      try {
+        const resolved = resolveSDKConfig(config);
+        return await sdkApiClient.trackBatch(resolved, batch);
+      } catch (err) {
+        queueRef.current = [...batch, ...queueRef.current];
+        setPendingCount(queueRef.current.length);
+        const message = err instanceof Error ? err.message : 'Batch tracking failed.';
+        if (!suppressError) {
+          setError(message);
+          throw err;
+        }
+        return null;
+      } finally {
+        setIsFlushing(false);
+      }
+    },
+    [config, isFlushing],
+  );
+
   const flush = useCallback(async (): Promise<TrackBatchResponse | null> => {
-    if (queueRef.current.length === 0 || isFlushing) return null;
-
-    setIsFlushing(true);
-    setError(null);
-
-    const batch = [...queueRef.current];
-    queueRef.current = [];
-    setPendingCount(0);
-
-    try {
-      const resolved = resolveSDKConfig(config);
-      return await sdkApiClient.trackBatch(resolved, batch);
-    } catch (err) {
-      queueRef.current = [...batch, ...queueRef.current];
-      setPendingCount(queueRef.current.length);
-      const message = err instanceof Error ? err.message : 'Batch tracking failed.';
-      setError(message);
-      throw err;
-    } finally {
-      setIsFlushing(false);
-    }
-  }, [config, isFlushing]);
+    return flushInternal(false);
+  }, [flushInternal]);
 
   const enqueueEvent = useCallback(
     async (event: TrackEventInput): Promise<void> => {
@@ -47,7 +57,6 @@ export function useTrackBatch(config?: Partial<SDKConfig>): UseTrackBatchResult 
       setPendingCount(queueRef.current.length);
 
       const resolved = resolveSDKConfig(config);
-
       if (queueRef.current.length >= resolved.trackBatchSize) {
         await flush();
       }
@@ -62,26 +71,27 @@ export function useTrackBatch(config?: Partial<SDKConfig>): UseTrackBatchResult 
 
     const id = window.setInterval(() => {
       if (queueRef.current.length > 0 && !isFlushing) {
-        void flush();
+        void flushInternal(true);
       }
     }, resolved.trackFlushIntervalMs);
 
-    const onBeforeUnload = () => {
-      if (queueRef.current.length > 0) {
-        navigator.sendBeacon(
-          `${resolved.apiUrl}/tracking/events/batch`,
-          JSON.stringify({ events: queueRef.current }),
-        );
-      }
+    const onFlushOnExit = () => {
+      if (queueRef.current.length === 0) return;
+      const batch = [...queueRef.current];
+      queueRef.current = [];
+      setPendingCount(0);
+      sdkApiClient.trackBatchKeepalive(resolved, batch);
     };
 
-    window.addEventListener('beforeunload', onBeforeUnload);
+    window.addEventListener('beforeunload', onFlushOnExit);
+    window.addEventListener('pagehide', onFlushOnExit);
 
     return () => {
       window.clearInterval(id);
-      window.removeEventListener('beforeunload', onBeforeUnload);
+      window.removeEventListener('beforeunload', onFlushOnExit);
+      window.removeEventListener('pagehide', onFlushOnExit);
     };
-  }, [config, flush, isFlushing]);
+  }, [config, flushInternal, isFlushing]);
 
   return {
     enqueueEvent,

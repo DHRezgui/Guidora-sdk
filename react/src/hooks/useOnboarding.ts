@@ -7,6 +7,7 @@ import { useFrictionDetection } from './useFrictionDetection';
 import { useFrictionScore } from './useFrictionScore';
 import { useOnboardingDebug } from './useOnboardingDebug';
 import { useOnboardingSession } from './useOnboardingSession';
+import { useRealtimeToursSync } from './useRealtimeToursSync';
 import { useTour } from './useTour';
 import { useTourProgress } from './useTourProgress';
 import { useTourTargetResolver } from './useTourTargetResolver';
@@ -120,6 +121,18 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     const tours = await activeTours.refresh(pageUrl);
     return tours;
   }, [activeTours, pageUrl]);
+
+  useRealtimeToursSync({
+    enabled: options?.config?.syncEnabled,
+    intervalMs: options?.config?.syncIntervalMs,
+    syncOnFocus: options?.config?.syncOnFocus,
+    syncOnReconnect: options?.config?.syncOnReconnect,
+    onSync: refresh,
+    onError: (error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      debug.warn('Realtime tours sync failed', { message });
+    },
+  });
 
   return useMemo(
     () => ({
