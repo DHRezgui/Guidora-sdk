@@ -5,7 +5,7 @@ export const findElement = (selector: string): HTMLElement | null => {
   if (!selector) return null;
   try {
     return document.querySelector(selector);
-  } catch (error) {
+  } catch {
     console.warn('[TrustDev SDK] Invalid selector:', selector);
     return null;
   }

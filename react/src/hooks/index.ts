@@ -1,6 +1,7 @@
 export * from './useActiveToursForUrl';
 export * from './useFrictionDetection';
 export * from './useFrictionScore';
+export * from './useContextualTourSuggestions';
 export * from './useOnboarding';
 export * from './useOnboardingDebug';
 export * from './useOnboardingSession';

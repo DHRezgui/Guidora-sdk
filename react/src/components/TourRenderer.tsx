@@ -103,7 +103,7 @@ export function TourRenderer({
           title={currentStep.title}
           content={currentStep.content}
           targetRect={hasTarget ? targetRect : null}
-          position={tooltipPosition as any}
+          position={tooltipPosition}
           stepIndex={currentIndex}
           totalSteps={totalSteps}
           theme={theme}

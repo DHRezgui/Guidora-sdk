@@ -71,6 +71,143 @@ export interface Step {
   waitTimeoutMs?: number;
 }
 
+export type TourDraftIntent = 'discovery' | 'primary-action' | 'support-navigation' | 'form-flow';
+
+export type TourPersona = 'admin' | 'support' | 'manager' | 'editor' | 'viewer' | 'operator' | 'other';
+
+export type ConflictResolutionStrategy = 'highest-confidence' | 'highest-score' | 'intent-priority' | 'hybrid';
+
+export type OnboardingStage = 'discovery' | 'activation' | 'adoption' | 'retention';
+
+export type FlowCompatibilityMode = 'strict' | 'lenient';
+
+export interface SessionOnboardingContext {
+  sessionId?: string;
+  userId?: string;
+  isNewUser?: boolean;
+  onboardingProgress?: number;
+  currentStage?: OnboardingStage;
+  seenSelectors?: string[];
+  completedSelectors?: string[];
+  completedTourIds?: string[];
+  completedStepIds?: string[];
+  preferredIntents?: TourDraftIntent[];
+  blockedIntents?: TourDraftIntent[];
+}
+
+export interface FlowVersioningMetadata {
+  flowVersion: string;
+  flowSignature: string;
+  compatibilityMode: FlowCompatibilityMode;
+  baselineVersion?: string;
+  migrationRequired: boolean;
+  migrationNotes: string[];
+}
+
+export interface TourDraftExplainability {
+  generatedFrom: string[];
+  sourceCandidateCount: number;
+  signalScores: {
+    semantic: number;
+    sequence: number;
+    confidence: number;
+  };
+  conflictNotes: string[];
+}
+
+export interface ContextualGenerationDebugReport {
+  generatedAt: string;
+  elapsedMs: number;
+  optionsSnapshot: {
+    minScore: number;
+    minConfidence: number;
+    conflictResolutionEnabled: boolean;
+    conflictResolutionStrategy: ConflictResolutionStrategy;
+    explainabilityEnabled: boolean;
+    sessionContextEnabled: boolean;
+    flowVersioningEnabled: boolean;
+    flowVersion: string;
+  };
+  candidateMetrics: {
+    considered: number;
+    accepted: number;
+    rejectedInvisible: number;
+    rejectedNoise: number;
+    rejectedNoLabel: number;
+    rejectedNoSelector: number;
+    rejectedBySession: number;
+    cacheHits: number;
+  };
+  draftMetrics: {
+    beforeConflict: number;
+    afterConflict: number;
+    afterConfidenceFilter: number;
+    afterMaxDrafts: number;
+  };
+  conflicts: Array<{
+    selector: string;
+    winnerDraft: string;
+    loserDraft: string;
+    reason: string;
+  }>;
+}
+
+export interface SuggestedTourDraft extends GuidedTour {
+  generatedBy: 'contextual-tour-generator';
+  generatedAt: string;
+  intent: TourDraftIntent;
+  score: number;
+  confidence: number;
+  semanticScore?: number;
+  sequenceScore?: number;
+  reasons: string[];
+  detectedSelectors: string[];
+  explainability?: TourDraftExplainability;
+  flowVersioning?: FlowVersioningMetadata;
+  sessionContextSnapshot?: {
+    stage: OnboardingStage;
+    progress: number;
+    isNewUser: boolean;
+  };
+}
+
+export interface TourDraftGenerationOptions {
+  maxDrafts?: number;
+  maxSteps?: number;
+  minScore?: number;
+  maxCandidates?: number;
+  includeSupportDraft?: boolean;
+  includeNavigationDraft?: boolean;
+  includeFormDraft?: boolean;
+  targetUrl?: string;
+  userRole?: string;
+  persona?: TourPersona | string;
+  projectDomain?: string;
+  businessObjectives?: string[];
+  semanticHints?: string[];
+  useSemanticRanking?: boolean;
+  enableIncremental?: boolean;
+  noiseFilteringEnabled?: boolean;
+  ignoreTransientUi?: boolean;
+  noiseSelectors?: string[];
+  mutationBatchWindowMs?: number;
+  maxDirtyNodesPerBatch?: number;
+  enableSequenceDetection?: boolean;
+  minConfidence?: number;
+  feedbackEnabled?: boolean;
+  dedupeLabels?: boolean;
+  conflictResolutionEnabled?: boolean;
+  conflictResolutionStrategy?: ConflictResolutionStrategy;
+  explainabilityEnabled?: boolean;
+  sessionContext?: SessionOnboardingContext;
+  flowVersioningEnabled?: boolean;
+  flowVersion?: string;
+  baselineFlowVersion?: string;
+  flowCompatibilityMode?: FlowCompatibilityMode;
+  knownFlowSignatures?: Record<string, string>;
+  customKeywords?: Partial<Record<TourDraftIntent, string[]>>;
+}
+
 export interface GuidedTour {
   id?: string;
   name: string;

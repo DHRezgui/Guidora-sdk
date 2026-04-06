@@ -105,3 +105,110 @@ initSDK({
 ```ts
 import { useRealtimeToursSync } from '@trustdev/onboarding-sdk-react';
 ```
+
+## Generation assistee de parcours
+
+Le SDK expose aussi une brique de suggestion contextuelle de parcours. Elle analyse le DOM visible de l'application cliente et propose des parcours de base que le developpeur peut ensuite modifier.
+
+### Hook exporte
+
+```ts
+import { useContextualTourSuggestions } from '@trustdev/onboarding-sdk-react';
+
+const { drafts, refresh, isGenerating, getDebugReport, getFlowRegistry } = useContextualTourSuggestions({
+  enabled: true,
+  autoGenerate: true,
+  maxDrafts: 3,
+  maxCandidates: 250,
+  enableIncremental: true,
+  feedbackEnabled: true,
+  userRole: 'admin',
+  persona: 'admin',
+  projectDomain: 'crm onboarding',
+  businessObjectives: ['convertir un utilisateur', 'publier un parcours', 'reussir la prise en main'],
+  semanticHints: ['creation de compte', 'validation', 'resultat'],
+  enableSequenceDetection: true,
+  useSemanticRanking: true,
+  noiseFilteringEnabled: true,
+  ignoreTransientUi: true,
+  mutationBatchWindowMs: 120,
+  maxDirtyNodesPerBatch: 280,
+  conflictResolutionEnabled: true,
+  conflictResolutionStrategy: 'hybrid',
+  explainabilityEnabled: true,
+  sessionContext: {
+    sessionId: 'sess_001',
+    isNewUser: true,
+    onboardingProgress: 0.25,
+    currentStage: 'activation',
+    seenSelectors: ['#welcome-banner'],
+    completedSelectors: ['#intro-step'],
+    preferredIntents: ['primary-action'],
+  },
+  flowVersioningEnabled: true,
+  flowVersion: 'v3.0.0',
+  baselineFlowVersion: 'v2.5.0',
+  flowCompatibilityMode: 'lenient',
+  minConfidence: 60,
+  customKeywords: {
+    'primary-action': ['approve', 'validate', 'publier'],
+  },
+});
+```
+
+### Ce que retourne le hook
+
+- `drafts`: parcours suggeres deja prets a etre ajustes.
+- `refresh`: relance l'analyse du contexte courant.
+- `isGenerating`: indique si la suggestion est en cours de calcul.
+- `getDebugReport`: retourne un rapport de debug (scores, filtres, conflits, volumes).
+- `getFlowRegistry`: retourne l'historique local des signatures/version des flows generes.
+
+V2 expose egalement:
+
+- `recordFeedback`: enregistre `shown`, `clicked`, `completed`, `skipped` pour affiner le scoring au fil du temps.
+- `resetFeedback`: reinitialise le feedback local de suggestion.
+
+### V3: ranking IA leger et flux sequentiels
+
+- `persona`: adapte les suggestions selon le profil utilisateur.
+- `projectDomain`, `businessObjectives`, `semanticHints`: enrichissent le contexte sémantique du ranking.
+- `useSemanticRanking`: active le calcul de similarite sémantique local.
+- `enableSequenceDetection`: active la reconstruction d'un parcours en plusieurs etapes.
+- `minConfidence`: filtre les drafts trop incertains.
+
+### Sprint 1: robustesse DOM et performance
+
+- `noiseFilteringEnabled`: active le filtrage anti-bruit (tooltips, loaders, toasts, statuts temporaires, etc.).
+- `ignoreTransientUi`: ignore les conteneurs temporaires (modals/overlays non stables) pour reduire les faux positifs.
+- `noiseSelectors`: permet d'ajouter des selecteurs custom a ignorer selon le design system du client.
+- `mutationBatchWindowMs`: debounce des mutations DOM avant recalcul.
+- `maxDirtyNodesPerBatch`: seuil de bascule vers full-rescan si trop de changements.
+
+### Sprint 2: conflict resolution et explainability
+
+- `conflictResolutionEnabled`: active l'arbitrage quand plusieurs drafts proposent les memes cibles.
+- `conflictResolutionStrategy`: choisit la politique d'arbitrage (`highest-confidence`, `highest-score`, `intent-priority`, `hybrid`).
+- `explainabilityEnabled`: ajoute les signaux explicatifs dans chaque draft et expose un rapport global via `getDebugReport`.
+
+### Sprint 3: session context et versioning des flows
+
+- `sessionContext`: adapte les suggestions au contexte utilisateur courant (new/existing user, progression, etapes deja vues/completees, intents preferes/bloques).
+- `flowVersioningEnabled`: annote chaque draft avec une signature de flow et des metadonnees de migration.
+- `flowVersion` et `baselineFlowVersion`: permettent de comparer la version courante au baseline pour detecter les changements incompatibles.
+- `flowCompatibilityMode`: regle de compatibilite (`strict` ou `lenient`) appliquee aux metadonnees de flow.
+
+### Ameliorations V2 integrees
+
+- Matching semantique multilingue (EN/FR/AR) avec tokenisation et stemming leger.
+- Scoring contextuel pondere (zone, taille, position viewport, penalites disabled/hidden).
+- Cache incremental base sur `MutationObserver` (re-scan partiel au lieu de full scan systematique).
+- Selecteurs plus stables (priorite a `data-tour-id`, `data-testid`, `data-cy`, `data-qa`).
+- Deduplication + diversification des drafts pour eviter les suggestions redondantes.
+- Feedback loop local (`localStorage`) pour repondrer automatiquement les prochains drafts.
+
+### Idee d'utilisation
+
+- Integrer le hook dans une page ou un dashboard d'administration.
+- Recuperer les drafts proposes.
+- Les modifier avant de les enregistrer ou de les publier.
