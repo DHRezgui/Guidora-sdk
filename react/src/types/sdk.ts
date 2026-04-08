@@ -111,6 +111,9 @@ export interface TourDraftExplainability {
     semantic: number;
     sequence: number;
     confidence: number;
+    selectorStabilityBonus?: number;
+    selectorFragilityPenalty?: number;
+    actionabilityPenalty?: number;
   };
   conflictNotes: string[];
 }
@@ -137,6 +140,11 @@ export interface ContextualGenerationDebugReport {
     rejectedNoSelector: number;
     rejectedBySession: number;
     cacheHits: number;
+  };
+  scoringAdjustments: {
+    selectorStabilityBonus: number;
+    selectorFragilityPenalty: number;
+    actionabilityPenalty: number;
   };
   draftMetrics: {
     beforeConflict: number;

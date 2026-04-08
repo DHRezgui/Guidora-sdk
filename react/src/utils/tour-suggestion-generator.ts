@@ -26,6 +26,9 @@ interface DetectedElement {
   semanticScore: number;
   personaScore: number;
   sequenceScore: number;
+  selectorStabilityBonus: number;
+  selectorFragilityPenalty: number;
+  actionabilityPenalty: number;
 }
 
 interface FeedbackStats {
@@ -90,6 +93,9 @@ interface GenerationDiagnostics {
   rejectedNoSelector: number;
   rejectedBySession: number;
   cacheHits: number;
+  selectorStabilityBonus: number;
+  selectorFragilityPenalty: number;
+  actionabilityPenalty: number;
 }
 
 interface ConflictEvent {
@@ -489,6 +495,9 @@ function createDiagnostics(): GenerationDiagnostics {
     rejectedNoSelector: 0,
     rejectedBySession: 0,
     cacheHits: 0,
+    selectorStabilityBonus: 0,
+    selectorFragilityPenalty: 0,
+    actionabilityPenalty: 0,
   };
 }
 
@@ -695,10 +704,12 @@ function draftPriorityScore(draft: SuggestedTourDraft, strategy: ConflictResolut
   if (strategy === 'highest-score') return draft.score;
   if (strategy === 'intent-priority') return intentPriority(draft.intent) * 100 + draft.confidence * 0.2;
 
+  const combined = draft.score * 0.6 + draft.confidence * 0.4;
   const intentBoost = intentPriority(draft.intent) * 5;
-  const semantic = draft.semanticScore || 0;
-  const sequence = draft.sequenceScore || 0;
-  return draft.confidence * 0.5 + draft.score * 0.25 + semantic * 0.15 + sequence * 0.1 + intentBoost;
+  // semanticScore/sequenceScore are exposed as 0..100 in drafts; normalize before weighting
+  const semantic = Math.max(0, Math.min(1, (draft.semanticScore || 0) / 100));
+  const sequence = Math.max(0, Math.min(1, (draft.sequenceScore || 0) / 100));
+  return combined + semantic * 12 + sequence * 10 + intentBoost;
 }
 
 function explainabilityEnabled(options?: TourDraftGenerationOptions): boolean {
@@ -1018,6 +1029,37 @@ function interactionWeight(tagName: string): number {
   }
 }
 
+function isActionableElement(element: HTMLElement): boolean {
+  const tagName = element.tagName.toLowerCase();
+  if (tagName === 'button') return true;
+  if (tagName === 'a') return Boolean((element as HTMLAnchorElement).href || element.getAttribute('href'));
+  if (tagName === 'input' || tagName === 'select' || tagName === 'textarea') return true;
+
+  const role = (element.getAttribute('role') || '').toLowerCase();
+  if (role === 'button' || role === 'link' || role === 'menuitem' || role === 'tab') return true;
+
+  if (typeof element.onclick === 'function') return true;
+  if (element.hasAttribute('contenteditable') && element.getAttribute('contenteditable') !== 'false') return true;
+  return element.tabIndex >= 0;
+}
+
+function isFormControlElement(element: HTMLElement): boolean {
+  const tagName = element.tagName.toLowerCase();
+  return tagName === 'input' || tagName === 'select' || tagName === 'textarea';
+}
+
+function selectorStabilityDelta(selector: string): number {
+  if (!selector) return 0;
+
+  if (selector.includes('[data-tour-id=')) return 18;
+  if (selector.includes('[data-testid=')) return 12;
+  if (selector.includes('[data-cy=') || selector.includes('[data-qa=')) return 10;
+  if (selector.startsWith('#')) return 6;
+
+  if (selector.includes(':nth-of-type(') || selector.includes(':nth-child(')) return -20;
+  return 0;
+}
+
 function getScoreFeatures(element: HTMLElement): ScoreFeatures {
   const rect = element.getBoundingClientRect();
   const area = rect.width * rect.height;
@@ -1203,7 +1245,15 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
 
   const cached = runtime.scoreCache.get(element);
   if (cached && cached.domVersion === runtime.domVersion) {
-    if (activeDiagnostics) activeDiagnostics.cacheHits += 1;
+    if (activeDiagnostics) {
+      activeDiagnostics.cacheHits += 1;
+      if (cached.detected) {
+        activeDiagnostics.accepted += 1;
+        activeDiagnostics.selectorStabilityBonus += cached.detected.selectorStabilityBonus;
+        activeDiagnostics.selectorFragilityPenalty += cached.detected.selectorFragilityPenalty;
+        activeDiagnostics.actionabilityPenalty += cached.detected.actionabilityPenalty;
+      }
+    }
     return cached.detected;
   }
 
@@ -1240,8 +1290,18 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
   const zone = detectZone(element);
   const features = getScoreFeatures(element);
   const tagName = element.tagName.toLowerCase();
-  const intent = getIntentFromSemanticHits(semantic, zone);
+  let intent = getIntentFromSemanticHits(semantic, zone);
   const sessionContext = getSessionContext(options);
+  const isActionable = isActionableElement(element);
+  const isFormControl = isFormControlElement(element);
+
+  if (intent === 'primary-action' && !isActionable) {
+    intent = zone === 'navigation' || zone === 'sidebar' || zone === 'header' ? 'support-navigation' : 'discovery';
+  }
+
+  if (intent === 'form-flow' && !isFormControl) {
+    intent = 'discovery';
+  }
 
   if (isIntentBlocked(intent, sessionContext)) {
     if (activeDiagnostics) activeDiagnostics.rejectedBySession += 1;
@@ -1274,6 +1334,14 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
   score += Math.min(14, Math.log10(Math.max(10, features.area)) * 4);
   score += features.viewportWeight;
 
+  const stabilityDelta = selectorStabilityDelta(selector);
+  const selectorStabilityBonus = Math.max(0, stabilityDelta);
+  const selectorFragilityPenalty = Math.min(0, stabilityDelta);
+  let actionabilityPenalty = 0;
+  score += stabilityDelta;
+  if (stabilityDelta > 0) reasons.push(`selector stability bonus: +${stabilityDelta}`);
+  if (stabilityDelta < 0) reasons.push(`selector stability penalty: ${stabilityDelta}`);
+
   if (zone === 'navigation' || zone === 'sidebar') {
     score += 6;
     reasons.push('navigation context');
@@ -1284,9 +1352,53 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
     reasons.push('form context');
   }
 
+  if (intent === 'primary-action') {
+    if (zone === 'form' || zone === 'main') {
+      score += 14;
+      reasons.push('primary-action boost: form/main zone');
+    }
+
+    const inputType = (element.getAttribute('type') || '').toLowerCase();
+    if (tagName === 'button' || (tagName === 'input' && (inputType === 'submit' || inputType === 'button'))) {
+      score += 14;
+      reasons.push('primary-action boost: actionable control');
+    }
+
+    // Dynamic UIs (transient DOM, noise filtering enabled) need a slight bias
+    // toward stable main actions instead of entry headings.
+    const dynamicContext = options?.noiseFilteringEnabled !== false && options?.ignoreTransientUi !== false;
+    const isActionControl = tagName === 'button' || (tagName === 'input' && (inputType === 'submit' || inputType === 'button'));
+    if (dynamicContext && zone === 'main' && isActionControl) {
+      score += 8;
+      reasons.push('dynamic-context boost: main action control');
+    }
+
+    if (zone === 'navigation' || zone === 'sidebar' || zone === 'header') {
+      score -= 28;
+      reasons.push('primary-action penalty: navigation-like zone');
+    }
+
+    if (tagName === 'a' && (zone === 'navigation' || zone === 'sidebar' || zone === 'header')) {
+      score -= 14;
+      reasons.push('primary-action penalty: navigation link over action control');
+    }
+  }
+
   if (features.disabled) {
     score -= 28;
     reasons.push('penalty: disabled element');
+  }
+
+  if ((intent === 'primary-action' || intent === 'form-flow') && !isActionable) {
+    actionabilityPenalty -= 42;
+    score -= 42;
+    reasons.push('penalty: non-actionable element for action intent');
+  }
+
+  if (intent === 'support-navigation' && !isActionable) {
+    actionabilityPenalty -= 20;
+    score -= 20;
+    reasons.push('penalty: non-actionable element for navigation intent');
   }
 
   score += feedbackBonus;
@@ -1296,7 +1408,7 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
     reasons.push('session penalty: selector already seen in session');
   }
 
-  if (tagName === 'button' || tagName === 'a' || tagName === 'input') {
+  if (isActionable) {
     reasons.push('interactive element');
   }
 
@@ -1332,9 +1444,17 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
     semanticScore,
     personaScore,
     sequenceScore,
+    selectorStabilityBonus,
+    selectorFragilityPenalty,
+    actionabilityPenalty,
   };
 
-  if (activeDiagnostics) activeDiagnostics.accepted += 1;
+  if (activeDiagnostics) {
+    activeDiagnostics.accepted += 1;
+    activeDiagnostics.selectorStabilityBonus += selectorStabilityBonus;
+    activeDiagnostics.selectorFragilityPenalty += selectorFragilityPenalty;
+    activeDiagnostics.actionabilityPenalty += actionabilityPenalty;
+  }
 
   runtime.scoreCache.set(element, { domVersion: runtime.domVersion, detected });
   return detected;
@@ -1521,12 +1641,43 @@ function dedupeCandidates(candidates: DetectedElement[], options?: TourDraftGene
   return Array.from(labelMap.values());
 }
 
+function primaryActionTieBreakerRank(candidate: DetectedElement): number {
+  const tag = candidate.element.tagName.toLowerCase();
+  const inputType = (candidate.element.getAttribute('type') || '').toLowerCase();
+
+  // Strong preference for actionable controls in form/main areas
+  const controlRank = tag === 'button'
+    ? 4
+    : (tag === 'input' && (inputType === 'submit' || inputType === 'button'))
+      ? 3
+      : tag === 'a'
+        ? 1
+        : 0;
+
+  const zoneRank = candidate.zone === 'form'
+    ? 3
+    : candidate.zone === 'main'
+      ? 2
+      : (candidate.zone === 'navigation' || candidate.zone === 'sidebar' || candidate.zone === 'header')
+        ? 0
+        : 1;
+
+  return controlRank * 10 + zoneRank;
+}
+
 function pickBestCandidate(candidates: DetectedElement[], intent: TourDraftIntent, excludedSelectors: string[] = []): DetectedElement | null {
   const blocked = new Set(excludedSelectors);
   return (
     candidates
       .filter((candidate) => candidate.intent === intent && !blocked.has(candidate.selector))
-      .sort((a, b) => b.score - a.score)[0] || null
+      .sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        if (intent === 'primary-action') {
+          const tie = primaryActionTieBreakerRank(b) - primaryActionTieBreakerRank(a);
+          if (tie !== 0) return tie;
+        }
+        return b.confidence - a.confidence;
+      })[0] || null
   );
 }
 
@@ -1586,6 +1737,7 @@ function createDraft(
   targetUrl: string,
   options?: TourDraftGenerationOptions,
 ): SuggestedTourDraft {
+  const reasonsWithAdjustments = reasons.slice();
   const averageCandidateScore = sourceCandidates.length
     ? sourceCandidates.reduce((total, candidate) => total + candidate.score, 0) / sourceCandidates.length
     : 0;
@@ -1598,8 +1750,45 @@ function createDraft(
   const averageSequenceScore = sourceCandidates.length
     ? sourceCandidates.reduce((total, candidate) => total + candidate.sequenceScore, 0) / sourceCandidates.length
     : 0;
-  const score = Math.min(100, Math.round(averageCandidateScore * 0.55 + steps.length * 10 + reasons.length * 3));
-  const confidence = confidenceFromSignals(score, averageSemanticScore, averagePersonaScore, averageSequenceScore, 0);
+  const averageSelectorStabilityBonus = sourceCandidates.length
+    ? sourceCandidates.reduce((total, candidate) => total + candidate.selectorStabilityBonus, 0) / sourceCandidates.length
+    : 0;
+  const averageSelectorFragilityPenalty = sourceCandidates.length
+    ? sourceCandidates.reduce((total, candidate) => total + candidate.selectorFragilityPenalty, 0) / sourceCandidates.length
+    : 0;
+  const averageActionabilityPenalty = sourceCandidates.length
+    ? sourceCandidates.reduce((total, candidate) => total + candidate.actionabilityPenalty, 0) / sourceCandidates.length
+    : 0;
+  let score = Math.min(100, Math.round(averageCandidateScore * 0.55 + steps.length * 10 + reasons.length * 3));
+  if (intent === 'discovery') {
+    score = Math.min(score, 92);
+  }
+  let confidence = confidenceFromSignals(score, averageSemanticScore, averagePersonaScore, averageSequenceScore, 0);
+
+  const dynamicContext = options?.noiseFilteringEnabled !== false && options?.ignoreTransientUi !== false;
+  const hasStableActionControl = sourceCandidates.some((candidate) => {
+    const tagName = candidate.element.tagName.toLowerCase();
+    const inputType = (candidate.element.getAttribute('type') || '').toLowerCase();
+    const isActionControl = tagName === 'button' || (tagName === 'input' && (inputType === 'submit' || inputType === 'button'));
+    const isStableSelector =
+      candidate.selector.includes('[data-tour-id=') ||
+      candidate.selector.includes('[data-testid=') ||
+      candidate.selector.startsWith('#');
+    // Dynamic layouts often report zones as 'other'; keep strict actionable/stable checks but relax zone guard.
+    return isActionControl && isStableSelector;
+  });
+
+  const hasDynamicActionMarker = sourceCandidates.some((candidate) => candidate.selector.includes('tour-dynamic-action-'));
+
+  if (intent === 'primary-action' && dynamicContext && hasStableActionControl) {
+    confidence = Math.min(100, confidence + 12);
+    reasonsWithAdjustments.push('dynamic-context confidence boost: stable action control');
+  }
+
+  if (intent === 'primary-action' && dynamicContext && hasDynamicActionMarker) {
+    confidence = Math.min(100, confidence + 6);
+    reasonsWithAdjustments.push('dynamic-context confidence boost: explicit dynamic action marker');
+  }
 
   const sessionContext = getSessionContext(options);
   const stage = normalizeStage(sessionContext?.currentStage);
@@ -1613,16 +1802,19 @@ function createDraft(
     confidence,
     semanticScore: Math.round(averageSemanticScore * 100),
     sequenceScore: Math.round(averageSequenceScore * 100),
-    reasons,
+    reasons: reasonsWithAdjustments,
     detectedSelectors: sourceCandidates.map((candidate) => candidate.selector),
     explainability: explainabilityEnabled(options)
       ? {
-          generatedFrom: reasons.slice(0, 8),
+          generatedFrom: reasonsWithAdjustments.slice(0, 8),
           sourceCandidateCount: sourceCandidates.length,
           signalScores: {
             semantic: Math.round(averageSemanticScore * 100),
             sequence: Math.round(averageSequenceScore * 100),
             confidence,
+            selectorStabilityBonus: Math.round(averageSelectorStabilityBonus),
+            selectorFragilityPenalty: Math.round(averageSelectorFragilityPenalty),
+            actionabilityPenalty: Math.round(averageActionabilityPenalty),
           },
           conflictNotes: [],
         }
@@ -1666,7 +1858,7 @@ function buildSequenceDraft(
   const progress = getProgress(sessionContext);
 
   const entry = heading
-    ? { element: heading, selector: buildUniqueSelector(heading), label: normalizeText(heading.textContent), score: 72, confidence: 68, intent: 'discovery' as const, reasons: ['entry heading'], tokenHits: 1, zone: 'main' as CandidateZone, semanticScore: 0.35, personaScore: 0.1, sequenceScore: 0.6 }
+    ? { element: heading, selector: buildUniqueSelector(heading), label: normalizeText(heading.textContent), score: 72, confidence: 68, intent: 'discovery' as const, reasons: ['entry heading'], tokenHits: 1, zone: 'main' as CandidateZone, semanticScore: 0.35, personaScore: 0.1, sequenceScore: 0.6, selectorStabilityBonus: 0, selectorFragilityPenalty: 0, actionabilityPenalty: 0 }
     : null;
 
   const orderedCandidates = candidates
@@ -1686,7 +1878,7 @@ function buildSequenceDraft(
     orderedCandidates[1] ||
     null;
 
-  const chain = [entry, action, validation, result].filter(Boolean) as Array<DetectedElement | { element: HTMLElement; selector: string; label: string; score: number; confidence: number; intent: TourDraftIntent; reasons: string[]; tokenHits: number; zone: CandidateZone; semanticScore: number; personaScore: number; sequenceScore: number }>;
+  const chain = [entry, action, validation, result].filter(Boolean) as Array<DetectedElement | { element: HTMLElement; selector: string; label: string; score: number; confidence: number; intent: TourDraftIntent; reasons: string[]; tokenHits: number; zone: CandidateZone; semanticScore: number; personaScore: number; sequenceScore: number; selectorStabilityBonus: number; selectorFragilityPenalty: number; actionabilityPenalty: number }>;
   const uniqueChain = chain.filter((candidate, index) => chain.findIndex((item) => item.selector === candidate.selector) === index);
 
   if (uniqueChain.length < 3) return null;
@@ -1711,6 +1903,9 @@ function buildSequenceDraft(
   });
 
   const sequenceScore = uniqueChain.reduce((total, candidate) => total + candidate.sequenceScore + candidate.semanticScore, 0) / uniqueChain.length;
+  const sequenceSelectorStabilityBonus = uniqueChain.reduce((total, candidate) => total + candidate.selectorStabilityBonus, 0) / uniqueChain.length;
+  const sequenceSelectorFragilityPenalty = uniqueChain.reduce((total, candidate) => total + candidate.selectorFragilityPenalty, 0) / uniqueChain.length;
+  const sequenceActionabilityPenalty = uniqueChain.reduce((total, candidate) => total + candidate.actionabilityPenalty, 0) / uniqueChain.length;
   const confidence = Math.min(100, Math.round(58 + sequenceScore * 30 + uniqueChain.length * 4));
   if (confidence < 45) return null;
 
@@ -1738,6 +1933,9 @@ function buildSequenceDraft(
             semantic: Math.round(sequenceScore * 100),
             sequence: Math.round(sequenceScore * 100),
             confidence,
+            selectorStabilityBonus: Math.round(sequenceSelectorStabilityBonus),
+            selectorFragilityPenalty: Math.round(sequenceSelectorFragilityPenalty),
+            actionabilityPenalty: Math.round(sequenceActionabilityPenalty),
           },
           conflictNotes: [],
         }
@@ -1812,6 +2010,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
         flowVersion: options?.flowVersion || 'v1',
       },
       candidateMetrics: activeDiagnostics || createDiagnostics(),
+      scoringAdjustments: {
+        selectorStabilityBonus: 0,
+        selectorFragilityPenalty: 0,
+        actionabilityPenalty: 0,
+      },
       draftMetrics: {
         beforeConflict: 0,
         afterConflict: 0,
@@ -2025,6 +2228,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
       flowVersion: options?.flowVersion || 'v1',
     },
     candidateMetrics: activeDiagnostics || createDiagnostics(),
+    scoringAdjustments: {
+      selectorStabilityBonus: (activeDiagnostics || createDiagnostics()).selectorStabilityBonus,
+      selectorFragilityPenalty: (activeDiagnostics || createDiagnostics()).selectorFragilityPenalty,
+      actionabilityPenalty: (activeDiagnostics || createDiagnostics()).actionabilityPenalty,
+    },
     draftMetrics: {
       beforeConflict: draftsBeforeConflict.length,
       afterConflict: resolvedConflicts.drafts.length,
