@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Step } from '../types';
+import { PositionType, Step } from '../types';
 import { Beacon } from './Beacon';
 import { Highlight } from './Highlight';
 import { TargetNotFoundFallback } from './TargetNotFoundFallback';
@@ -21,7 +21,7 @@ export interface TourRendererProps {
   showHighlight?: boolean;
   showBeacon?: boolean;
   showTooltip?: boolean;
-  tooltipPosition?: 'TOP' | 'BOTTOM' | 'LEFT' | 'RIGHT';
+  tooltipPosition?: PositionType;
   targetNotFound?: boolean;
   retryingSelector?: boolean;
 }
@@ -103,7 +103,7 @@ export function TourRenderer({
           title={currentStep.title}
           content={currentStep.content}
           targetRect={hasTarget ? targetRect : null}
-          position={tooltipPosition}
+          position={currentStep.position || tooltipPosition}
           stepIndex={currentIndex}
           totalSteps={totalSteps}
           theme={theme}

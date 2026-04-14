@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useOnboarding } from '../hooks/useOnboarding';
-import { SDKConfig } from '../types';
+import { PositionType, SDKConfig } from '../types';
 import { OnboardingTheme } from './theme';
 import { TourRenderer } from './TourRenderer';
 
@@ -12,7 +12,7 @@ export interface TourViewerProps {
   showHighlight?: boolean;
   showBeacon?: boolean;
   showTooltip?: boolean;
-  tooltipPosition?: 'TOP' | 'BOTTOM' | 'LEFT' | 'RIGHT';
+  tooltipPosition?: PositionType;
   onTourComplete?: (tourId?: string) => void;
   onTourSkipped?: (tourId?: string) => void;
 }

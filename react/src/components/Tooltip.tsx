@@ -69,6 +69,48 @@ function getTooltipPosition(targetRect?: RectLike | null, position: PositionType
   }
 }
 
+function resolveRuntimePosition(targetRect?: RectLike | null, preferred: PositionType = 'BOTTOM'): PositionType {
+  if (!targetRect) return preferred;
+
+  const viewportWidth = typeof window !== 'undefined' ? Math.max(1, window.innerWidth || 1) : 1280;
+  const viewportHeight = typeof window !== 'undefined' ? Math.max(1, window.innerHeight || 1) : 720;
+
+  const spaceTop = targetRect.top;
+  const spaceBottom = viewportHeight - (targetRect.top + targetRect.height);
+  const spaceLeft = targetRect.left;
+  const spaceRight = viewportWidth - (targetRect.left + targetRect.width);
+
+  const requiredVerticalSpace = 180;
+  const requiredHorizontalSpace = 260;
+
+  const hasBottomSpace = spaceBottom >= requiredVerticalSpace;
+  const hasTopSpace = spaceTop >= requiredVerticalSpace;
+  const hasLeftSpace = spaceLeft >= requiredHorizontalSpace;
+  const hasRightSpace = spaceRight >= requiredHorizontalSpace;
+
+  const verticalFallback = spaceBottom >= spaceTop ? 'BOTTOM' : 'TOP';
+  const horizontalFallback = spaceRight >= spaceLeft ? 'RIGHT' : 'LEFT';
+
+  switch (preferred) {
+    case 'TOP':
+    case 'TOP_LEFT':
+    case 'TOP_RIGHT':
+      return hasTopSpace ? preferred : hasBottomSpace ? 'BOTTOM' : hasRightSpace || hasLeftSpace ? horizontalFallback : verticalFallback;
+    case 'BOTTOM':
+    case 'BOTTOM_LEFT':
+    case 'BOTTOM_RIGHT':
+      return hasBottomSpace ? preferred : hasTopSpace ? 'TOP' : hasRightSpace || hasLeftSpace ? horizontalFallback : verticalFallback;
+    case 'LEFT':
+      return hasLeftSpace ? preferred : hasRightSpace ? 'RIGHT' : hasTopSpace || hasBottomSpace ? verticalFallback : preferred;
+    case 'RIGHT':
+      return hasRightSpace ? preferred : hasLeftSpace ? 'LEFT' : hasTopSpace || hasBottomSpace ? verticalFallback : preferred;
+    case 'CENTER':
+      return preferred;
+    default:
+      return verticalFallback;
+  }
+}
+
 export function Tooltip({
   open,
   title,
@@ -92,6 +134,7 @@ export function Tooltip({
   const cssVars = useThemeCssVars(theme);
   const isFirstStep = (stepIndex ?? 0) <= 0;
   const isLastStep = typeof totalSteps === 'number' && typeof stepIndex === 'number' ? stepIndex >= totalSteps - 1 : false;
+  const effectivePosition = resolveRuntimePosition(targetRect, position);
 
   if (!open) return null;
 
@@ -106,8 +149,8 @@ export function Tooltip({
           onSkip={onSkip || onClose}
         />
 
-        <div className={`td-tooltip ${className || ''}`.trim()} style={{ ...getTooltipPosition(targetRect, position), ...style }} role="dialog" aria-modal="false">
-          {!hideArrow ? <TooltipArrow position={position} /> : null}
+        <div className={`td-tooltip ${className || ''}`.trim()} style={{ ...getTooltipPosition(targetRect, effectivePosition), ...style }} role="dialog" aria-modal="false">
+          {!hideArrow ? <TooltipArrow position={effectivePosition} /> : null}
 
           {typeof stepIndex === 'number' && typeof totalSteps === 'number' ? (
             <p className="td-tooltip__meta">Step {stepIndex + 1}/{totalSteps}</p>

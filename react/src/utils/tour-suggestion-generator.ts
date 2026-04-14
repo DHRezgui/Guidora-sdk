@@ -1845,20 +1845,59 @@ function getPageHeading(): HTMLElement | null {
   return null;
 }
 
+function inferStepPosition(element: HTMLElement): PositionType {
+  const rect = element.getBoundingClientRect();
+  const viewportWidth = Math.max(1, window.innerWidth || 1);
+  const viewportHeight = Math.max(1, window.innerHeight || 1);
+
+  const spaceTop = rect.top;
+  const spaceBottom = viewportHeight - rect.bottom;
+  const spaceLeft = rect.left;
+  const spaceRight = viewportWidth - rect.right;
+
+  const minVerticalSpace = 180;
+  const minHorizontalSpace = 220;
+
+  if (spaceBottom >= minVerticalSpace) {
+    if (rect.left < viewportWidth * 0.25) return 'BOTTOM_LEFT';
+    if (rect.right > viewportWidth * 0.75) return 'BOTTOM_RIGHT';
+    return 'BOTTOM';
+  }
+
+  if (spaceTop >= minVerticalSpace) {
+    if (rect.left < viewportWidth * 0.25) return 'TOP_LEFT';
+    if (rect.right > viewportWidth * 0.75) return 'TOP_RIGHT';
+    return 'TOP';
+  }
+
+  if (spaceRight >= minHorizontalSpace) {
+    return 'RIGHT';
+  }
+
+  if (spaceLeft >= minHorizontalSpace) {
+    return 'LEFT';
+  }
+
+  return spaceBottom >= spaceTop ? 'BOTTOM' : 'TOP';
+}
+
 function buildStep(
   title: string,
   content: string,
   element: HTMLElement,
-  position: PositionType = 'BOTTOM',
+  position?: PositionType,
   action: Step['action'] = 'NEXT',
 ): Step {
+  const inferredPosition = inferStepPosition(element);
+  const resolvedPosition = !position || position === 'BOTTOM' ? inferredPosition : position;
+
   stepCounter += 1;
   return {
     id: `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Date.now()}-${stepCounter}`,
     title,
     content,
     targetSelector: buildUniqueSelector(element),
-    position,
+    position: resolvedPosition,
     action,
     skipAllowed: true,
     highlightElement: true,
