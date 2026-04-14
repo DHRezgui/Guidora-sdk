@@ -1,6 +1,7 @@
 import {
   ConflictResolutionStrategy,
   ContextualGenerationDebugReport,
+  ContextualAnalysisSeverity,
   FlowCompatibilityMode,
   FlowVersioningMetadata,
   OnboardingStage,
@@ -110,6 +111,15 @@ interface FlowRegistryEntry {
   signature: string;
   generatedAt: string;
   targetUrl: string;
+}
+
+interface GenerationSeverityProfile {
+  minScore: number;
+  minConfidence: number;
+  includeSupportDraft: boolean;
+  includeNavigationDraft: boolean;
+  includeFormDraft: boolean;
+  maxDrafts: number;
 }
 
 const FEEDBACK_STORAGE_KEY = '__trustdev_contextual_tour_feedback_v2';
@@ -282,6 +292,33 @@ const SEQUENCE_KEYWORDS = {
   result: ['result', 'success', 'done', 'complete', 'status', 'updated', 'published', 'résultat', 'terminé', 'نجح'],
 } as const;
 
+const GENERATION_SEVERITY_PROFILES: Record<ContextualAnalysisSeverity, GenerationSeverityProfile> = {
+  strict: {
+    minScore: 30,
+    minConfidence: 62,
+    includeSupportDraft: false,
+    includeNavigationDraft: false,
+    includeFormDraft: false,
+    maxDrafts: 2,
+  },
+  balanced: {
+    minScore: 25,
+    minConfidence: 55,
+    includeSupportDraft: true,
+    includeNavigationDraft: true,
+    includeFormDraft: false,
+    maxDrafts: 3,
+  },
+  relaxed: {
+    minScore: 16,
+    minConfidence: 24,
+    includeSupportDraft: true,
+    includeNavigationDraft: true,
+    includeFormDraft: true,
+    maxDrafts: 4,
+  },
+};
+
 const runtime: RuntimeState = {
   domVersion: 0,
   fullRescanNeeded: true,
@@ -414,6 +451,20 @@ function buildSemanticVector(tokens: string[]): SemanticVector {
   return {
     dimensions,
     magnitude: Math.sqrt(magnitude),
+  };
+}
+
+function resolveGenerationProfile(options?: TourDraftGenerationOptions): GenerationSeverityProfile {
+  const severity = options?.analysisSeverity ?? 'balanced';
+  const profile = GENERATION_SEVERITY_PROFILES[severity];
+
+  return {
+    minScore: options?.minScore ?? profile.minScore,
+    minConfidence: options?.minConfidence ?? profile.minConfidence,
+    includeSupportDraft: options?.includeSupportDraft ?? profile.includeSupportDraft,
+    includeNavigationDraft: options?.includeNavigationDraft ?? profile.includeNavigationDraft,
+    includeFormDraft: options?.includeFormDraft ?? profile.includeFormDraft,
+    maxDrafts: options?.maxDrafts ?? profile.maxDrafts,
   };
 }
 
@@ -750,12 +801,22 @@ function resolveDraftConflicts(
   const processed = ranked.map((entry) => {
     const filteredSteps: Step[] = [];
     const localSeen = new Set<string>();
-    for (const step of dedupeStepsBySelector(entry.draft.steps)) {
+    const dedupedSteps = dedupeStepsBySelector(entry.draft.steps);
+    for (const [stepIndex, step] of dedupedSteps.entries()) {
       const selector = step.targetSelector || '';
       if (!selector || localSeen.has(selector)) continue;
 
       localSeen.add(selector);
       const existingOwner = ownership.get(selector);
+      const protectPrimaryAnchor = entry.draft.intent === 'primary-action' && stepIndex === 0;
+
+      if (protectPrimaryAnchor) {
+        // Keep the first step of a primary-action draft as an anchor even if another draft references the same selector.
+        ownership.set(selector, { draftName: entry.draft.name, priority: entry.priority });
+        filteredSteps.push(step);
+        continue;
+      }
+
       if (!existingOwner) {
         ownership.set(selector, { draftName: entry.draft.name, priority: entry.priority });
         filteredSteps.push(step);
@@ -972,9 +1033,9 @@ function getLabel(element: HTMLElement): string {
     element.getAttribute('aria-label'),
     element.getAttribute('title'),
     element.getAttribute('placeholder'),
+    element.textContent,
     element.getAttribute('data-testid'),
     element.getAttribute('name'),
-    element.textContent,
   ];
 
   return normalizeText(candidates.find((value) => normalizeText(value).length > 0) || '');
@@ -1353,6 +1414,7 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
   }
 
   if (intent === 'primary-action') {
+    const normalizedLabel = normalizeText(label);
     if (zone === 'form' || zone === 'main') {
       score += 14;
       reasons.push('primary-action boost: form/main zone');
@@ -1362,6 +1424,16 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
     if (tagName === 'button' || (tagName === 'input' && (inputType === 'submit' || inputType === 'button'))) {
       score += 14;
       reasons.push('primary-action boost: actionable control');
+    }
+
+    if (/(create|creer|d[ée]marrer|start|lancer|save|enregistrer|validate|valider|submit|soumettre|confirm|confirmer|publish|publier|refresh|relancer)/i.test(normalizedLabel)) {
+      score += 12;
+      reasons.push('primary-action boost: high-intent action verb');
+    }
+
+    if (tagName === 'a' && /(discover|d[ée]couvrir|guide|explore|documentation|docs|help|aide)/i.test(normalizedLabel)) {
+      score -= 30;
+      reasons.push('primary-action penalty: discovery/support link');
     }
 
     // Dynamic UIs (transient DOM, noise filtering enabled) need a slight bias
@@ -1681,6 +1753,41 @@ function pickBestCandidate(candidates: DetectedElement[], intent: TourDraftInten
   );
 }
 
+function pickBestActionableCandidate(candidates: DetectedElement[], excludedSelectors: string[] = []): DetectedElement | null {
+  const blocked = new Set(excludedSelectors);
+  return (
+    candidates
+      .filter((candidate) => !blocked.has(candidate.selector) && isActionableElement(candidate.element))
+      .sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        const tie = primaryActionTieBreakerRank(b) - primaryActionTieBreakerRank(a);
+        if (tie !== 0) return tie;
+        return b.confidence - a.confidence;
+      })[0] || null
+  );
+}
+
+function pickBestPrimaryActionCandidate(candidates: DetectedElement[], excludedSelectors: string[] = []): DetectedElement | null {
+  const blocked = new Set(excludedSelectors);
+  const actionable = candidates.filter((candidate) => candidate.intent === 'primary-action' && !blocked.has(candidate.selector));
+  const controls = actionable.filter((candidate) => {
+    const tag = candidate.element.tagName.toLowerCase();
+    const inputType = (candidate.element.getAttribute('type') || '').toLowerCase();
+    return tag === 'button' || (tag === 'input' && (inputType === 'submit' || inputType === 'button'));
+  });
+
+  const pool = controls.length > 0 ? controls : actionable;
+  return (
+    pool
+      .sort((a, b) => {
+        if (b.score !== a.score) return b.score - a.score;
+        const tie = primaryActionTieBreakerRank(b) - primaryActionTieBreakerRank(a);
+        if (tie !== 0) return tie;
+        return b.confidence - a.confidence;
+      })[0] || null
+  );
+}
+
 function pickAnyCandidate(
   candidates: DetectedElement[],
   excludedSelectors: string[] = [],
@@ -1696,6 +1803,37 @@ function pickAnyCandidate(
         return b.score - a.score;
       })[0] || null
   );
+}
+
+function buildSecondaryStepCopy(candidate: DetectedElement, draftIntent: TourDraftIntent): { title: string; content: string } {
+  const label = candidate.label || 'element courant';
+  const normalizedLabel = normalizeText(label);
+
+  if (candidate.intent === 'form-flow' || /form|champ|saisie|validation|email|company|organisation|organisation|notes/i.test(normalizedLabel)) {
+    return {
+      title: 'Acceder au formulaire',
+      content: `Poursuivez vers la zone de configuration pour renseigner ou verifier les informations metier: ${label}.`,
+    };
+  }
+
+  if (candidate.intent === 'support-navigation' || candidate.zone === 'navigation' || candidate.zone === 'sidebar') {
+    return {
+      title: 'Consulter la navigation metier',
+      content: `Utilisez cette zone pour rejoindre les sections utiles du parcours: ${label}.`,
+    };
+  }
+
+  if (draftIntent === 'primary-action') {
+    return {
+      title: 'Poursuivre le flux metier',
+      content: `Cet element complete le parcours principal et permet de continuer le flux: ${label}.`,
+    };
+  }
+
+  return {
+    title: 'Etape suivante',
+    content: `Poursuivez avec cet element du contexte: ${label}.`,
+  };
 }
 
 function getPageHeading(): HTMLElement | null {
@@ -1883,6 +2021,9 @@ function buildSequenceDraft(
 
   if (uniqueChain.length < 3) return null;
 
+  const hasActionableStep = uniqueChain.some((candidate) => isActionableElement(candidate.element));
+  if (!hasActionableStep) return null;
+
   const steps: Step[] = uniqueChain.slice(0, 4).map((candidate, index) => {
     const titles = ['Point d\'entrée', 'Action clé', 'Validation', 'Résultat'];
     const actions: Step['action'][] = ['NEXT', 'CLICK', 'CLICK', 'NEXT'];
@@ -1912,7 +2053,7 @@ function buildSequenceDraft(
   const draftBase: SuggestedTourDraft = {
     generatedBy: 'contextual-tour-generator',
     generatedAt: new Date().toISOString(),
-    intent: action?.intent || 'discovery',
+    intent: 'discovery',
     score: Math.min(100, Math.round(sequenceScore * 100)),
     confidence,
     semanticScore: Math.round(sequenceScore * 100),
@@ -1988,10 +2129,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
   const startedAt = Date.now();
   activeDiagnostics = createDiagnostics();
 
-  const maxDrafts = options?.maxDrafts ?? 3;
+  const generationProfile = resolveGenerationProfile(options);
+  const maxDrafts = generationProfile.maxDrafts;
   const maxSteps = options?.maxSteps ?? 3;
-  const minScore = options?.minScore ?? 25;
-  const minConfidence = options?.minConfidence ?? 55;
+  const minScore = generationProfile.minScore;
+  const minConfidence = generationProfile.minConfidence;
   const targetUrl = options?.targetUrl ?? window.location.pathname;
 
   const candidates = collectCandidates(options);
@@ -2028,15 +2170,20 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
   }
 
   const heading = getPageHeading();
-  const primary = pickBestCandidate(candidates, 'primary-action') || pickAnyCandidate(candidates);
-  const support = options?.includeSupportDraft !== false ? pickBestCandidate(candidates, 'support-navigation') : null;
-  const navigation = options?.includeNavigationDraft !== false ? pickAnyCandidate(candidates, [primary?.selector || ''], ['navigation', 'sidebar', 'main']) : null;
-  const form = options?.includeFormDraft ? pickBestCandidate(candidates, 'form-flow') : null;
+  const headingSelector = heading ? buildUniqueSelector(heading) : '';
+  const primary =
+    pickBestPrimaryActionCandidate(candidates, headingSelector ? [headingSelector] : []) ||
+    pickBestCandidate(candidates, 'primary-action') ||
+    pickBestActionableCandidate(candidates, headingSelector ? [headingSelector] : []) ||
+    pickAnyCandidate(candidates, headingSelector ? [headingSelector] : []);
+  const support = generationProfile.includeSupportDraft ? pickBestCandidate(candidates, 'support-navigation') : null;
+  const navigation = generationProfile.includeNavigationDraft ? pickAnyCandidate(candidates, [primary?.selector || ''], ['navigation', 'sidebar', 'main']) : null;
+  const form = generationProfile.includeFormDraft ? pickBestCandidate(candidates, 'form-flow') : null;
 
   const drafts: SuggestedTourDraft[] = [];
 
   if (heading && primary) {
-    const usedSelectors = new Set<string>([primary.selector]);
+    const usedSelectors = new Set<string>([primary.selector, ...(headingSelector ? [headingSelector] : [])]);
     const steps: Step[] = [
       buildStep(
         'Decouvrir la page',
@@ -2054,13 +2201,14 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
       ),
     ];
 
-    const nextCandidate = pickAnyCandidate(candidates, Array.from(usedSelectors));
+    const nextCandidate = pickBestActionableCandidate(candidates, Array.from(usedSelectors)) || pickAnyCandidate(candidates, Array.from(usedSelectors));
     if (nextCandidate && steps.length < maxSteps) {
       usedSelectors.add(nextCandidate.selector);
+      const secondaryCopy = buildSecondaryStepCopy(nextCandidate, 'discovery');
       steps.push(
         buildStep(
-          'Etape suivante',
-          `Poursuivez avec cet element du contexte: ${nextCandidate.label}.`,
+          secondaryCopy.title,
+          secondaryCopy.content,
           nextCandidate.element,
           'BOTTOM',
           'CLICK',
@@ -2079,11 +2227,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
       options,
     );
 
-    if (draft.score >= minScore) drafts.push(draft);
+    if (steps.length >= 2 && draft.score >= minScore) drafts.push(draft);
   }
 
   if (primary) {
-    const secondary = pickAnyCandidate(candidates, [primary.selector]);
+    const secondary = pickBestActionableCandidate(candidates, [primary.selector]) || pickAnyCandidate(candidates, [primary.selector]);
     const steps: Step[] = [
       buildStep(
         'Action principale',
@@ -2095,10 +2243,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
     ];
 
     if (secondary && steps.length < maxSteps) {
+      const secondaryCopy = buildSecondaryStepCopy(secondary, 'primary-action');
       steps.push(
         buildStep(
-          'Completer le flux',
-          `Cet autre element peut completer le parcours: ${secondary.label}.`,
+          secondaryCopy.title,
+          secondaryCopy.content,
           secondary.element,
           'BOTTOM',
           'CLICK',
@@ -2107,10 +2256,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
     }
 
     if (form && !steps.some((step) => step.targetSelector === form.selector) && steps.length < maxSteps) {
+      const formCopy = buildSecondaryStepCopy(form, 'form-flow');
       steps.push(
         buildStep(
-          'Saisie ou validation',
-          `Le contexte contient aussi une zone de formulaire utile: ${form.label}.`,
+          formCopy.title,
+          formCopy.content,
           form.element,
           'BOTTOM',
           'CLICK',
@@ -2132,7 +2282,7 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
     if (draft.score >= minScore) drafts.push(draft);
   }
 
-  if (options?.includeSupportDraft !== false && support) {
+  if (generationProfile.includeSupportDraft && support) {
     const steps: Step[] = [
       buildStep(
         "Acceder a l'aide",
@@ -2144,10 +2294,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
     ];
 
     if (navigation && steps.length < maxSteps) {
+      const navigationCopy = buildSecondaryStepCopy(navigation, 'support-navigation');
       steps.push(
         buildStep(
-          'Explorer la navigation',
-          `La navigation detectee peut servir de point d'entree pour guider l'utilisateur: ${navigation.label}.`,
+          navigationCopy.title,
+          navigationCopy.content,
           navigation.element,
           'RIGHT',
           'CLICK',
@@ -2169,7 +2320,7 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
     if (draft.score >= minScore) drafts.push(draft);
   }
 
-  if (options?.includeFormDraft && form) {
+  if (generationProfile.includeFormDraft && form) {
     const steps: Step[] = [
       buildStep(
         'Zone de saisie',
@@ -2202,9 +2353,9 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
   }
 
   const draftsBeforeConflict = diversifyDrafts(drafts);
-  const resolvedConflicts = resolveDraftConflicts(draftsBeforeConflict, options);
-  const confidenceFiltered = resolvedConflicts.drafts.filter((draft) => draft.confidence >= minConfidence);
-  const limited = confidenceFiltered.slice(0, maxDrafts);
+  const confidenceFiltered = draftsBeforeConflict.filter((draft) => draft.confidence >= minConfidence);
+  const resolvedConflicts = resolveDraftConflicts(confidenceFiltered, options);
+  const limited = resolvedConflicts.drafts.slice(0, maxDrafts);
 
   if (options?.feedbackEnabled !== false) {
     for (const draft of limited) {

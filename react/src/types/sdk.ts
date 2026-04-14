@@ -81,6 +81,20 @@ export type OnboardingStage = 'discovery' | 'activation' | 'adoption' | 'retenti
 
 export type FlowCompatibilityMode = 'strict' | 'lenient';
 
+export type ContextualScenario = 'simple' | 'medium' | 'dynamic';
+export type ContextualAnalysisSeverity = 'strict' | 'balanced' | 'relaxed';
+
+export interface ContextualPublishFallbackPolicy {
+  enabled?: boolean;
+  maxAttempts?: number;
+  retryOnRejectedReasons?: string[];
+  relaxedMinConfidence?: number;
+  relaxedMinScore?: number;
+  includeSupportDraft?: boolean;
+  includeNavigationDraft?: boolean;
+  includeFormDraft?: boolean;
+}
+
 export interface SessionOnboardingContext {
   sessionId?: string;
   userId?: string;
@@ -214,6 +228,8 @@ export interface TourDraftGenerationOptions {
   flowCompatibilityMode?: FlowCompatibilityMode;
   knownFlowSignatures?: Record<string, string>;
   customKeywords?: Partial<Record<TourDraftIntent, string[]>>;
+  analysisSeverity?: ContextualAnalysisSeverity;
+  publishFallbackPolicy?: ContextualPublishFallbackPolicy;
 }
 
 export interface GuidedTour {
@@ -267,6 +283,61 @@ export interface ActiveToursResponse {
   success: boolean;
   count: number;
   tours: GuidedTour[];
+}
+
+export interface PublishContextualDraftStep {
+  title: string;
+  content: string;
+  targetSelector?: string;
+  position?: PositionType;
+  action?: ActionType;
+  skipAllowed?: boolean;
+  highlightElement?: boolean;
+  isPrimary?: boolean;
+  intent?: string;
+}
+
+export interface PublishContextualFlowVersioning {
+  flowVersion: string;
+  flowSignature: string;
+}
+
+export interface PublishContextualDraft {
+  name: string;
+  description?: string;
+  targetUrl: string;
+  intent?: string;
+  confidence: number;
+  score: number;
+  steps: PublishContextualDraftStep[];
+  flowVersioning: PublishContextualFlowVersioning;
+  explainability?: Record<string, unknown>;
+  diagnostics?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+}
+
+export interface PublishContextualDraftsRequest {
+  scenario: ContextualScenario;
+  drafts: PublishContextualDraft[];
+  autoActivate?: boolean;
+}
+
+export interface PublishContextualDraftsResponse {
+  success: boolean;
+  message: string;
+  report: {
+    processed: number;
+    created: number;
+    activated: number;
+    rejected: number;
+    skipped: number;
+    details: Array<{
+      draftName: string;
+      outcome: 'created' | 'activated' | 'rejected' | 'skipped';
+      reasons: string[];
+      tourId?: string;
+    }>;
+  };
 }
 
 export interface TourProgress {

@@ -1,12 +1,24 @@
-import { ActiveToursResponse, NormalizedSDKConfig, TrackBatchResponse, TrackEventInput, TrackEventResponse } from '../types';
+import {
+  ActiveToursResponse,
+  NormalizedSDKConfig,
+  PublishContextualDraftsRequest,
+  PublishContextualDraftsResponse,
+  TrackBatchResponse,
+  TrackEventInput,
+  TrackEventResponse,
+} from '../types';
 
 function buildHeaders(config: NormalizedSDKConfig): Record<string, string> {
   const token = config.sdkToken || config.getAccessToken?.() || config.accessToken;
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    'x-api-key': config.apiKey,
   };
+
+  // For authenticated dashboard flows, JWT is sufficient and avoids extra CORS preflight constraints.
+  if (!token && config.apiKey) {
+    headers['x-api-key'] = config.apiKey;
+  }
 
   if (token) {
     headers.Authorization = `Bearer ${token}`;
@@ -67,6 +79,16 @@ export const sdkApiClient = {
   getActiveToursForUrl(config: NormalizedSDKConfig, url: string): Promise<ActiveToursResponse> {
     const encodedUrl = encodeURIComponent(url);
     return request<ActiveToursResponse>(config, `/tours/active/url?url=${encodedUrl}`);
+  },
+
+  publishContextualDrafts(
+    config: NormalizedSDKConfig,
+    payload: PublishContextualDraftsRequest,
+  ): Promise<PublishContextualDraftsResponse> {
+    return request<PublishContextualDraftsResponse>(config, '/tours/contextual/publish', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
   },
 
   trackEvent(config: NormalizedSDKConfig, event: TrackEventInput): Promise<TrackEventResponse> {
