@@ -118,6 +118,33 @@ export interface FlowVersioningMetadata {
   migrationNotes: string[];
 }
 
+export interface PageElementSnapshot {
+  selector: string;
+  text?: string;
+  role?: string;
+  tag: string;
+  intent?: TourDraftIntent;
+  actionable: boolean;
+  bbox: {
+    top: number;
+    left: number;
+    width: number;
+    height: number;
+  };
+}
+
+export interface PageStructuralSnapshot {
+  pageUrl: string;
+  pathname: string;
+  pageTitle: string;
+  capturedAt: string;
+  viewport: {
+    width: number;
+    height: number;
+  };
+  elements: PageElementSnapshot[];
+}
+
 export interface TourDraftExplainability {
   generatedFrom: string[];
   sourceCandidateCount: number;
@@ -186,6 +213,11 @@ export interface SuggestedTourDraft extends GuidedTour {
   detectedSelectors: string[];
   explainability?: TourDraftExplainability;
   flowVersioning?: FlowVersioningMetadata;
+  metadata?: {
+    previewContext?: PageStructuralSnapshot;
+    [key: string]: unknown;
+  };
+  diagnostics?: Record<string, unknown>;
   sessionContextSnapshot?: {
     stage: OnboardingStage;
     progress: number;

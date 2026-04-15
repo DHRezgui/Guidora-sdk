@@ -2,6 +2,7 @@ import {
   ConflictResolutionStrategy,
   ContextualGenerationDebugReport,
   ContextualAnalysisSeverity,
+  PageStructuralSnapshot,
   FlowCompatibilityMode,
   FlowVersioningMetadata,
   OnboardingStage,
@@ -1845,6 +1846,65 @@ function getPageHeading(): HTMLElement | null {
   return null;
 }
 
+type SnapshotSource = {
+  element: HTMLElement;
+  selector: string;
+  label?: string;
+  intent?: TourDraftIntent;
+};
+
+function clampSnapshotText(value?: string): string | undefined {
+  const text = normalizeText(value);
+  if (!text) return undefined;
+  return text.slice(0, 180);
+}
+
+function buildPreviewContextSnapshot(sources: SnapshotSource[]): PageStructuralSnapshot | undefined {
+  if (typeof window === 'undefined') return undefined;
+
+  const deduped: SnapshotSource[] = [];
+  const seen = new Set<string>();
+
+  for (const source of sources) {
+    if (!source?.selector || !source.element?.isConnected) continue;
+    if (seen.has(source.selector)) continue;
+    seen.add(source.selector);
+    deduped.push(source);
+    if (deduped.length >= 40) break;
+  }
+
+  const elements = deduped.map((source) => {
+    const rect = source.element.getBoundingClientRect();
+    const role = source.element.getAttribute('role') || undefined;
+    return {
+      selector: source.selector,
+      text: clampSnapshotText(source.label || source.element.textContent || source.element.getAttribute('aria-label') || ''),
+      role,
+      tag: source.element.tagName.toLowerCase(),
+      intent: source.intent,
+      actionable: isActionableElement(source.element),
+      bbox: {
+        top: Math.round(rect.top),
+        left: Math.round(rect.left),
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+      },
+    };
+  });
+
+  return {
+    pageUrl: window.location.href,
+    pathname: window.location.pathname,
+    pageTitle: document.title || 'Untitled page',
+    capturedAt: new Date().toISOString(),
+    viewport: {
+      width: Math.round(window.innerWidth || 0),
+      height: Math.round(window.innerHeight || 0),
+    },
+    elements,
+  };
+}
+
 function inferStepPosition(element: HTMLElement): PositionType {
   const rect = element.getBoundingClientRect();
   const viewportWidth = Math.max(1, window.innerWidth || 1);
@@ -1970,6 +2030,14 @@ function createDraft(
   const sessionContext = getSessionContext(options);
   const stage = normalizeStage(sessionContext?.currentStage);
   const progress = getProgress(sessionContext);
+  const previewContext = buildPreviewContextSnapshot(
+    sourceCandidates.map((candidate) => ({
+      element: candidate.element,
+      selector: candidate.selector,
+      label: candidate.label,
+      intent: candidate.intent,
+    })),
+  );
 
   const draftBase: SuggestedTourDraft = {
     generatedBy: 'contextual-tour-generator',
@@ -1994,6 +2062,11 @@ function createDraft(
             actionabilityPenalty: Math.round(averageActionabilityPenalty),
           },
           conflictNotes: [],
+        }
+      : undefined,
+    metadata: previewContext
+      ? {
+          previewContext,
         }
       : undefined,
     name,
@@ -2088,6 +2161,14 @@ function buildSequenceDraft(
   const sequenceActionabilityPenalty = uniqueChain.reduce((total, candidate) => total + candidate.actionabilityPenalty, 0) / uniqueChain.length;
   const confidence = Math.min(100, Math.round(58 + sequenceScore * 30 + uniqueChain.length * 4));
   if (confidence < 45) return null;
+  const previewContext = buildPreviewContextSnapshot(
+    uniqueChain.map((candidate) => ({
+      element: candidate.element,
+      selector: candidate.selector,
+      label: candidate.label,
+      intent: candidate.intent,
+    })),
+  );
 
   const draftBase: SuggestedTourDraft = {
     generatedBy: 'contextual-tour-generator',
@@ -2118,6 +2199,11 @@ function buildSequenceDraft(
             actionabilityPenalty: Math.round(sequenceActionabilityPenalty),
           },
           conflictNotes: [],
+        }
+      : undefined,
+    metadata: previewContext
+      ? {
+          previewContext,
         }
       : undefined,
     name: `Parcours séquentiel - ${document.title || action?.label || 'page courante'}`,
