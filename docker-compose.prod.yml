@@ -1,0 +1,13 @@
+services:
+  sdk:
+    build:
+      context: .
+      dockerfile: .docker/prod/Dockerfile
+    env_file: .docker/prod/.env
+    networks:
+      - onboarding-sdk-prod
+    restart: always
+
+networks:
+  onboarding-sdk-prod:
+    driver: bridge

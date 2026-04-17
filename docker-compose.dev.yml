@@ -1,0 +1,17 @@
+services:
+  sdk:
+    build:
+      context: .
+      dockerfile: .docker/develop/Dockerfile
+    env_file: .docker/develop/.env
+    volumes:
+      - ./react:/app
+      - /app/node_modules
+    command: npm run dev
+    networks:
+      - onboarding-sdk-dev
+    restart: unless-stopped
+
+networks:
+  onboarding-sdk-dev:
+    driver: bridge
