@@ -13,11 +13,7 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true,
-    "rootDir": "./src",
-    "baseUrl": ".",
-    "paths": {
-      "@/*": ["src/*"]
-    }
+    "rootDir": "./src"
   },
   "include": ["src"],
   "exclude": ["node_modules", "dist", "examples", "tests"]
