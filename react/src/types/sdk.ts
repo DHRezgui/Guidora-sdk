@@ -11,6 +11,8 @@ export type PositionType =
 
 export type ActionType = 'CLICK' | 'HOVER' | 'SCROLL' | 'NEXT' | 'SKIP' | 'COMPLETE';
 
+export type StepType = 'tooltip' | 'highlight' | 'modal' | 'form' | 'tutorial' | 'checklist';
+
 export type EventType = 'PAGE_VIEW' | 'CLICK' | 'SCROLL' | 'HOVER' | 'EXIT' | 'FORM_SUBMIT' | 'ERROR';
 
 export type FrictionType =
@@ -63,6 +65,7 @@ export interface Step {
   orderIndex?: number;
   title: string;
   content: string;
+  stepType?: StepType;
   targetSelector?: string;
   position?: PositionType;
   action?: ActionType;
@@ -81,7 +84,7 @@ export type OnboardingStage = 'discovery' | 'activation' | 'adoption' | 'retenti
 
 export type FlowCompatibilityMode = 'strict' | 'lenient';
 
-export type ContextualScenario = 'simple' | 'medium' | 'dynamic';
+export type ContextualScenario = 'simple' | 'medium' | 'dynamic' | 'stress';
 export type ContextualAnalysisSeverity = 'strict' | 'balanced' | 'relaxed';
 
 export interface ContextualPublishFallbackPolicy {
@@ -325,6 +328,7 @@ export interface PublishContextualDraftStep {
   action?: ActionType;
   skipAllowed?: boolean;
   highlightElement?: boolean;
+  stepType?: StepType;
   isPrimary?: boolean;
   intent?: string;
 }
@@ -369,6 +373,12 @@ export interface PublishContextualDraftsResponse {
       reasons: string[];
       tourId?: string;
     }>;
+    monitoring?: {
+      environment: string;
+      activationPolicyMode: 'auto' | 'manual_review';
+      reasonsBreakdown: Record<string, number>;
+      postPublishChecks: string[];
+    };
   };
 }
 

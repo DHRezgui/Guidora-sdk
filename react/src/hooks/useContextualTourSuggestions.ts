@@ -55,6 +55,7 @@ function toPublishStep(step: Step): PublishContextualDraftStep {
     action: step.action,
     skipAllowed: step.skipAllowed,
     highlightElement: step.highlightElement,
+    stepType: step.stepType,
     isPrimary: typeof rawStep.isPrimary === 'boolean' ? rawStep.isPrimary : undefined,
     intent: typeof rawStep.intent === 'string' ? rawStep.intent : undefined,
   };
@@ -204,10 +205,11 @@ export function useContextualTourSuggestions(
         }
 
         console.info('[SDK] Publishing sanitized drafts:', sanitizedDrafts);
+        const defaultAutoActivate = process.env.NODE_ENV === 'production' ? false : true;
         const response = await sdkApiClient.publishContextualDrafts(resolvedConfig, {
           scenario: options?.publishScenario ?? 'medium',
           drafts: sanitizedDrafts,
-          autoActivate: options?.autoActivatePublishedDrafts ?? true,
+          autoActivate: options?.autoActivatePublishedDrafts ?? defaultAutoActivate,
         });
         console.info('[SDK] Publish response report:', response.report);
         setLastPublishReport(response.report);

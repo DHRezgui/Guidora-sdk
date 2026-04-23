@@ -9,6 +9,7 @@ import {
   PositionType,
   SessionOnboardingContext,
   Step,
+  StepType,
   SuggestedTourDraft,
   TourDraftGenerationOptions,
   TourDraftIntent,
@@ -1941,26 +1942,112 @@ function inferStepPosition(element: HTMLElement): PositionType {
   return spaceBottom >= spaceTop ? 'BOTTOM' : 'TOP';
 }
 
+interface StepBuildContext {
+  intent?: TourDraftIntent;
+  stepIndex?: number;
+  totalSteps?: number;
+}
+
+function inferStepType(
+  title: string,
+  content: string,
+  element: HTMLElement,
+  action: Step['action'],
+  context?: StepBuildContext,
+): StepType {
+  const normalizedTitle = normalizeText(title);
+  const combined = normalizeText(`${title} ${content} ${getLabel(element)}`);
+  const zone = detectZone(element);
+  const tagName = element.tagName.toLowerCase();
+  const role = normalizeText(element.getAttribute('role'));
+  const inputType = normalizeText(element.getAttribute('type'));
+  const ariaHasPopup = normalizeText(element.getAttribute('aria-haspopup'));
+  const isModalZone =
+    zone === 'modal' || Boolean(element.closest('[role="dialog"], [aria-modal="true"], .modal, .drawer'));
+  const isFormElement = isFormControlElement(element) || Boolean(element.closest('form'));
+  const isButtonLike =
+    tagName === 'button' ||
+    tagName === 'a' ||
+    (tagName === 'input' && (inputType === 'button' || inputType === 'submit' || inputType === 'reset')) ||
+    role === 'button' ||
+    role === 'link' ||
+    role === 'menuitem' ||
+    role === 'tab';
+  const isChecklistElement =
+    tagName === 'ul' ||
+    tagName === 'ol' ||
+    tagName === 'li' ||
+    (tagName === 'input' && (inputType === 'checkbox' || inputType === 'radio')) ||
+    role === 'checkbox' ||
+    role === 'menuitemcheckbox' ||
+    role === 'treeitem';
+  const hasVideoTarget =
+    tagName === 'video' ||
+    tagName === 'iframe' ||
+    Boolean(element.querySelector('video, iframe[src*="youtube"], iframe[src*="vimeo"], iframe[src*="loom"]'));
+  const looksLikeTutorial =
+    hasVideoTarget || /tutorial|video|walkthrough|demo|youtube|vimeo|loom|formation/.test(combined);
+  const strongChecklistVocabulary = /checklist|to-do|todo|a faire|step by step|liste de taches|task list/.test(combined);
+  const formVocabulary = /zone de saisie|formulaire|champ|saisie|input|email|mot de passe|password|select|dropdown|texte|notes/.test(combined);
+  const validationVocabulary = /validation|valider|submit|soumettre|confirmer|confirm|enregistrer|save/.test(combined);
+  const sequenceChecklistHint =
+    (context?.totalSteps || 0) >= 4 && (context?.stepIndex || 0) > 0 && context?.intent === 'discovery';
+
+  // Explicit semantic rules for generator-produced labels and common onboarding copy.
+  if (/decouvrir la page|point d'entree|point d entree|acceder a l'aide|acceder a l aide|consulter la navigation/.test(normalizedTitle)) {
+    return 'tooltip';
+  }
+
+  if (looksLikeTutorial) return 'tutorial';
+  if (isModalZone || ariaHasPopup === 'dialog') return 'modal';
+
+  // Checklist should be rare and tied to explicit checklist semantics.
+  if (strongChecklistVocabulary && (isChecklistElement || !isActionableElement(element))) return 'checklist';
+  if (sequenceChecklistHint && !isButtonLike && !isFormElement) return 'checklist';
+
+  // Form should map to actual form controls/contexts, not generic action buttons.
+  if (isFormControlElement(element)) return 'form';
+  if (context?.intent === 'form-flow' && !isButtonLike && (isFormElement || formVocabulary)) return 'form';
+  if ((formVocabulary || validationVocabulary) && !isButtonLike && Boolean(element.closest('form'))) return 'form';
+
+  if (context?.intent === 'support-navigation' && (zone === 'navigation' || zone === 'sidebar' || zone === 'header')) {
+    return 'tooltip';
+  }
+
+  // Validation labels on buttons are usually key actions rather than form fields.
+  if (validationVocabulary && isButtonLike) return 'highlight';
+
+  if (action === 'HOVER' || (context?.intent === 'discovery' && (context?.stepIndex || 0) === 0)) return 'tooltip';
+  return 'highlight';
+}
+
+function shouldHighlightElement(stepType: StepType): boolean {
+  return stepType === 'highlight' || stepType === 'form';
+}
+
 function buildStep(
   title: string,
   content: string,
   element: HTMLElement,
   position?: PositionType,
   action: Step['action'] = 'NEXT',
+  context?: StepBuildContext,
 ): Step {
   const inferredPosition = inferStepPosition(element);
   const resolvedPosition = !position || position === 'BOTTOM' ? inferredPosition : position;
+  const stepType = inferStepType(title, content, element, action, context);
 
   stepCounter += 1;
   return {
     id: `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Date.now()}-${stepCounter}`,
     title,
     content,
+    stepType,
     targetSelector: buildUniqueSelector(element),
     position: resolvedPosition,
     action,
     skipAllowed: true,
-    highlightElement: true,
+    highlightElement: shouldHighlightElement(stepType),
   };
 }
 
@@ -2152,6 +2239,11 @@ function buildSequenceDraft(
       candidate.element,
       positions[index] || 'BOTTOM',
       actions[index] || 'NEXT',
+      {
+        intent: candidate.intent,
+        stepIndex: index,
+        totalSteps: Math.min(4, uniqueChain.length),
+      },
     );
   });
 
@@ -2316,6 +2408,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
         heading,
         'BOTTOM',
         'NEXT',
+        {
+          intent: 'discovery',
+          stepIndex: 0,
+          totalSteps: maxSteps,
+        },
       ),
       buildStep(
         'Action principale',
@@ -2323,6 +2420,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
         primary.element,
         'BOTTOM',
         'CLICK',
+        {
+          intent: primary.intent,
+          stepIndex: 1,
+          totalSteps: maxSteps,
+        },
       ),
     ];
 
@@ -2337,6 +2439,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
           nextCandidate.element,
           'BOTTOM',
           'CLICK',
+          {
+            intent: nextCandidate.intent,
+            stepIndex: steps.length,
+            totalSteps: maxSteps,
+          },
         ),
       );
     }
@@ -2364,6 +2471,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
         primary.element,
         'BOTTOM',
         'CLICK',
+        {
+          intent: primary.intent,
+          stepIndex: 0,
+          totalSteps: maxSteps,
+        },
       ),
     ];
 
@@ -2376,6 +2488,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
           secondary.element,
           'BOTTOM',
           'CLICK',
+          {
+            intent: secondary.intent,
+            stepIndex: steps.length,
+            totalSteps: maxSteps,
+          },
         ),
       );
     }
@@ -2389,6 +2506,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
           form.element,
           'BOTTOM',
           'CLICK',
+          {
+            intent: form.intent,
+            stepIndex: steps.length,
+            totalSteps: maxSteps,
+          },
         ),
       );
     }
@@ -2415,6 +2537,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
         support.element,
         'BOTTOM_RIGHT',
         'CLICK',
+        {
+          intent: support.intent,
+          stepIndex: 0,
+          totalSteps: maxSteps,
+        },
       ),
     ];
 
@@ -2427,6 +2554,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
           navigation.element,
           'RIGHT',
           'CLICK',
+          {
+            intent: navigation.intent,
+            stepIndex: steps.length,
+            totalSteps: maxSteps,
+          },
         ),
       );
     }
@@ -2453,6 +2585,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
         form.element,
         'BOTTOM',
         'CLICK',
+        {
+          intent: form.intent,
+          stepIndex: 0,
+          totalSteps: maxSteps,
+        },
       ),
     ];
 
