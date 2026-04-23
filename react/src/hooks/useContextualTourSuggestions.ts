@@ -51,6 +51,7 @@ function toPublishStep(step: Step): PublishContextualDraftStep {
     title: step.title,
     content: step.content,
     targetSelector: step.targetSelector,
+    stepTargetUrl: step.stepTargetUrl,
     position: step.position,
     action: step.action,
     skipAllowed: step.skipAllowed,

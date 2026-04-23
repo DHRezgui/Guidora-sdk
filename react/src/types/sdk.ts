@@ -67,6 +67,7 @@ export interface Step {
   content: string;
   stepType?: StepType;
   targetSelector?: string;
+  stepTargetUrl?: string;
   position?: PositionType;
   action?: ActionType;
   skipAllowed?: boolean;
@@ -324,6 +325,7 @@ export interface PublishContextualDraftStep {
   title: string;
   content: string;
   targetSelector?: string;
+  stepTargetUrl?: string;
   position?: PositionType;
   action?: ActionType;
   skipAllowed?: boolean;

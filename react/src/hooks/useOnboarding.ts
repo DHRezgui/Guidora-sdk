@@ -20,6 +20,41 @@ export interface UseOnboardingOptions {
   role?: string;
 }
 
+const ACTIVE_TOUR_SESSION_KEY = '__trustdev_active_tour_session_v1';
+
+type ActiveTourSessionSnapshot = {
+  tour: GuidedTour;
+  stepIndex: number;
+  savedAt: number;
+};
+
+function readActiveTourSnapshot(): ActiveTourSessionSnapshot | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.sessionStorage.getItem(ACTIVE_TOUR_SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as ActiveTourSessionSnapshot;
+    if (!parsed?.tour || !Array.isArray(parsed.tour.steps)) return null;
+    if (typeof parsed.stepIndex !== 'number') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function writeActiveTourSnapshot(snapshot: ActiveTourSessionSnapshot | null): void {
+  if (typeof window === 'undefined') return;
+  try {
+    if (!snapshot) {
+      window.sessionStorage.removeItem(ACTIVE_TOUR_SESSION_KEY);
+      return;
+    }
+    window.sessionStorage.setItem(ACTIVE_TOUR_SESSION_KEY, JSON.stringify(snapshot));
+  } catch {
+    // Ignore session storage write errors.
+  }
+}
+
 export function useOnboarding(options?: UseOnboardingOptions) {
   const pageUrl = getCurrentPageUrl();
   const [activeTour, setActiveTour] = useState<GuidedTour | null>(null);
@@ -28,7 +63,11 @@ export function useOnboarding(options?: UseOnboardingOptions) {
   const debug = useOnboardingDebug({ enabled: options?.debug });
   const session = useOnboardingSession();
   const activeTours = useActiveToursForUrl(options?.config, { autoFetch: true, url: pageUrl });
-  const tour = useTour({ autoOpen: false });
+  const tour = useTour({
+    autoOpen: false,
+    onComplete: () => writeActiveTourSnapshot(null),
+    onSkip: () => writeActiveTourSnapshot(null),
+  });
   const tourProgress = useTourProgress(activeTour?.id);
   const resolver = useTourTargetResolver();
   const friction = useFrictionDetection({
@@ -87,6 +126,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
 
   const stop = useCallback(() => {
     tour.closeTour();
+    writeActiveTourSnapshot(null);
     debug.info('Tour stopped');
   }, [debug, tour]);
 
@@ -94,6 +134,29 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     if (!activeTour?.id) return;
     tourProgress.setStepIndex(tour.currentStepIndex);
   }, [activeTour?.id, tour.currentStepIndex, tourProgress]);
+
+  useEffect(() => {
+    if (!tour.isOpen || !activeTour) return;
+    writeActiveTourSnapshot({
+      tour: activeTour,
+      stepIndex: tour.currentStepIndex,
+      savedAt: Date.now(),
+    });
+  }, [activeTour, tour.currentStepIndex, tour.isOpen]);
+
+  useEffect(() => {
+    if (!options?.autoStart) return;
+    if (tour.isOpen) return;
+    const snapshot = readActiveTourSnapshot();
+    if (!snapshot) return;
+
+    setActiveTour(snapshot.tour);
+    tour.startTour(snapshot.tour, snapshot.stepIndex);
+    debug.info('Restored active tour from session snapshot', {
+      tourId: snapshot.tour.id,
+      stepIndex: snapshot.stepIndex,
+    });
+  }, [debug, options?.autoStart, tour]);
 
   useEffect(() => {
     if (!options?.autoStart) return;

@@ -24,6 +24,9 @@ export interface TourRendererProps {
   tooltipPosition?: PositionType;
   targetNotFound?: boolean;
   retryingSelector?: boolean;
+  routeMismatch?: boolean;
+  expectedRoute?: string;
+  currentRoute?: string;
 }
 
 /**
@@ -48,6 +51,9 @@ export function TourRenderer({
   tooltipPosition = 'BOTTOM',
   targetNotFound = false,
   retryingSelector = false,
+  routeMismatch = false,
+  expectedRoute,
+  currentRoute,
 }: TourRendererProps) {
   const [showFallback, setShowFallback] = useState(false);
 
@@ -69,7 +75,7 @@ export function TourRenderer({
 
   const isFirstStep = currentIndex <= 0;
   const isLastStep = currentIndex >= totalSteps - 1;
-  const hasTarget = targetRect && !targetNotFound;
+  const hasTarget = targetRect && !targetNotFound && !routeMismatch;
 
   return (
     <TourPortal>
@@ -97,7 +103,7 @@ export function TourRenderer({
       ) : null}
 
       {/* Tooltip principal avec navigation */}
-      {showTooltip && currentStep ? (
+      {showTooltip && currentStep && !routeMismatch ? (
         <Tooltip
           open={!targetNotFound}
           title={currentStep.title}
@@ -118,8 +124,38 @@ export function TourRenderer({
         />
       ) : null}
 
+      {routeMismatch ? (
+        <div
+          style={{
+            position: 'fixed',
+            top: 24,
+            right: 24,
+            zIndex: 2147483600,
+            maxWidth: 420,
+            background: '#111827',
+            color: '#fff',
+            borderRadius: 12,
+            boxShadow: '0 10px 25px rgba(0,0,0,0.25)',
+            padding: '14px 16px',
+            fontSize: 13,
+            lineHeight: 1.45,
+          }}
+        >
+          <div style={{ fontWeight: 700, marginBottom: 6 }}>Navigation requise pour continuer</div>
+          <div>
+            Cette étape attend la page <code>{expectedRoute || 'N/A'}</code>.
+          </div>
+          <div style={{ opacity: 0.85, marginTop: 4 }}>
+            Route actuelle: <code>{currentRoute || 'N/A'}</code>
+          </div>
+          <div style={{ opacity: 0.8, marginTop: 8 }}>
+            Naviguez vers la route attendue, le tour reprendra automatiquement.
+          </div>
+        </div>
+      ) : null}
+
       {/* Fallback si le sélecteur target n'est pas trouvé */}
-      {showFallback && targetNotFound ? (
+      {showFallback && targetNotFound && !routeMismatch ? (
         <TargetNotFoundFallback
           open={true}
           selector={currentStep?.targetSelector}

@@ -17,6 +17,19 @@ export interface TourViewerProps {
   onTourSkipped?: (tourId?: string) => void;
 }
 
+function normalizeRoutePath(value?: string): string {
+  if (!value) return '';
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+
+  try {
+    const parsed = new URL(trimmed, typeof window !== 'undefined' ? window.location.origin : 'http://localhost');
+    return parsed.pathname.replace(/\/+$/, '') || '/';
+  } catch {
+    return trimmed.split('?')[0].split('#')[0].replace(/\/+$/, '') || '/';
+  }
+}
+
 /**
  * Composant haut-niveau qui orchestre tout automatiquement:
  * - Initialise useOnboarding hook
@@ -52,10 +65,47 @@ export function TourViewer({
   );
   const [targetNotFound, setTargetNotFound] = useState(false);
   const [resolveAttempt, setResolveAttempt] = useState(0);
+  const [currentPathname, setCurrentPathname] = useState(() =>
+    typeof window !== 'undefined' ? window.location.pathname : '',
+  );
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const updatePath = () => {
+      setCurrentPathname(window.location.pathname);
+    };
+
+    const originalPushState = window.history.pushState;
+    const originalReplaceState = window.history.replaceState;
+
+    window.history.pushState = function (...args) {
+      originalPushState.apply(this, args);
+      updatePath();
+    };
+    window.history.replaceState = function (...args) {
+      originalReplaceState.apply(this, args);
+      updatePath();
+    };
+
+    window.addEventListener('popstate', updatePath);
+    window.addEventListener('hashchange', updatePath);
+
+    return () => {
+      window.history.pushState = originalPushState;
+      window.history.replaceState = originalReplaceState;
+      window.removeEventListener('popstate', updatePath);
+      window.removeEventListener('hashchange', updatePath);
+    };
+  }, []);
+
+  const expectedStepRoute = normalizeRoutePath(onboarding.tour.currentStep?.stepTargetUrl);
+  const normalizedCurrentRoute = normalizeRoutePath(currentPathname);
+  const routeMismatch = Boolean(expectedStepRoute) && expectedStepRoute !== normalizedCurrentRoute;
 
   // Résoudre le sélecteur de la step courante
   useEffect(() => {
-    if (!onboarding.tour.isOpen || !onboarding.tour.currentStep?.targetSelector) {
+    if (!onboarding.tour.isOpen || routeMismatch || !onboarding.tour.currentStep?.targetSelector) {
       setTargetRect(null);
       setTargetNotFound(false);
       return;
@@ -93,6 +143,7 @@ export function TourViewer({
     onboarding.tour.currentStep?.targetSelector,
     onboarding.resolver,
     onboarding.debug,
+    routeMismatch,
     resolveAttempt,
   ]);
 
@@ -137,8 +188,11 @@ export function TourViewer({
       showBeacon={showBeacon}
       showTooltip={showTooltip}
       tooltipPosition={tooltipPosition}
-      targetNotFound={targetNotFound}
+      targetNotFound={!routeMismatch && targetNotFound}
       retryingSelector={onboarding.resolver.isResolving}
+      routeMismatch={routeMismatch}
+      expectedRoute={expectedStepRoute}
+      currentRoute={normalizedCurrentRoute}
     />
   );
 }
