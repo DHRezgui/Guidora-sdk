@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useOnboarding } from '../hooks/useOnboarding';
 import { PositionType, SDKConfig } from '../types';
 import { OnboardingTheme } from './theme';
@@ -54,6 +54,13 @@ export function TourViewer({
   onTourComplete,
   onTourSkipped,
 }: TourViewerProps) {
+  const activeTargetRef = useRef<HTMLElement | null>(null);
+  const previewBridgeRef = useRef<{
+    selector: string;
+    source: Window | null;
+    origin: string;
+  } | null>(null);
+
   const onboarding = useOnboarding({
     config,
     autoStart,
@@ -68,6 +75,19 @@ export function TourViewer({
   const [currentPathname, setCurrentPathname] = useState(() =>
     typeof window !== 'undefined' ? window.location.pathname : '',
   );
+
+  const syncTargetRect = useCallback(() => {
+    const el = activeTargetRef.current;
+    if (!el) return;
+    const domRect = el.getBoundingClientRect();
+    setTargetRect({
+      // Tooltip/overlay are fixed-position layers, so keep viewport coordinates.
+      top: domRect.top,
+      left: domRect.left,
+      width: domRect.width,
+      height: domRect.height,
+    });
+  }, []);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -99,6 +119,85 @@ export function TourViewer({
     };
   }, []);
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const sendTargetRect = () => {
+      const bridge = previewBridgeRef.current;
+      if (!bridge?.source || !bridge.selector) return;
+
+      const target = document.querySelector(bridge.selector) as HTMLElement | null;
+      const rect = target?.getBoundingClientRect();
+      bridge.source.postMessage(
+        {
+          type: 'TRUSTDEV_PREVIEW_TARGET_RECT',
+          selector: bridge.selector,
+          href: window.location.href,
+          rect: rect
+            ? {
+                top: rect.top,
+                left: rect.left,
+                width: rect.width,
+                height: rect.height,
+              }
+            : null,
+        },
+        bridge.origin,
+      );
+    };
+
+    let rafId: number | null = null;
+    const scheduleSend = () => {
+      if (rafId !== null) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = null;
+        sendTargetRect();
+      });
+    };
+
+    const onMessage = (event: MessageEvent) => {
+      const data = event.data as { type?: string; selector?: string } | null;
+      if (!data || data.type !== 'TRUSTDEV_PREVIEW_REQUEST_TARGET' || !data.selector) {
+        return;
+      }
+
+      previewBridgeRef.current = {
+        selector: data.selector,
+        source: event.source as Window | null,
+        origin: event.origin || '*',
+      };
+      scheduleSend();
+    };
+
+    const onViewportChange = () => {
+      if (!previewBridgeRef.current) return;
+      scheduleSend();
+    };
+
+    const observer = new MutationObserver(onViewportChange);
+    if (document.body) {
+      observer.observe(document.body, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+      });
+    }
+
+    window.addEventListener('message', onMessage);
+    window.addEventListener('scroll', onViewportChange, true);
+    window.addEventListener('resize', onViewportChange);
+
+    return () => {
+      if (rafId !== null) {
+        window.cancelAnimationFrame(rafId);
+      }
+      observer.disconnect();
+      window.removeEventListener('message', onMessage);
+      window.removeEventListener('scroll', onViewportChange, true);
+      window.removeEventListener('resize', onViewportChange);
+    };
+  }, []);
+
   const expectedStepRoute = normalizeRoutePath(onboarding.tour.currentStep?.stepTargetUrl);
   const normalizedCurrentRoute = normalizeRoutePath(currentPathname);
   const routeMismatch = Boolean(expectedStepRoute) && expectedStepRoute !== normalizedCurrentRoute;
@@ -106,38 +205,99 @@ export function TourViewer({
   // Résoudre le sélecteur de la step courante
   useEffect(() => {
     if (!onboarding.tour.isOpen || routeMismatch || !onboarding.tour.currentStep?.targetSelector) {
+      activeTargetRef.current = null;
       setTargetRect(null);
       setTargetNotFound(false);
       return;
     }
 
+    let cancelled = false;
+    let raf1: number | null = null;
+    let raf2: number | null = null;
+    let observer: MutationObserver | null = null;
+
+    const onViewportChange = () => {
+      syncTargetRect();
+    };
+
     const resolveSelector = async () => {
       try {
-        const rect = await onboarding.resolver.resolveTarget(onboarding.tour.currentStep!.targetSelector, {
+        const targetEl = await onboarding.resolver.resolveTarget(onboarding.tour.currentStep!.targetSelector, {
           retries: 8,
           intervalMs: 250,
         });
 
-        if (rect) {
-          const domRect = rect.getBoundingClientRect();
-          setTargetRect({
-            top: domRect.top + window.scrollY,
-            left: domRect.left + window.scrollX,
-            width: domRect.width,
-            height: domRect.height,
-          });
+        if (cancelled) return;
+
+        if (targetEl) {
+          activeTargetRef.current = targetEl;
+          const domRect = targetEl.getBoundingClientRect();
+          const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+          const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+          const isOutOfViewport =
+            domRect.bottom < 0 ||
+            domRect.top > viewportHeight ||
+            domRect.right < 0 ||
+            domRect.left > viewportWidth;
+
+          if (isOutOfViewport) {
+            targetEl.scrollIntoView({
+              behavior: 'smooth',
+              block: 'center',
+              inline: 'center',
+            });
+            // Wait for smooth scroll/layout to settle, then read the final rect.
+            raf1 = window.requestAnimationFrame(() => {
+              raf2 = window.requestAnimationFrame(() => {
+                if (!cancelled) syncTargetRect();
+              });
+            });
+          } else {
+            setTargetRect({
+              // Tooltip/overlay are fixed-position layers, so keep viewport coordinates.
+              top: domRect.top,
+              left: domRect.left,
+              width: domRect.width,
+              height: domRect.height,
+            });
+          }
+
+          window.addEventListener('scroll', onViewportChange, true);
+          window.addEventListener('resize', onViewportChange);
+          observer = new MutationObserver(onViewportChange);
+          if (document.body) {
+            observer.observe(document.body, {
+              subtree: true,
+              childList: true,
+              attributes: true,
+            });
+          }
+
           setTargetNotFound(false);
         } else {
+          activeTargetRef.current = null;
           setTargetRect(null);
           setTargetNotFound(true);
         }
       } catch (error) {
         onboarding.debug.error('Failed to resolve target', { error });
+        activeTargetRef.current = null;
+        setTargetRect(null);
         setTargetNotFound(true);
       }
     };
 
     void resolveSelector();
+
+    return () => {
+      cancelled = true;
+      activeTargetRef.current = null;
+      if (raf1 !== null) window.cancelAnimationFrame(raf1);
+      if (raf2 !== null) window.cancelAnimationFrame(raf2);
+      if (observer) observer.disconnect();
+      window.removeEventListener('scroll', onViewportChange, true);
+      window.removeEventListener('resize', onViewportChange);
+    };
   }, [
     onboarding.tour.isOpen,
     onboarding.tour.currentStep?.targetSelector,
@@ -145,6 +305,7 @@ export function TourViewer({
     onboarding.debug,
     routeMismatch,
     resolveAttempt,
+    syncTargetRect,
   ]);
 
   const handleNext = useCallback(() => {

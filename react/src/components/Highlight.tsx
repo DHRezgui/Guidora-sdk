@@ -39,7 +39,7 @@ export function Highlight({
 
   return (
     <TourPortal>
-      <div className="td-layer" style={cssVars}>
+      <div className="td-layer td-layer--highlight" style={cssVars}>
         {withOverlay ? <TourOverlay open={open} onClick={onOverlayClick} /> : null}
         <div
           className={`td-highlight ${className || ''}`.trim()}

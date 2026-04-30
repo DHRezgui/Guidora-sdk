@@ -74,13 +74,16 @@ export function TourRenderer({
   if (!isOpen || !currentStep) return null;
 
   const isFirstStep = currentIndex <= 0;
-  const isLastStep = currentIndex >= totalSteps - 1;
+  const isLastStep = totalSteps > 0 && currentIndex >= totalSteps - 1;
   const hasTarget = targetRect && !targetNotFound && !routeMismatch;
+  const stepHighlightEnabled = currentStep.highlightElement !== false;
+  const shouldShowStepHighlight = showHighlight && stepHighlightEnabled && hasTarget;
+  const shouldShowSkip = currentStep.skipAllowed !== false && !isLastStep;
 
   return (
     <TourPortal>
       {/* Overlay highlight autour de l'élément cible */}
-      {showHighlight && hasTarget ? (
+      {shouldShowStepHighlight ? (
         <Highlight
           open={true}
           targetRect={targetRect}
@@ -114,8 +117,8 @@ export function TourRenderer({
           totalSteps={totalSteps}
           theme={theme}
           showNavigation={true}
-          showSkip={currentStep.skipAllowed !== false}
-          onNext={isLastStep ? undefined : onNext}
+          showSkip={shouldShowSkip}
+          onNext={onNext}
           onPrev={isFirstStep ? undefined : onPrev}
           onSkip={onSkip}
           onClose={onClose}

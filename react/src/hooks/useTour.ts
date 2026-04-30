@@ -24,23 +24,44 @@ export interface UseTourResult {
   completeTour: () => void;
 }
 
+function sortStepsByOrderIndex(steps: Step[]): Step[] {
+  return [...steps]
+    .map((step, idx) => ({ step, idx }))
+    .sort((a, b) => {
+      const ao = typeof a.step.orderIndex === 'number' ? a.step.orderIndex : Number.MAX_SAFE_INTEGER;
+      const bo = typeof b.step.orderIndex === 'number' ? b.step.orderIndex : Number.MAX_SAFE_INTEGER;
+      if (ao !== bo) return ao - bo;
+      return a.idx - b.idx;
+    })
+    .map((entry) => entry.step);
+}
+
 export function useTour(options?: UseTourOptions): UseTourResult {
+  const initialStepIndex = options?.initialStepIndex ?? 0;
+  const autoOpen = options?.autoOpen ?? false;
+  const onComplete = options?.onComplete;
+  const onSkip = options?.onSkip;
+
   const [activeTour, setActiveTour] = useState<GuidedTour | null>(null);
-  const [currentStepIndex, setCurrentStepIndex] = useState(options?.initialStepIndex ?? 0);
-  const [isOpen, setIsOpen] = useState(options?.autoOpen ?? false);
+  const [currentStepIndex, setCurrentStepIndex] = useState(initialStepIndex);
+  const [isOpen, setIsOpen] = useState(autoOpen);
   const [isCompleted, setIsCompleted] = useState(false);
 
   const steps = activeTour?.steps || [];
   const currentStep = steps[currentStepIndex] || null;
 
   const startTour = useCallback(
-    (tour: GuidedTour, startIndex = options?.initialStepIndex ?? 0) => {
-      setActiveTour(tour);
+    (tour: GuidedTour, startIndex = initialStepIndex) => {
+      const normalizedTour: GuidedTour = {
+        ...tour,
+        steps: sortStepsByOrderIndex(tour.steps || []),
+      };
+      setActiveTour(normalizedTour);
       setCurrentStepIndex(startIndex);
       setIsOpen(true);
       setIsCompleted(false);
     },
-    [options?.initialStepIndex],
+    [initialStepIndex],
   );
 
   const closeTour = useCallback(() => {
@@ -49,11 +70,11 @@ export function useTour(options?: UseTourOptions): UseTourResult {
 
   const completeTour = useCallback(() => {
     if (activeTour) {
-      options?.onComplete?.(activeTour);
+      onComplete?.(activeTour);
     }
     setIsCompleted(true);
     setIsOpen(false);
-  }, [activeTour, options]);
+  }, [activeTour, onComplete]);
 
   const nextStep = useCallback(() => {
     if (!steps.length) return;
@@ -82,10 +103,10 @@ export function useTour(options?: UseTourOptions): UseTourResult {
 
   const skipTour = useCallback(() => {
     if (activeTour) {
-      options?.onSkip?.(activeTour);
+      onSkip?.(activeTour);
     }
     setIsOpen(false);
-  }, [activeTour, options]);
+  }, [activeTour, onSkip]);
 
   return useMemo(
     () => ({

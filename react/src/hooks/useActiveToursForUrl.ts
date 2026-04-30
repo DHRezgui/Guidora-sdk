@@ -16,6 +16,38 @@ export interface UseActiveToursForUrlResult {
   refresh: (nextUrl?: string) => Promise<GuidedTour[]>;
 }
 
+function buildUrlCandidates(baseUrl: string): string[] {
+  const trimmed = (baseUrl || '').trim();
+  if (!trimmed) return ['/'];
+
+  const candidates: string[] = [trimmed];
+  const add = (value?: string | null) => {
+    if (!value) return;
+    if (!candidates.includes(value)) {
+      candidates.push(value);
+    }
+  };
+
+  if (typeof window !== 'undefined') {
+    add(window.location.pathname);
+    add(window.location.pathname + window.location.search);
+    add(window.location.origin + window.location.pathname);
+    add(window.location.href);
+  }
+
+  try {
+    const parsed = new URL(trimmed, typeof window !== 'undefined' ? window.location.origin : 'http://localhost');
+    add(parsed.pathname);
+    add(parsed.pathname + parsed.search);
+    add(parsed.origin + parsed.pathname);
+    add(parsed.href);
+  } catch {
+    // Ignore invalid candidate parsing and keep original URL.
+  }
+
+  return candidates;
+}
+
 export function useActiveToursForUrl(
   config?: Partial<SDKConfig>,
   options?: UseActiveToursForUrlOptions,
@@ -31,11 +63,20 @@ export function useActiveToursForUrl(
 
       try {
         const resolved = resolveSDKConfig(config);
-        const url = nextUrl ?? options?.url ?? getCurrentPageUrl();
-        const response = await sdkApiClient.getActiveToursForUrl(resolved, url);
-        const nextTours = response.tours || [];
-        setTours(nextTours);
-        return nextTours;
+        const requestedUrl = nextUrl ?? options?.url ?? getCurrentPageUrl();
+        const candidates = buildUrlCandidates(requestedUrl);
+
+        for (const candidate of candidates) {
+          const response = await sdkApiClient.getActiveToursForUrl(resolved, candidate);
+          const nextTours = response.tours || [];
+          if (nextTours.length > 0) {
+            setTours(nextTours);
+            return nextTours;
+          }
+        }
+
+        setTours([]);
+        return [];
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Failed to load active tours.';
         setError(message);

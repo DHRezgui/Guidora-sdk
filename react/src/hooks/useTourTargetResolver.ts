@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { findElement } from '../utils/dom-utils';
 
 export interface ResolveOptions {
@@ -40,8 +40,11 @@ export function useTourTargetResolver(): UseTourTargetResolverResult {
     [],
   );
 
-  return {
-    resolveTarget,
-    isResolving,
-  };
+  return useMemo(
+    () => ({
+      resolveTarget,
+      isResolving,
+    }),
+    [resolveTarget, isResolving],
+  );
 }

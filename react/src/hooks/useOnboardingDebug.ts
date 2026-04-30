@@ -34,16 +34,19 @@ export function useOnboardingDebug(options?: UseOnboardingDebugOptions) {
   );
 
   const clearLogs = useCallback(() => setLogs([]), []);
+  const info = useCallback((message: string, payload?: unknown) => push('info', message, payload), [push]);
+  const warn = useCallback((message: string, payload?: unknown) => push('warn', message, payload), [push]);
+  const error = useCallback((message: string, payload?: unknown) => push('error', message, payload), [push]);
 
   return useMemo(
     () => ({
       enabled,
       logs,
-      info: (message: string, payload?: unknown) => push('info', message, payload),
-      warn: (message: string, payload?: unknown) => push('warn', message, payload),
-      error: (message: string, payload?: unknown) => push('error', message, payload),
+      info,
+      warn,
+      error,
       clearLogs,
     }),
-    [clearLogs, enabled, logs, push],
+    [clearLogs, enabled, error, info, logs, warn],
   );
 }

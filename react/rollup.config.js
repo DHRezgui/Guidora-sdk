@@ -3,6 +3,13 @@ const commonjs = require('@rollup/plugin-commonjs');
 const typescript = require('@rollup/plugin-typescript');
 const postcss = require('rollup-plugin-postcss');
 
+const external = (id) =>
+  id === 'react' ||
+  id === 'react-dom' ||
+  id === 'framer-motion' ||
+  id.startsWith('react/') ||
+  id.startsWith('react-dom/');
+
 module.exports = {
   input: 'src/index.ts',
   output: [
@@ -18,7 +25,7 @@ module.exports = {
       sourcemap: true,
     },
   ],
-  external: ['react', 'react-dom', 'framer-motion'],
+  external,
   plugins: [
     resolve.nodeResolve(),
     commonjs(),

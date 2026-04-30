@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { GuidedTour, SDKConfig } from '../types';
+import { GuidedTour, SDKConfig, Step } from '../types';
 import { increaseVisitCount } from '../utils/storage';
 import { getCurrentPageUrl } from '../utils/url';
 import { useActiveToursForUrl } from './useActiveToursForUrl';
@@ -55,12 +55,46 @@ function writeActiveTourSnapshot(snapshot: ActiveTourSessionSnapshot | null): vo
   }
 }
 
+function sortStepsForFingerprint(steps: Step[]): Step[] {
+  return [...steps]
+    .map((step, idx) => ({ step, idx }))
+    .sort((a, b) => {
+      const ao = typeof a.step.orderIndex === 'number' ? a.step.orderIndex : Number.MAX_SAFE_INTEGER;
+      const bo = typeof b.step.orderIndex === 'number' ? b.step.orderIndex : Number.MAX_SAFE_INTEGER;
+      if (ao !== bo) return ao - bo;
+      return a.idx - b.idx;
+    })
+    .map((entry) => entry.step);
+}
+
+/** Detects editor/API changes so we can hot-apply a new tour definition without reloading the page. */
+function tourDefinitionFingerprint(tour: GuidedTour | null | undefined): string {
+  if (!tour?.steps?.length) return '';
+  const steps = sortStepsForFingerprint(tour.steps);
+  const rows = steps.map((s) =>
+    [
+      s.id,
+      s.orderIndex,
+      s.skipAllowed,
+      s.highlightElement,
+      s.targetSelector,
+      s.stepTargetUrl,
+      s.position,
+      s.action,
+      s.stepType,
+    ].join(':'),
+  );
+  return `${tour.updatedAt || ''}#${tour.id || ''}#${rows.join('>')}`;
+}
+
 export function useOnboarding(options?: UseOnboardingOptions) {
   const pageUrl = getCurrentPageUrl();
   const [activeTour, setActiveTour] = useState<GuidedTour | null>(null);
   const displaysRef = useRef<Record<string, number>>({});
 
   const debug = useOnboardingDebug({ enabled: options?.debug });
+  const debugInfo = debug.info;
+  const debugWarn = debug.warn;
   const session = useOnboardingSession();
   const activeTours = useActiveToursForUrl(options?.config, { autoFetch: true, url: pageUrl });
   const tour = useTour({
@@ -94,7 +128,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     async (tourToStart?: GuidedTour) => {
       const candidate = tourToStart || pickTour(activeTours.tours);
       if (!candidate) {
-        debug.info('No tour candidate for this page');
+        debugInfo('No tour candidate for this page');
         return;
       }
 
@@ -107,7 +141,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
 
       const initialIndex = tourProgress.progress?.stepIndex ?? 0;
       tour.startTour(candidate, initialIndex);
-      debug.info('Tour started', { tourId: candidate.id, initialIndex });
+      debugInfo('Tour started', { tourId: candidate.id, initialIndex });
 
       const step = candidate.steps[initialIndex];
       if (step?.targetSelector) {
@@ -117,23 +151,23 @@ export function useOnboarding(options?: UseOnboardingOptions) {
         });
 
         if (!target) {
-          debug.warn('Target selector not found for first step', { selector: step.targetSelector });
+          debugWarn('Target selector not found for first step', { selector: step.targetSelector });
         }
       }
     },
-    [activeTours.tours, debug, pageUrl, pickTour, resolver, tour, tourProgress.progress?.stepIndex],
+    [activeTours.tours, debugInfo, debugWarn, pageUrl, pickTour, resolver, tour, tourProgress.progress?.stepIndex],
   );
 
   const stop = useCallback(() => {
     tour.closeTour();
     writeActiveTourSnapshot(null);
-    debug.info('Tour stopped');
-  }, [debug, tour]);
+    debugInfo('Tour stopped');
+  }, [debugInfo, tour]);
 
   useEffect(() => {
     if (!activeTour?.id) return;
     tourProgress.setStepIndex(tour.currentStepIndex);
-  }, [activeTour?.id, tour.currentStepIndex, tourProgress]);
+  }, [activeTour?.id, tour.currentStepIndex, tourProgress.setStepIndex]);
 
   useEffect(() => {
     if (!tour.isOpen || !activeTour) return;
@@ -152,11 +186,11 @@ export function useOnboarding(options?: UseOnboardingOptions) {
 
     setActiveTour(snapshot.tour);
     tour.startTour(snapshot.tour, snapshot.stepIndex);
-    debug.info('Restored active tour from session snapshot', {
+    debugInfo('Restored active tour from session snapshot', {
       tourId: snapshot.tour.id,
       stepIndex: snapshot.stepIndex,
     });
-  }, [debug, options?.autoStart, tour]);
+  }, [debugInfo, options?.autoStart, tour.isOpen, tour.startTour]);
 
   useEffect(() => {
     if (!options?.autoStart) return;
@@ -164,7 +198,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     if (activeTours.loading) return;
     if (activeTours.tours.length === 0) return;
     if (!triggerCheck.shouldStart) {
-      debug.info('Tour blocked by trigger conditions', triggerCheck.reasons);
+      debugInfo('Tour blocked by trigger conditions', triggerCheck.reasons);
       return;
     }
 
@@ -172,18 +206,35 @@ export function useOnboarding(options?: UseOnboardingOptions) {
   }, [
     activeTours.loading,
     activeTours.tours,
-    debug,
+    debugInfo,
     options?.autoStart,
     start,
     tour.isOpen,
-    triggerCheck.reasons,
     triggerCheck.shouldStart,
   ]);
+
+  // Apply tour edits from the dashboard as soon as `/tours/active/url` returns new data (sync interval / focus).
+  useEffect(() => {
+    if (!tour.isOpen || !activeTour?.id) return;
+    if (activeTours.loading) return;
+
+    const fresh = activeTours.tours.find((t) => t.id === activeTour.id);
+    if (!fresh) return;
+
+    if (tourDefinitionFingerprint(fresh) === tourDefinitionFingerprint(activeTour)) {
+      return;
+    }
+
+    setActiveTour(fresh);
+    const maxIdx = Math.max(0, (fresh.steps?.length ?? 1) - 1);
+    tour.startTour(fresh, Math.min(tour.currentStepIndex, maxIdx));
+    debugInfo('Active tour definition refreshed from server', { tourId: fresh.id });
+  }, [activeTours.tours, activeTours.loading, tour.isOpen, activeTour, tour, debugInfo]);
 
   const refresh = useCallback(async () => {
     const tours = await activeTours.refresh(pageUrl);
     return tours;
-  }, [activeTours, pageUrl]);
+  }, [activeTours.refresh, pageUrl]);
 
   useRealtimeToursSync({
     enabled: options?.config?.syncEnabled,
@@ -193,7 +244,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     onSync: refresh,
     onError: (error) => {
       const message = error instanceof Error ? error.message : String(error);
-      debug.warn('Realtime tours sync failed', { message });
+      debugWarn('Realtime tours sync failed', { message });
     },
   });
 

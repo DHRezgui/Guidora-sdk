@@ -22,31 +22,35 @@ export function StepFooter({
   showSkip = true,
   disablePrev,
   disableNext,
-  nextLabel = 'Next',
-  prevLabel = 'Previous',
-  skipLabel = 'Skip',
+  nextLabel = 'Suivant',
+  prevLabel = 'Precedent',
+  skipLabel = 'Passer',
   onNext,
   onPrev,
   onSkip,
 }: StepFooterProps) {
   return (
     <footer className="td-step-footer">
-      {showProgress ? <ProgressIndicator currentIndex={currentIndex} total={totalSteps} /> : null}
+      <div className="td-step-footer__row">
+        {showProgress ? <ProgressIndicator currentIndex={currentIndex} total={totalSteps} showLabel={false} /> : null}
 
-      <div className="td-tooltip__actions">
-        <button type="button" className="td-btn td-btn--ghost" onClick={onPrev} disabled={disablePrev || !onPrev}>
-          {prevLabel}
-        </button>
+        <div className="td-tooltip__actions">
+          {showSkip ? (
+            <button type="button" className="td-btn td-btn--text" onClick={onSkip}>
+              {skipLabel}
+            </button>
+          ) : null}
 
-        <button type="button" className="td-btn td-btn--primary" onClick={onNext} disabled={disableNext || !onNext}>
-          {nextLabel}
-        </button>
+          {!disablePrev && onPrev ? (
+            <button type="button" className="td-btn td-btn--icon" onClick={onPrev} aria-label={prevLabel}>
+              &lt;
+            </button>
+          ) : null}
 
-        {showSkip ? (
-          <button type="button" className="td-btn td-btn--text" onClick={onSkip}>
-            {skipLabel}
+          <button type="button" className="td-btn td-btn--primary" onClick={onNext} disabled={disableNext || !onNext}>
+            {nextLabel}
           </button>
-        ) : null}
+        </div>
       </div>
     </footer>
   );

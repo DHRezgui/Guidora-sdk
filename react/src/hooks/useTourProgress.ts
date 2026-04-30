@@ -25,13 +25,19 @@ export function useTourProgress(tourId?: string): UseTourProgressResult {
   const setStepIndex = useCallback(
     (stepIndex: number) => {
       if (!tourId) return;
-      const next: TourProgress = {
-        tourId,
-        stepIndex,
-        updatedAt: Date.now(),
-      };
-      saveTourProgress(next);
-      setProgress(next);
+      setProgress((prev) => {
+        if (prev?.tourId === tourId && prev.stepIndex === stepIndex) {
+          return prev;
+        }
+
+        const next: TourProgress = {
+          tourId,
+          stepIndex,
+          updatedAt: Date.now(),
+        };
+        saveTourProgress(next);
+        return next;
+      });
     },
     [tourId],
   );
