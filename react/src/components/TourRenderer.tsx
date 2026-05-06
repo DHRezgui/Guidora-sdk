@@ -27,6 +27,7 @@ export interface TourRendererProps {
   routeMismatch?: boolean;
   expectedRoute?: string;
   currentRoute?: string;
+  autoNavigating?: boolean;
 }
 
 /**
@@ -54,6 +55,7 @@ export function TourRenderer({
   routeMismatch = false,
   expectedRoute,
   currentRoute,
+  autoNavigating = false,
 }: TourRendererProps) {
   const [showFallback, setShowFallback] = useState(false);
 
@@ -88,7 +90,8 @@ export function TourRenderer({
           open={true}
           targetRect={targetRect}
           theme={theme}
-          padding={8}
+          padding={0}
+          borderRadius={6}
           onOverlayClick={onClose}
         />
       ) : null}
@@ -127,7 +130,7 @@ export function TourRenderer({
         />
       ) : null}
 
-      {routeMismatch ? (
+      {routeMismatch && !autoNavigating ? (
         <div
           style={{
             position: 'fixed',

@@ -61,12 +61,6 @@ export function TourViewer({
     origin: string;
   } | null>(null);
 
-  const onboarding = useOnboarding({
-    config,
-    autoStart,
-    debug,
-  });
-
   const [targetRect, setTargetRect] = useState<{ top: number; left: number; width: number; height: number } | null>(
     null,
   );
@@ -75,6 +69,32 @@ export function TourViewer({
   const [currentPathname, setCurrentPathname] = useState(() =>
     typeof window !== 'undefined' ? window.location.pathname : '',
   );
+  const [autoNavigatingToRoute, setAutoNavigatingToRoute] = useState<string | null>(null);
+  const isEmbeddedSimulatorPreview =
+    typeof window !== 'undefined' &&
+    window.self !== window.top &&
+    new URLSearchParams(window.location.search).get('__trustdev_simulator_preview') === '1';
+  const effectiveAutoStart = isEmbeddedSimulatorPreview ? false : autoStart;
+
+  const onboarding = useOnboarding({
+    config,
+    autoStart: effectiveAutoStart,
+    debug,
+  });
+
+  const navigateToStepRoute = useCallback((rawRoute?: string): boolean => {
+    if (typeof window === 'undefined') return false;
+    const normalizedTargetRoute = normalizeRoutePath(rawRoute);
+    if (!normalizedTargetRoute) return false;
+
+    const normalizedCurrentRoute = normalizeRoutePath(window.location.pathname);
+    if (normalizedTargetRoute === normalizedCurrentRoute) return false;
+
+    setAutoNavigatingToRoute(normalizedTargetRoute);
+    const targetUrl = `${window.location.origin}${normalizedTargetRoute}`;
+    window.location.assign(targetUrl);
+    return true;
+  }, []);
 
   const syncTargetRect = useCallback(() => {
     const el = activeTargetRef.current;
@@ -201,6 +221,22 @@ export function TourViewer({
   const expectedStepRoute = normalizeRoutePath(onboarding.tour.currentStep?.stepTargetUrl);
   const normalizedCurrentRoute = normalizeRoutePath(currentPathname);
   const routeMismatch = Boolean(expectedStepRoute) && expectedStepRoute !== normalizedCurrentRoute;
+  const isAutoNavigating = Boolean(autoNavigatingToRoute) && routeMismatch;
+
+  useEffect(() => {
+    if (!autoNavigatingToRoute) return;
+    if (normalizedCurrentRoute === autoNavigatingToRoute) {
+      setAutoNavigatingToRoute(null);
+    }
+  }, [autoNavigatingToRoute, normalizedCurrentRoute]);
+
+  useEffect(() => {
+    if (!autoNavigatingToRoute) return;
+    const timer = window.setTimeout(() => {
+      setAutoNavigatingToRoute(null);
+    }, 1500);
+    return () => window.clearTimeout(timer);
+  }, [autoNavigatingToRoute]);
 
   // Résoudre le sélecteur de la step courante
   useEffect(() => {
@@ -314,15 +350,19 @@ export function TourViewer({
       onboarding.tour.completeTour();
       onTourComplete?.(onboarding.activeTour?.id);
     } else {
+      const nextStep = onboarding.tour.steps[onboarding.tour.currentStepIndex + 1];
       onboarding.tour.nextStep();
       setResolveAttempt((prev) => prev + 1); // Trigger re-resolution
+      navigateToStepRoute(nextStep?.stepTargetUrl);
     }
-  }, [onboarding.tour, onboarding.activeTour?.id, onTourComplete]);
+  }, [onboarding.tour, onboarding.activeTour?.id, onTourComplete, navigateToStepRoute]);
 
   const handlePrev = useCallback(() => {
+    const prevStep = onboarding.tour.steps[onboarding.tour.currentStepIndex - 1];
     onboarding.tour.prevStep();
     setResolveAttempt((prev) => prev + 1);
-  }, [onboarding.tour]);
+    navigateToStepRoute(prevStep?.stepTargetUrl);
+  }, [onboarding.tour, navigateToStepRoute]);
 
   const handleSkip = useCallback(() => {
     onboarding.tour.skipTour();
@@ -354,6 +394,7 @@ export function TourViewer({
       routeMismatch={routeMismatch}
       expectedRoute={expectedStepRoute}
       currentRoute={normalizedCurrentRoute}
+      autoNavigating={isAutoNavigating}
     />
   );
 }

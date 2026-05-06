@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { sdkApiClient } from '../core/api-client';
+import { resolveSDKConfig } from '../core/sdk-state';
 import { GuidedTour, SDKConfig, Step } from '../types';
 import { increaseVisitCount } from '../utils/storage';
 import { getCurrentPageUrl } from '../utils/url';
@@ -91,16 +93,64 @@ export function useOnboarding(options?: UseOnboardingOptions) {
   const pageUrl = getCurrentPageUrl();
   const [activeTour, setActiveTour] = useState<GuidedTour | null>(null);
   const displaysRef = useRef<Record<string, number>>({});
+  const dismissedTourIdsRef = useRef<Set<string>>(new Set());
+  const suppressAutostartUntilRef = useRef(0);
+  const isSuppressed = () => Date.now() < suppressAutostartUntilRef.current;
 
   const debug = useOnboardingDebug({ enabled: options?.debug });
   const debugInfo = debug.info;
   const debugWarn = debug.warn;
+  const deactivateTour = useCallback(
+    async (tourToDeactivate: GuidedTour, reason: 'skip' | 'complete') => {
+      if (!tourToDeactivate?.id) return;
+      try {
+        const config = resolveSDKConfig(options?.config);
+        if (reason === 'complete') {
+          await sdkApiClient.completeTourForCurrentUser(config, tourToDeactivate.id);
+        } else {
+          await sdkApiClient.dismissTourForCurrentUser(config, tourToDeactivate.id);
+        }
+        debugInfo('Tour user-state updated after user action', {
+          tourId: tourToDeactivate.id,
+          reason,
+        });
+      } catch (error) {
+        debugWarn('Failed to update tour user-state after user action', {
+          tourId: tourToDeactivate?.id,
+          reason,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    },
+    [debugInfo, debugWarn, options?.config],
+  );
+
   const session = useOnboardingSession();
   const activeTours = useActiveToursForUrl(options?.config, { autoFetch: true, url: pageUrl });
   const tour = useTour({
     autoOpen: false,
-    onComplete: () => writeActiveTourSnapshot(null),
-    onSkip: () => writeActiveTourSnapshot(null),
+    onComplete: (completedTour) => {
+      if (completedTour?.id) {
+        dismissedTourIdsRef.current.add(completedTour.id);
+      }
+      // Prevent immediate restart from stale active tours response.
+      suppressAutostartUntilRef.current = Date.now() + 12000;
+      writeActiveTourSnapshot(null);
+      setActiveTour(null);
+      void deactivateTour(completedTour, 'complete');
+      void activeTours.refresh(pageUrl).catch(() => undefined);
+    },
+    onSkip: (skippedTour) => {
+      if (skippedTour?.id) {
+        dismissedTourIdsRef.current.add(skippedTour.id);
+      }
+      // Prevent immediate restart from stale active tours response.
+      suppressAutostartUntilRef.current = Date.now() + 12000;
+      writeActiveTourSnapshot(null);
+      setActiveTour(null);
+      void deactivateTour(skippedTour, 'skip');
+      void activeTours.refresh(pageUrl).catch(() => undefined);
+    },
   });
   const tourProgress = useTourProgress(activeTour?.id);
   const resolver = useTourTargetResolver();
@@ -120,7 +170,12 @@ export function useOnboarding(options?: UseOnboardingOptions) {
 
   const pickTour = useCallback((tours: GuidedTour[]): GuidedTour | null => {
     if (!tours.length) return null;
-    const sorted = [...tours].sort((a, b) => (b.priority || 0) - (a.priority || 0));
+    const eligible = tours.filter((tourItem) => {
+      if (!tourItem?.id) return true;
+      return !dismissedTourIdsRef.current.has(tourItem.id);
+    });
+    if (!eligible.length) return null;
+    const sorted = [...eligible].sort((a, b) => (b.priority || 0) - (a.priority || 0));
     return sorted[0] || null;
   }, []);
 
@@ -129,6 +184,16 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       const candidate = tourToStart || pickTour(activeTours.tours);
       if (!candidate) {
         debugInfo('No tour candidate for this page');
+        return;
+      }
+      if (candidate.id && dismissedTourIdsRef.current.has(candidate.id)) {
+        debugInfo('Skipping dismissed tour restart', { tourId: candidate.id });
+        return;
+      }
+      if (!tourToStart && isSuppressed()) {
+        debugInfo('Skipping autostart during suppression window', {
+          suppressedUntil: suppressAutostartUntilRef.current,
+        });
         return;
       }
 
@@ -181,8 +246,10 @@ export function useOnboarding(options?: UseOnboardingOptions) {
   useEffect(() => {
     if (!options?.autoStart) return;
     if (tour.isOpen) return;
+    if (isSuppressed()) return;
     const snapshot = readActiveTourSnapshot();
     if (!snapshot) return;
+    if (snapshot.tour?.id && dismissedTourIdsRef.current.has(snapshot.tour.id)) return;
 
     setActiveTour(snapshot.tour);
     tour.startTour(snapshot.tour, snapshot.stepIndex);
@@ -195,6 +262,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
   useEffect(() => {
     if (!options?.autoStart) return;
     if (tour.isOpen) return;
+    if (isSuppressed()) return;
     if (activeTours.loading) return;
     if (activeTours.tours.length === 0) return;
     if (!triggerCheck.shouldStart) {
@@ -233,6 +301,12 @@ export function useOnboarding(options?: UseOnboardingOptions) {
 
   const refresh = useCallback(async () => {
     const tours = await activeTours.refresh(pageUrl);
+    const activeTourIds = new Set(tours.map((tourItem) => tourItem.id).filter(Boolean));
+    for (const dismissedId of dismissedTourIdsRef.current) {
+      if (!activeTourIds.has(dismissedId)) {
+        dismissedTourIdsRef.current.delete(dismissedId);
+      }
+    }
     return tours;
   }, [activeTours.refresh, pageUrl]);
 

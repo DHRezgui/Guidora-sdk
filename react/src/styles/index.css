@@ -7,7 +7,7 @@
   --td-bg-color: #FFFFFF;
   --td-muted-color: #64748B;
   --td-border-color: #CBD5E1;
-  --td-overlay-color: rgba(15, 23, 42, 0.55);
+  --td-overlay-color: rgba(2, 6, 23, 0.45);
   --td-border-radius: 10px;
   --td-font-family: 'Plus Jakarta Sans', system-ui, sans-serif;
   --td-shadow: 0 18px 50px rgba(2, 6, 23, 0.22);
@@ -442,8 +442,8 @@
 
 .td-highlight {
   position: fixed;
-  border: 2px solid var(--td-primary-color);
-  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.7), 0 10px 24px rgba(15, 23, 42, 0.32);
+  border: 2px solid rgba(249, 115, 22, 0.9);
+  box-shadow: 0 0 0 6px rgba(148, 163, 184, 0.38);
   animation: td-highlight-in 0.22s ease-out;
   pointer-events: none;
 }

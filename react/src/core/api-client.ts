@@ -11,9 +11,7 @@ import {
 function buildHeaders(config: NormalizedSDKConfig): Record<string, string> {
   const token = config.sdkToken || config.getAccessToken?.() || config.accessToken;
 
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-  };
+  const headers: Record<string, string> = {};
 
   // For authenticated dashboard flows, JWT is sufficient and avoids extra CORS preflight constraints.
   if (!token && config.apiKey) {
@@ -28,10 +26,15 @@ function buildHeaders(config: NormalizedSDKConfig): Record<string, string> {
 }
 
 async function request<T>(config: NormalizedSDKConfig, path: string, init?: RequestInit): Promise<T> {
+  const hasBody = typeof init?.body !== 'undefined' && init?.body !== null;
+  const method = (init?.method || 'GET').toUpperCase();
+  const shouldSendJsonContentType = hasBody && method !== 'GET' && method !== 'HEAD';
+
   const response = await fetch(`${config.apiUrl}${path}`, {
     ...init,
     headers: {
       ...buildHeaders(config),
+      ...(shouldSendJsonContentType ? { 'Content-Type': 'application/json' } : {}),
       ...(init?.headers || {}),
     },
   });
@@ -78,7 +81,11 @@ function sendKeepaliveBatch(config: NormalizedSDKConfig, events: TrackEventInput
 export const sdkApiClient = {
   getActiveToursForUrl(config: NormalizedSDKConfig, url: string): Promise<ActiveToursResponse> {
     const encodedUrl = encodeURIComponent(url);
-    return request<ActiveToursResponse>(config, `/tours/active/url?url=${encodedUrl}`);
+    // Use a query cache-buster instead of no-store headers to avoid CORS preflight issues.
+    const cacheBuster = Date.now();
+    return request<ActiveToursResponse>(config, `/tours/active/url?url=${encodedUrl}&_ts=${cacheBuster}`, {
+      method: 'GET',
+    });
   },
 
   publishContextualDrafts(
@@ -107,5 +114,17 @@ export const sdkApiClient = {
 
   trackBatchKeepalive(config: NormalizedSDKConfig, events: TrackEventInput[]): void {
     sendKeepaliveBatch(config, events);
+  },
+
+  dismissTourForCurrentUser(config: NormalizedSDKConfig, tourId: string): Promise<unknown> {
+    return request<unknown>(config, `/tours/${tourId}/dismiss`, {
+      method: 'POST',
+    });
+  },
+
+  completeTourForCurrentUser(config: NormalizedSDKConfig, tourId: string): Promise<unknown> {
+    return request<unknown>(config, `/tours/${tourId}/complete`, {
+      method: 'POST',
+    });
   },
 };

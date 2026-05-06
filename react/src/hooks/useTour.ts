@@ -69,11 +69,12 @@ export function useTour(options?: UseTourOptions): UseTourResult {
   }, []);
 
   const completeTour = useCallback(() => {
-    if (activeTour) {
-      onComplete?.(activeTour);
-    }
-    setIsCompleted(true);
     setIsOpen(false);
+    setIsCompleted(true);
+    const finishedTour = activeTour;
+    if (finishedTour) {
+      onComplete?.(finishedTour);
+    }
   }, [activeTour, onComplete]);
 
   const nextStep = useCallback(() => {
@@ -102,10 +103,11 @@ export function useTour(options?: UseTourOptions): UseTourResult {
   );
 
   const skipTour = useCallback(() => {
-    if (activeTour) {
-      onSkip?.(activeTour);
-    }
     setIsOpen(false);
+    const skippedTour = activeTour;
+    if (skippedTour) {
+      onSkip?.(skippedTour);
+    }
   }, [activeTour, onSkip]);
 
   return useMemo(
