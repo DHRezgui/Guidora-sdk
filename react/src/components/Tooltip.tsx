@@ -1,91 +1,16 @@
-import { CSSProperties } from 'react';
+import { CSSProperties, useLayoutEffect, useRef, useState } from 'react';
 import { PositionType } from '../types';
 import { KeyboardNavigation } from './KeyboardNavigation';
 import { StepFooter } from './StepFooter';
-import { TooltipArrow } from './TooltipArrow';
+import { FlexibleTooltipArrow } from './TooltipArrow';
 import { TourPortal } from './TourPortal';
 import { OnboardingTheme, useThemeCssVars } from './theme';
 
 type RectLike = Pick<DOMRect, 'top' | 'left' | 'width' | 'height'>;
 const VIEWPORT_MARGIN_PX = 8;
 const TOOLTIP_DEFAULT_WIDTH_PX = 360;
-const TOOLTIP_DEFAULT_HEIGHT_PX = 220;
-const ANCHOR_LENGTH_PX = 60;
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
-}
-
-function clampTooltipAnchor(left: number, top: number, position: PositionType): Pick<CSSProperties, 'left' | 'top'> {
-  if (typeof window === 'undefined') return { left, top };
-
-  const viewportWidth = Math.max(1, window.innerWidth || 1);
-  const viewportHeight = Math.max(1, window.innerHeight || 1);
-  const tooltipWidth = Math.min(TOOLTIP_DEFAULT_WIDTH_PX, Math.max(220, viewportWidth - VIEWPORT_MARGIN_PX * 2));
-  const tooltipHeight = Math.min(TOOLTIP_DEFAULT_HEIGHT_PX, Math.max(140, viewportHeight - VIEWPORT_MARGIN_PX * 2));
-
-  let minLeft = VIEWPORT_MARGIN_PX;
-  let maxLeft = viewportWidth - VIEWPORT_MARGIN_PX;
-  let minTop = VIEWPORT_MARGIN_PX;
-  let maxTop = viewportHeight - VIEWPORT_MARGIN_PX;
-
-  switch (position) {
-    case 'TOP':
-      minLeft += tooltipWidth / 2;
-      maxLeft -= tooltipWidth / 2;
-      minTop += tooltipHeight;
-      break;
-    case 'BOTTOM':
-      minLeft += tooltipWidth / 2;
-      maxLeft -= tooltipWidth / 2;
-      maxTop -= tooltipHeight;
-      break;
-    case 'LEFT':
-      minLeft += tooltipWidth;
-      minTop += tooltipHeight / 2;
-      maxTop -= tooltipHeight / 2;
-      break;
-    case 'RIGHT':
-      maxLeft -= tooltipWidth;
-      minTop += tooltipHeight / 2;
-      maxTop -= tooltipHeight / 2;
-      break;
-    case 'TOP_LEFT':
-      minTop += tooltipHeight;
-      maxLeft -= tooltipWidth;
-      break;
-    case 'TOP_RIGHT':
-      minLeft += tooltipWidth;
-      minTop += tooltipHeight;
-      break;
-    case 'BOTTOM_LEFT':
-      maxLeft -= tooltipWidth;
-      maxTop -= tooltipHeight;
-      break;
-    case 'BOTTOM_RIGHT':
-      minLeft += tooltipWidth;
-      maxTop -= tooltipHeight;
-      break;
-    case 'CENTER':
-      minLeft += tooltipWidth / 2;
-      maxLeft -= tooltipWidth / 2;
-      minTop += tooltipHeight / 2;
-      maxTop -= tooltipHeight / 2;
-      break;
-    default:
-      break;
-  }
-
-  const safeMinLeft = Math.min(minLeft, maxLeft);
-  const safeMaxLeft = Math.max(minLeft, maxLeft);
-  const safeMinTop = Math.min(minTop, maxTop);
-  const safeMaxTop = Math.max(minTop, maxTop);
-
-  return {
-    left: clamp(left, safeMinLeft, safeMaxLeft),
-    top: clamp(top, safeMinTop, safeMaxTop),
-  };
-}
+// Keep visible breathing room between target edge and tooltip edge.
+const ANCHOR_LENGTH_PX = 84;
 
 export interface TooltipProps {
   open: boolean;
@@ -142,13 +67,17 @@ function getTooltipAnchorFromTargetAnchor(
 ): { x: number; y: number } {
   switch (position) {
     case 'LEFT':
-    case 'TOP_LEFT':
-    case 'BOTTOM_LEFT':
       return { x: targetAnchorX - ANCHOR_LENGTH_PX, y: targetAnchorY };
     case 'RIGHT':
-    case 'TOP_RIGHT':
-    case 'BOTTOM_RIGHT':
       return { x: targetAnchorX + ANCHOR_LENGTH_PX, y: targetAnchorY };
+    case 'TOP_LEFT':
+      return { x: targetAnchorX - ANCHOR_LENGTH_PX, y: targetAnchorY - ANCHOR_LENGTH_PX };
+    case 'TOP_RIGHT':
+      return { x: targetAnchorX + ANCHOR_LENGTH_PX, y: targetAnchorY - ANCHOR_LENGTH_PX };
+    case 'BOTTOM_LEFT':
+      return { x: targetAnchorX - ANCHOR_LENGTH_PX, y: targetAnchorY + ANCHOR_LENGTH_PX };
+    case 'BOTTOM_RIGHT':
+      return { x: targetAnchorX + ANCHOR_LENGTH_PX, y: targetAnchorY + ANCHOR_LENGTH_PX };
     case 'TOP':
       return { x: targetAnchorX, y: targetAnchorY - ANCHOR_LENGTH_PX };
     case 'BOTTOM':
@@ -157,64 +86,79 @@ function getTooltipAnchorFromTargetAnchor(
   }
 }
 
-function getTooltipStyleFromAnchor(anchorX: number, anchorY: number, position: PositionType): CSSProperties {
-  switch (position) {
+function getTooltipPositionFromArrowAnchor(
+  arrowAnchorX: number,
+  arrowAnchorY: number,
+  placement: PositionType,
+  viewportWidth: number,
+  viewportHeight: number,
+): { top: string; left: string; transform: string } {
+  const anchorPctX = (arrowAnchorX / Math.max(1, viewportWidth)) * 100;
+  const anchorPctY = (arrowAnchorY / Math.max(1, viewportHeight)) * 100;
+
+  switch (placement) {
     case 'TOP':
-      return {
-        top: anchorY,
-        left: anchorX,
-        transform: 'translate(-50%, -100%)',
-      };
+      return { top: `${anchorPctY}%`, left: `${anchorPctX}%`, transform: 'translate(-50%, -100%)' };
     case 'LEFT':
-      return {
-        top: anchorY,
-        left: anchorX,
-        transform: 'translate(-100%, -50%)',
-      };
+      return { top: `${anchorPctY}%`, left: `${anchorPctX}%`, transform: 'translate(-100%, -50%)' };
     case 'RIGHT':
-      return {
-        top: anchorY,
-        left: anchorX,
-        transform: 'translate(0, -50%)',
-      };
+      return { top: `${anchorPctY}%`, left: `${anchorPctX}%`, transform: 'translate(0, -50%)' };
     case 'TOP_LEFT':
-      return {
-        top: anchorY,
-        left: anchorX,
-        transform: 'translate(-100%, -100%)',
-      };
+      return { top: `${anchorPctY}%`, left: `${anchorPctX}%`, transform: 'translate(-100%, -100%)' };
     case 'TOP_RIGHT':
-      return {
-        top: anchorY,
-        left: anchorX,
-        transform: 'translate(0, -100%)',
-      };
+      return { top: `${anchorPctY}%`, left: `${anchorPctX}%`, transform: 'translate(0, -100%)' };
     case 'BOTTOM_LEFT':
-      return {
-        top: anchorY,
-        left: anchorX,
-        transform: 'translate(-100%, 0)',
-      };
+      return { top: `${anchorPctY}%`, left: `${anchorPctX}%`, transform: 'translate(-100%, 0)' };
     case 'BOTTOM_RIGHT':
-      return {
-        top: anchorY,
-        left: anchorX,
-        transform: 'translate(0, 0)',
-      };
+      return { top: `${anchorPctY}%`, left: `${anchorPctX}%`, transform: 'translate(0, 0)' };
     case 'CENTER':
-      return {
-        top: '50%',
-        left: '50%',
-        transform: 'translate(-50%, -50%)',
-      };
+      return { top: '50%', left: '50%', transform: 'translate(-50%, -50%)' };
     case 'BOTTOM':
     default:
-      return {
-        top: anchorY,
-        left: anchorX,
-        transform: 'translate(-50%, 0)',
-      };
+      return { top: `${anchorPctY}%`, left: `${anchorPctX}%`, transform: 'translate(-50%, 0)' };
   }
+}
+
+function clampTooltipStyle(style: { top: string; left: string; transform: string }) {
+  const topMatch = style.top.match(/-?\d+(?:\.\d+)?/);
+  const leftMatch = style.left.match(/-?\d+(?:\.\d+)?/);
+  if (!topMatch || !leftMatch) return style;
+
+  const rawTop = Number(topMatch[0]);
+  const rawLeft = Number(leftMatch[0]);
+
+  let minLeft = 2;
+  let maxLeft = 98;
+  let minTop = 2;
+  let maxTop = 98;
+
+  if (style.transform.includes('translate(-50%')) {
+    minLeft = 16;
+    maxLeft = 84;
+  } else if (style.transform.includes('translate(-100%')) {
+    minLeft = 26;
+    maxLeft = 98;
+  } else if (style.transform.includes('translate(0')) {
+    minLeft = 2;
+    maxLeft = 74;
+  }
+
+  if (style.transform.includes('-100%)')) {
+    minTop = 20;
+    maxTop = 98;
+  } else if (style.transform.includes('-50%')) {
+    minTop = 10;
+    maxTop = 90;
+  } else {
+    minTop = 2;
+    maxTop = 78;
+  }
+
+  return {
+    ...style,
+    top: `${Math.max(minTop, Math.min(maxTop, rawTop))}%`,
+    left: `${Math.max(minLeft, Math.min(maxLeft, rawLeft))}%`,
+  };
 }
 
 function getTooltipPosition(targetRect?: RectLike | null, position: PositionType = 'BOTTOM'): CSSProperties {
@@ -228,13 +172,36 @@ function getTooltipPosition(targetRect?: RectLike | null, position: PositionType
 
   const targetAnchor = getAnchorOnTarget(targetRect, position);
   const tooltipAnchor = getTooltipAnchorFromTargetAnchor(position, targetAnchor.x, targetAnchor.y);
-  const base = getTooltipStyleFromAnchor(tooltipAnchor.x, tooltipAnchor.y, position);
-
-  const safe = clampTooltipAnchor(base.left as number, base.top as number, position);
+  const viewportWidth = typeof window !== 'undefined' ? window.innerWidth : 1280;
+  const viewportHeight = typeof window !== 'undefined' ? window.innerHeight : 720;
+  const base = getTooltipPositionFromArrowAnchor(tooltipAnchor.x, tooltipAnchor.y, position, viewportWidth, viewportHeight);
+  const safe = clampTooltipStyle(base);
   return {
-    ...base,
     ...safe,
     maxWidth: `min(${TOOLTIP_DEFAULT_WIDTH_PX}px, calc(100vw - ${VIEWPORT_MARGIN_PX * 2}px))`,
+  };
+}
+
+function getRectBoundaryPoint(
+  rect: Pick<DOMRect, 'top' | 'left' | 'width' | 'height'>,
+  toward: { x: number; y: number },
+): { x: number; y: number } {
+  const cx = rect.left + rect.width / 2;
+  const cy = rect.top + rect.height / 2;
+  const dx = toward.x - cx;
+  const dy = toward.y - cy;
+
+  if (Math.abs(dx) < 0.001 && Math.abs(dy) < 0.001) {
+    return { x: cx, y: cy };
+  }
+
+  const halfW = Math.max(1, rect.width / 2);
+  const halfH = Math.max(1, rect.height / 2);
+  const scale = 1 / Math.max(Math.abs(dx) / halfW, Math.abs(dy) / halfH);
+
+  return {
+    x: cx + dx * scale,
+    y: cy + dy * scale,
   };
 }
 
@@ -287,11 +254,45 @@ export function Tooltip({
   enableKeyboardNavigation = true,
   hideArrow = false,
 }: TooltipProps) {
+  const tooltipRef = useRef<HTMLDivElement | null>(null);
+  const [tooltipRect, setTooltipRect] = useState<Pick<DOMRect, 'top' | 'left' | 'width' | 'height'> | null>(null);
   const cssVars = useThemeCssVars(theme);
   const isFirstStep = (stepIndex ?? 0) <= 0;
   const isLastStep = typeof totalSteps === 'number' && typeof stepIndex === 'number' ? stepIndex >= totalSteps - 1 : false;
   const effectivePosition = resolveRuntimePosition(targetRect, position);
   const computedStyle = getTooltipPosition(targetRect, effectivePosition);
+  const targetAnchor = targetRect ? getAnchorOnTarget(targetRect, effectivePosition) : null;
+  const connectorStart = tooltipRect && targetAnchor
+    ? getRectBoundaryPoint(tooltipRect, targetAnchor)
+    : targetAnchor
+      ? getTooltipAnchorFromTargetAnchor(effectivePosition, targetAnchor.x, targetAnchor.y)
+    : null;
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    const node = tooltipRef.current;
+    if (!node) return;
+
+    const updateRect = () => {
+      const rect = node.getBoundingClientRect();
+      setTooltipRect({
+        top: rect.top,
+        left: rect.left,
+        width: rect.width,
+        height: rect.height,
+      });
+    };
+
+    updateRect();
+    const rafId = window.requestAnimationFrame(updateRect);
+    window.addEventListener('resize', updateRect);
+    window.addEventListener('scroll', updateRect, true);
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      window.removeEventListener('resize', updateRect);
+      window.removeEventListener('scroll', updateRect, true);
+    };
+  }, [open, computedStyle.left, computedStyle.top, computedStyle.transform, content, title, stepIndex, totalSteps]);
 
   if (!open) return null;
 
@@ -306,8 +307,13 @@ export function Tooltip({
           onSkip={onSkip || onClose}
         />
 
-        <div className={`td-tooltip ${className || ''}`.trim()} style={{ ...computedStyle, ...style }} role="dialog" aria-modal="false">
-          {!hideArrow ? <TooltipArrow position={effectivePosition} /> : null}
+        <div
+          ref={tooltipRef}
+          className={`td-tooltip ${className || ''}`.trim()}
+          style={{ ...computedStyle, ...style }}
+          role="dialog"
+          aria-modal="false"
+        >
 
           {onClose ? (
             <button type="button" className="td-tooltip__close" onClick={onClose} aria-label="Close tooltip">
@@ -333,6 +339,7 @@ export function Tooltip({
             />
           ) : null}
         </div>
+        {!hideArrow ? <FlexibleTooltipArrow from={connectorStart} to={targetAnchor} /> : null}
       </div>
     </TourPortal>
   );

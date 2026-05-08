@@ -31,13 +31,28 @@ export function Highlight({
 
   if (!open || !targetRect) return null;
 
-  // Snap to integer pixels to avoid sub-pixel anti-aliasing color drift.
-  const top = Math.round(Math.max(0, targetRect.top - padding));
-  const left = Math.round(Math.max(0, targetRect.left - padding));
+  // Keep highlight anchored to the real selector position, even when partially off-screen.
+  const top = Math.round(targetRect.top - padding);
+  const left = Math.round(targetRect.left - padding);
   const width = Math.round(targetRect.width + padding * 2);
   const height = Math.round(targetRect.height + padding * 2);
   const rightStart = left + width;
   const bottomStart = top + height;
+  const viewportWidth = typeof window !== 'undefined' ? window.innerWidth : 0;
+  const viewportHeight = typeof window !== 'undefined' ? window.innerHeight : 0;
+
+  const clippedLeft = Math.max(0, left);
+  const clippedRight = Math.min(viewportWidth, rightStart);
+  const clippedWidth = Math.max(0, clippedRight - clippedLeft);
+  const showTopEdgeLine = top < 0 && clippedWidth > 0;
+  const showBottomEdgeLine = bottomStart > viewportHeight && clippedWidth > 0;
+
+  // Overlay cuts must remain non-negative even if target is outside viewport.
+  const overlayTop = Math.max(0, top);
+  const overlayLeft = Math.max(0, left);
+  const overlayRightStart = Math.max(0, rightStart);
+  const overlayBottomStart = Math.max(0, bottomStart);
+  const overlayMiddleHeight = Math.max(0, overlayBottomStart - overlayTop);
 
   const overlayPieceStyle: CSSProperties = {
     position: 'fixed',
@@ -56,7 +71,7 @@ export function Highlight({
                 top: 0,
                 left: 0,
                 right: 0,
-                height: top,
+                height: overlayTop,
               }}
               onClick={onOverlayClick}
               aria-hidden="true"
@@ -64,10 +79,10 @@ export function Highlight({
             <div
               style={{
                 ...overlayPieceStyle,
-                top,
+                top: overlayTop,
                 left: 0,
-                width: left,
-                height,
+                width: overlayLeft,
+                height: overlayMiddleHeight,
               }}
               onClick={onOverlayClick}
               aria-hidden="true"
@@ -75,10 +90,10 @@ export function Highlight({
             <div
               style={{
                 ...overlayPieceStyle,
-                top,
-                left: rightStart,
+                top: overlayTop,
+                left: overlayRightStart,
                 right: 0,
-                height,
+                height: overlayMiddleHeight,
               }}
               onClick={onOverlayClick}
               aria-hidden="true"
@@ -86,7 +101,7 @@ export function Highlight({
             <div
               style={{
                 ...overlayPieceStyle,
-                top: bottomStart,
+                top: overlayBottomStart,
                 left: 0,
                 right: 0,
                 bottom: 0,
@@ -108,6 +123,40 @@ export function Highlight({
           }}
           aria-hidden="true"
         />
+        {showTopEdgeLine ? (
+          <div
+            aria-hidden="true"
+            style={{
+              position: 'fixed',
+              top: 0,
+              left: clippedLeft,
+              width: clippedWidth,
+              height: 2,
+              borderRadius: 999,
+              background: 'rgba(249, 115, 22, 0.9)',
+              boxShadow: '0 0 0 3px rgba(148, 163, 184, 0.38)',
+              pointerEvents: 'none',
+              zIndex: 'calc(var(--td-z-index) + 1)',
+            }}
+          />
+        ) : null}
+        {showBottomEdgeLine ? (
+          <div
+            aria-hidden="true"
+            style={{
+              position: 'fixed',
+              bottom: 0,
+              left: clippedLeft,
+              width: clippedWidth,
+              height: 2,
+              borderRadius: 999,
+              background: 'rgba(249, 115, 22, 0.9)',
+              boxShadow: '0 0 0 3px rgba(148, 163, 184, 0.38)',
+              pointerEvents: 'none',
+              zIndex: 'calc(var(--td-z-index) + 1)',
+            }}
+          />
+        ) : null}
       </div>
     </TourPortal>
   );

@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useOnboarding } from '../hooks/useOnboarding';
 import { PositionType, SDKConfig } from '../types';
+import { UseContextualTourSuggestionsOptions } from '../hooks/useContextualTourSuggestions';
+import { ContextualSuggestionsPublisher, ContextualSuggestionsUIMode } from './ContextualSuggestionsPublisher';
 import { OnboardingTheme } from './theme';
 import { TourRenderer } from './TourRenderer';
 
@@ -15,7 +17,76 @@ export interface TourViewerProps {
   tooltipPosition?: PositionType;
   onTourComplete?: (tourId?: string) => void;
   onTourSkipped?: (tourId?: string) => void;
+  runtimeBehavior?: {
+    /**
+     * Enables preview auto-detection in iframe runtime.
+     */
+    detectPreviewIframe?: boolean;
+    /**
+     * Host suffixes considered as preview hosts when embedded in iframe.
+     * Example: ['tunnelmole.net'].
+     */
+    previewHostSuffixes?: string[];
+    /**
+     * Whether tour UI should be hidden in preview iframe.
+     */
+    hideTourUiInPreview?: boolean;
+    /**
+     * Whether auto-start should be disabled in preview iframe.
+     */
+    disableAutoStartInPreview?: boolean;
+    /**
+     * Clears local progress/session storage on mount.
+     * - never: no reset
+     * - always: always reset
+     * - non-preview: reset only outside preview iframe
+     */
+    resetProgressOnMount?: 'never' | 'always' | 'non-preview';
+  };
+  contextualSuggestions?: (UseContextualTourSuggestionsOptions & {
+    /**
+     * Defaults to 'auto':
+     * - hidden when autoPublish=true
+     * - minimal manual panel when autoPublish=false
+     */
+    uiMode?: ContextualSuggestionsUIMode;
+    title?: string;
+    stableOnly?: boolean;
+    preset?: 'ecommerce-default';
+  }) | null;
 }
+
+const CONTEXTUAL_SUGGESTIONS_PRESETS: Record<string, Partial<UseContextualTourSuggestionsOptions>> = {
+  'ecommerce-default': {
+    enabled: true,
+    autoGenerate: true,
+    autoPublish: false,
+    autoActivatePublishedDrafts: true,
+    publishScenario: 'simple',
+    maxDrafts: 4,
+    maxCandidates: 250,
+    ignoreTransientUi: true,
+    includeSupportDraft: true,
+    includeNavigationDraft: true,
+    includeFormDraft: true,
+    useSemanticRanking: true,
+    enableSequenceDetection: true,
+    noiseFilteringEnabled: true,
+    conflictResolutionEnabled: true,
+    conflictResolutionStrategy: 'hybrid',
+    explainabilityEnabled: true,
+    minConfidence: 45,
+    projectDomain: 'e-commerce onboarding',
+    persona: 'admin',
+    businessObjectives: ['discover products', 'add to cart', 'reach checkout'],
+    semanticHints: ['shop', 'cart', 'checkout', 'contact'],
+    flowVersioningEnabled: true,
+    flowVersion: 'ecommerce-v1',
+    baselineFlowVersion: 'ecommerce-v0',
+    flowCompatibilityMode: 'lenient',
+    feedbackEnabled: true,
+  },
+};
 
 function normalizeRoutePath(value?: string): string {
   if (!value) return '';
@@ -53,6 +124,8 @@ export function TourViewer({
   tooltipPosition = 'BOTTOM',
   onTourComplete,
   onTourSkipped,
+  runtimeBehavior,
+  contextualSuggestions = null,
 }: TourViewerProps) {
   const activeTargetRef = useRef<HTMLElement | null>(null);
   const previewBridgeRef = useRef<{
@@ -74,7 +147,20 @@ export function TourViewer({
     typeof window !== 'undefined' &&
     window.self !== window.top &&
     new URLSearchParams(window.location.search).get('__trustdev_simulator_preview') === '1';
-  const effectiveAutoStart = isEmbeddedSimulatorPreview ? false : autoStart;
+  const previewHostSuffixes = runtimeBehavior?.previewHostSuffixes ?? ['tunnelmole.net'];
+  const detectPreviewIframe = runtimeBehavior?.detectPreviewIframe ?? true;
+  const isRuntimePreviewIframe =
+    typeof window !== 'undefined' &&
+    detectPreviewIframe &&
+    window.self !== window.top &&
+    previewHostSuffixes.some((suffix) => window.location.hostname.endsWith(suffix));
+  const isPreviewRuntime = isEmbeddedSimulatorPreview || isRuntimePreviewIframe;
+  const shouldHideTourUiInPreview = runtimeBehavior?.hideTourUiInPreview ?? true;
+  const shouldDisableAutoStartInPreview = runtimeBehavior?.disableAutoStartInPreview ?? true;
+  const effectiveAutoStart = isPreviewRuntime && shouldDisableAutoStartInPreview ? false : autoStart;
+  const effectiveShowHighlight = isPreviewRuntime && shouldHideTourUiInPreview ? false : showHighlight;
+  const effectiveShowBeacon = isPreviewRuntime && shouldHideTourUiInPreview ? false : showBeacon;
+  const effectiveShowTooltip = isPreviewRuntime && shouldHideTourUiInPreview ? false : showTooltip;
 
   const onboarding = useOnboarding({
     config,
@@ -138,6 +224,24 @@ export function TourViewer({
       window.removeEventListener('hashchange', updatePath);
     };
   }, []);
+
+  useEffect(() => {
+    const resetMode = runtimeBehavior?.resetProgressOnMount ?? 'never';
+    if (resetMode === 'never') return;
+    if (resetMode === 'non-preview' && isPreviewRuntime) return;
+
+    try {
+      for (let i = window.localStorage.length - 1; i >= 0; i -= 1) {
+        const key = window.localStorage.key(i);
+        if (key && key.startsWith('trustdev_sdk_progress:')) {
+          window.localStorage.removeItem(key);
+        }
+      }
+      window.sessionStorage.removeItem('__trustdev_active_tour_session_v1');
+    } catch {
+      // Ignore storage access errors.
+    }
+  }, [runtimeBehavior?.resetProgressOnMount, isPreviewRuntime]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -373,28 +477,55 @@ export function TourViewer({
     onboarding.stop();
   }, [onboarding]);
 
+  const resolvedContextualSuggestions = (() => {
+    if (!contextualSuggestions) return null;
+    const presetName = contextualSuggestions.preset;
+    const preset = presetName ? CONTEXTUAL_SUGGESTIONS_PRESETS[presetName] ?? {} : {};
+    return {
+      ...preset,
+      ...contextualSuggestions,
+      noiseSelectors: contextualSuggestions.noiseSelectors ?? preset.noiseSelectors,
+      businessObjectives: contextualSuggestions.businessObjectives ?? preset.businessObjectives,
+      semanticHints: contextualSuggestions.semanticHints ?? preset.semanticHints,
+    };
+  })();
+
   return (
-    <TourRenderer
-      isOpen={onboarding.tour.isOpen}
-      currentStep={onboarding.tour.currentStep}
-      currentIndex={onboarding.tour.currentStepIndex}
-      totalSteps={onboarding.tour.steps.length}
-      theme={theme}
-      onNext={handleNext}
-      onPrev={handlePrev}
-      onSkip={handleSkip}
-      onClose={handleClose}
-      targetRect={targetRect}
-      showHighlight={showHighlight}
-      showBeacon={showBeacon}
-      showTooltip={showTooltip}
-      tooltipPosition={tooltipPosition}
-      targetNotFound={!routeMismatch && targetNotFound}
-      retryingSelector={onboarding.resolver.isResolving}
-      routeMismatch={routeMismatch}
-      expectedRoute={expectedStepRoute}
-      currentRoute={normalizedCurrentRoute}
-      autoNavigating={isAutoNavigating}
-    />
+    <>
+      <TourRenderer
+        isOpen={onboarding.tour.isOpen}
+        currentStep={onboarding.tour.currentStep}
+        currentIndex={onboarding.tour.currentStepIndex}
+        totalSteps={onboarding.tour.steps.length}
+        theme={theme}
+        onNext={handleNext}
+        onPrev={handlePrev}
+        onSkip={handleSkip}
+        onClose={handleClose}
+        targetRect={targetRect}
+        showHighlight={effectiveShowHighlight}
+        showBeacon={effectiveShowBeacon}
+        showTooltip={effectiveShowTooltip}
+        tooltipPosition={tooltipPosition}
+        targetNotFound={!routeMismatch && targetNotFound}
+        retryingSelector={onboarding.resolver.isResolving}
+        routeMismatch={routeMismatch}
+        expectedRoute={expectedStepRoute}
+        currentRoute={normalizedCurrentRoute}
+        autoNavigating={isAutoNavigating}
+      />
+      {resolvedContextualSuggestions ? (
+        <ContextualSuggestionsPublisher
+          {...resolvedContextualSuggestions}
+          uiMode={resolvedContextualSuggestions.uiMode ?? 'auto'}
+          title={resolvedContextualSuggestions.title}
+          stableOnly={resolvedContextualSuggestions.stableOnly}
+          publishConfig={{
+            ...(config ?? {}),
+            ...(resolvedContextualSuggestions.publishConfig ?? {}),
+          }}
+        />
+      ) : null}
+    </>
   );
 }

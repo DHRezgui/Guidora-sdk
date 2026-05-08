@@ -14,3 +14,4 @@ export * from './StepFooter';
 export * from './TargetNotFoundFallback';
 export * from './TourRenderer';
 export * from './TourViewer';
+export * from './ContextualSuggestionsPublisher';
