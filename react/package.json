@@ -14,12 +14,21 @@
       "require": "./dist/index.cjs.js",
       "types": "./dist/index.d.ts"
     },
+    "./packs": {
+      "import": "./dist/packs/index.esm.js",
+      "require": "./dist/packs/index.cjs.js",
+      "types": "./dist/packs/index.d.ts"
+    },
     "./styles.css": "./dist/styles.css"
   },
   "files": [
     "dist",
+    "scripts/init.js",
     "README.md"
   ],
+  "bin": {
+    "trustdev-init": "./scripts/init.js"
+  },
   "scripts": {
     "clean": "rimraf dist",
     "dev": "rollup -c -w",

@@ -9,8 +9,20 @@ import { OnboardingTheme, useThemeCssVars } from './theme';
 type RectLike = Pick<DOMRect, 'top' | 'left' | 'width' | 'height'>;
 const VIEWPORT_MARGIN_PX = 8;
 const TOOLTIP_DEFAULT_WIDTH_PX = 360;
+const TOOLTIP_ESTIMATED_HEIGHT_PX = 190;
 // Keep visible breathing room between target edge and tooltip edge.
 const ANCHOR_LENGTH_PX = 84;
+const PLACEMENT_CANDIDATES: PositionType[] = [
+  'BOTTOM',
+  'TOP',
+  'RIGHT',
+  'LEFT',
+  'BOTTOM_RIGHT',
+  'BOTTOM_LEFT',
+  'TOP_RIGHT',
+  'TOP_LEFT',
+  'CENTER',
+];
 
 export interface TooltipProps {
   open: boolean;
@@ -179,6 +191,8 @@ function getTooltipPosition(targetRect?: RectLike | null, position: PositionType
   return {
     ...safe,
     maxWidth: `min(${TOOLTIP_DEFAULT_WIDTH_PX}px, calc(100vw - ${VIEWPORT_MARGIN_PX * 2}px))`,
+    maxHeight: `calc(100vh - ${VIEWPORT_MARGIN_PX * 2}px)`,
+    overflowY: 'auto',
   };
 }
 
@@ -205,11 +219,123 @@ function getRectBoundaryPoint(
   };
 }
 
-function resolveRuntimePosition(targetRect?: RectLike | null, preferred: PositionType = 'BOTTOM'): PositionType {
+function getPlacementOrder(preferred: PositionType): PositionType[] {
+  const opposites: Partial<Record<PositionType, PositionType[]>> = {
+    BOTTOM: ['TOP', 'RIGHT', 'LEFT'],
+    TOP: ['BOTTOM', 'RIGHT', 'LEFT'],
+    RIGHT: ['LEFT', 'TOP', 'BOTTOM'],
+    LEFT: ['RIGHT', 'TOP', 'BOTTOM'],
+    BOTTOM_LEFT: ['TOP_LEFT', 'BOTTOM_RIGHT', 'TOP'],
+    BOTTOM_RIGHT: ['TOP_RIGHT', 'BOTTOM_LEFT', 'TOP'],
+    TOP_LEFT: ['BOTTOM_LEFT', 'TOP_RIGHT', 'BOTTOM'],
+    TOP_RIGHT: ['BOTTOM_RIGHT', 'TOP_LEFT', 'BOTTOM'],
+    CENTER: ['BOTTOM', 'TOP', 'RIGHT', 'LEFT'],
+  };
+
+  return Array.from(new Set([preferred, ...(opposites[preferred] ?? []), ...PLACEMENT_CANDIDATES]));
+}
+
+function getProjectedTooltipBounds(
+  targetRect: RectLike,
+  position: PositionType,
+  tooltipWidth: number,
+  tooltipHeight: number,
+  viewportWidth: number,
+  viewportHeight: number,
+): { top: number; left: number; right: number; bottom: number } {
+  if (position === 'CENTER') {
+    const left = (viewportWidth - tooltipWidth) / 2;
+    const top = (viewportHeight - tooltipHeight) / 2;
+    return { top, left, right: left + tooltipWidth, bottom: top + tooltipHeight };
+  }
+
+  const targetAnchor = getAnchorOnTarget(targetRect, position);
+  const tooltipAnchor = getTooltipAnchorFromTargetAnchor(position, targetAnchor.x, targetAnchor.y);
+
+  let left = tooltipAnchor.x;
+  let top = tooltipAnchor.y;
+
+  switch (position) {
+    case 'TOP':
+      left -= tooltipWidth / 2;
+      top -= tooltipHeight;
+      break;
+    case 'LEFT':
+      left -= tooltipWidth;
+      top -= tooltipHeight / 2;
+      break;
+    case 'RIGHT':
+      top -= tooltipHeight / 2;
+      break;
+    case 'TOP_LEFT':
+      left -= tooltipWidth;
+      top -= tooltipHeight;
+      break;
+    case 'TOP_RIGHT':
+      top -= tooltipHeight;
+      break;
+    case 'BOTTOM_LEFT':
+      left -= tooltipWidth;
+      break;
+    case 'BOTTOM_RIGHT':
+      break;
+    case 'BOTTOM':
+    default:
+      left -= tooltipWidth / 2;
+      break;
+  }
+
+  return {
+    top,
+    left,
+    right: left + tooltipWidth,
+    bottom: top + tooltipHeight,
+  };
+}
+
+function getOverflowScore(bounds: { top: number; left: number; right: number; bottom: number }): number {
+  const viewportWidth = typeof window !== 'undefined' ? Math.max(1, window.innerWidth || 1) : 1280;
+  const viewportHeight = typeof window !== 'undefined' ? Math.max(1, window.innerHeight || 1) : 720;
+
+  return (
+    Math.max(VIEWPORT_MARGIN_PX - bounds.left, 0) +
+    Math.max(bounds.right - (viewportWidth - VIEWPORT_MARGIN_PX), 0) +
+    Math.max(VIEWPORT_MARGIN_PX - bounds.top, 0) +
+    Math.max(bounds.bottom - (viewportHeight - VIEWPORT_MARGIN_PX), 0)
+  );
+}
+
+function areMeasuredRectsClose(
+  a: Pick<DOMRect, 'top' | 'left' | 'width' | 'height'> | null,
+  b: Pick<DOMRect, 'top' | 'left' | 'width' | 'height'>,
+  tolerance = 0.5,
+): boolean {
+  if (!a) return false;
+  return (
+    Math.abs(a.top - b.top) <= tolerance &&
+    Math.abs(a.left - b.left) <= tolerance &&
+    Math.abs(a.width - b.width) <= tolerance &&
+    Math.abs(a.height - b.height) <= tolerance
+  );
+}
+
+function resolveRuntimePosition(
+  targetRect?: RectLike | null,
+  preferred: PositionType = 'BOTTOM',
+  measuredTooltipRect?: Pick<DOMRect, 'width' | 'height'> | null,
+): PositionType {
   if (!targetRect) return preferred;
 
   const viewportWidth = typeof window !== 'undefined' ? Math.max(1, window.innerWidth || 1) : 1280;
   const viewportHeight = typeof window !== 'undefined' ? Math.max(1, window.innerHeight || 1) : 720;
+  const tooltipWidth = Math.min(
+    measuredTooltipRect?.width || TOOLTIP_DEFAULT_WIDTH_PX,
+    viewportWidth - VIEWPORT_MARGIN_PX * 2,
+  );
+  const tooltipHeight = Math.min(
+    measuredTooltipRect?.height || TOOLTIP_ESTIMATED_HEIGHT_PX,
+    viewportHeight - VIEWPORT_MARGIN_PX * 2,
+  );
 
   const leftPct = (targetRect.left / viewportWidth) * 100;
   const rightPct = ((targetRect.left + targetRect.width) / viewportWidth) * 100;
@@ -231,7 +357,26 @@ function resolveRuntimePosition(targetRect?: RectLike | null, preferred: Positio
     pos = pos === 'TOP' ? 'BOTTOM' : pos === 'TOP_LEFT' ? 'BOTTOM_LEFT' : 'BOTTOM_RIGHT';
   }
 
-  return pos;
+  const preferredBounds = getProjectedTooltipBounds(targetRect, pos, tooltipWidth, tooltipHeight, viewportWidth, viewportHeight);
+  if (getOverflowScore(preferredBounds) <= 0) {
+    return pos;
+  }
+
+  let bestPosition = pos;
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  getPlacementOrder(pos).forEach((candidate, index) => {
+    const bounds = getProjectedTooltipBounds(targetRect, candidate, tooltipWidth, tooltipHeight, viewportWidth, viewportHeight);
+    const overflowScore = getOverflowScore(bounds);
+    // Tiny index penalty keeps stable preference order when multiple positions fit.
+    const score = overflowScore + index * 0.001;
+    if (score < bestScore) {
+      bestScore = score;
+      bestPosition = candidate;
+    }
+  });
+
+  return bestPosition;
 }
 
 export function Tooltip({
@@ -259,7 +404,7 @@ export function Tooltip({
   const cssVars = useThemeCssVars(theme);
   const isFirstStep = (stepIndex ?? 0) <= 0;
   const isLastStep = typeof totalSteps === 'number' && typeof stepIndex === 'number' ? stepIndex >= totalSteps - 1 : false;
-  const effectivePosition = resolveRuntimePosition(targetRect, position);
+  const effectivePosition = resolveRuntimePosition(targetRect, position, tooltipRect);
   const computedStyle = getTooltipPosition(targetRect, effectivePosition);
   const targetAnchor = targetRect ? getAnchorOnTarget(targetRect, effectivePosition) : null;
   const connectorStart = tooltipRect && targetAnchor
@@ -275,22 +420,32 @@ export function Tooltip({
 
     const updateRect = () => {
       const rect = node.getBoundingClientRect();
-      setTooltipRect({
+      const nextRect = {
         top: rect.top,
         left: rect.left,
         width: rect.width,
         height: rect.height,
+      };
+      setTooltipRect((prev) => (areMeasuredRectsClose(prev, nextRect) ? prev : nextRect));
+    };
+
+    let rafId: number | null = null;
+    const scheduleUpdateRect = () => {
+      if (rafId !== null) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = null;
+        updateRect();
       });
     };
 
     updateRect();
-    const rafId = window.requestAnimationFrame(updateRect);
-    window.addEventListener('resize', updateRect);
-    window.addEventListener('scroll', updateRect, true);
+    scheduleUpdateRect();
+    window.addEventListener('resize', scheduleUpdateRect);
+    window.addEventListener('scroll', scheduleUpdateRect, { capture: true, passive: true });
     return () => {
-      window.cancelAnimationFrame(rafId);
-      window.removeEventListener('resize', updateRect);
-      window.removeEventListener('scroll', updateRect, true);
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
+      window.removeEventListener('resize', scheduleUpdateRect);
+      window.removeEventListener('scroll', scheduleUpdateRect, true);
     };
   }, [open, computedStyle.left, computedStyle.top, computedStyle.transform, content, title, stepIndex, totalSteps]);
 

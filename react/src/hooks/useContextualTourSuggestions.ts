@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ContextualGenerationDebugReport,
   PublishContextualDraft,
@@ -13,20 +13,74 @@ import {
 import { sdkApiClient } from '../core/api-client';
 import { resolveSDKConfig } from '../core/sdk-state';
 import {
+  clearRemoteContextualFeedback,
   getContextualFlowRegistry,
   generateContextualTourDrafts,
   getLastContextualGenerationDebugReport,
+  getLocalFeedbackForSelector,
   recordTourSuggestionFeedback,
   resetTourSuggestionFeedback,
+  setRemoteContextualFeedback,
 } from '../utils/tour-suggestion-generator';
+import {
+  setContextualFeedbackConfig,
+  flushFeedbackQueue,
+  enqueueContextualFeedback,
+} from '../utils/contextual-feedback-flusher';
 
 export interface UseContextualTourSuggestionsOptions extends TourDraftGenerationOptions {
   enabled?: boolean;
   autoGenerate?: boolean;
   autoPublish?: boolean;
+  /**
+   * Whether published drafts should be activated automatically on the dashboard.
+   * Defaults to false: tours are created as inactive, the developer decides
+   * which ones to activate via the dashboard.
+   */
   autoActivatePublishedDrafts?: boolean;
+  /**
+   * Max number of tours auto-published per browser session (per origin).
+   * Prevents flooding the dashboard with duplicate or near-duplicate tours.
+   * Defaults to 3.
+   */
+  maxAutoPublishedTours?: number;
   publishScenario?: ContextualScenario;
   publishConfig?: Partial<SDKConfig>;
+}
+
+const AUTOPUBLISHED_SIGNATURES_STORAGE_KEY = '__trustdev_autopublished_signatures_v1';
+
+function readAutoPublishedSignatures(): Set<string> {
+  if (typeof window === 'undefined') return new Set();
+  try {
+    const raw = window.sessionStorage.getItem(AUTOPUBLISHED_SIGNATURES_STORAGE_KEY);
+    if (!raw) return new Set();
+    const parsed = JSON.parse(raw);
+    return new Set(Array.isArray(parsed) ? parsed.filter((value) => typeof value === 'string') : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function persistAutoPublishedSignatures(signatures: Set<string>): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.sessionStorage.setItem(
+      AUTOPUBLISHED_SIGNATURES_STORAGE_KEY,
+      JSON.stringify(Array.from(signatures)),
+    );
+  } catch {
+    // ignore storage failures
+  }
+}
+
+function computeDraftDedupeSignature(draft: SuggestedTourDraft): string {
+  const flowSignature = draft.flowVersioning?.flowSignature ?? 'no-sig';
+  const url = draft.targetUrl ?? '';
+  const intent = draft.intent ?? '';
+  const firstSelector = draft.steps[0]?.targetSelector ?? '';
+  const stepCount = draft.steps.length;
+  return [flowSignature, url, intent, firstSelector, String(stepCount)].join('|');
 }
 
 export interface UseContextualTourSuggestionsResult {
@@ -40,8 +94,22 @@ export interface UseContextualTourSuggestionsResult {
   publishDrafts: (draftsToPublish?: SuggestedTourDraft[]) => Promise<PublishContextualDraftsResponse['report'] | null>;
   getDebugReport: () => ContextualGenerationDebugReport | null;
   getFlowRegistry: () => Array<{ version: string; signature: string; generatedAt: string; targetUrl: string }>;
-  recordFeedback: (input: { selector?: string; intent: SuggestedTourDraft['intent']; event: 'shown' | 'clicked' | 'completed' | 'skipped' }) => void;
+  recordFeedback: (input: { selector?: string; intent: SuggestedTourDraft['intent']; event: 'shown' | 'clicked' | 'completed' | 'skipped'; blueprintId?: string }) => void;
   resetFeedback: () => void;
+  /**
+   * Returns the local (per-browser) feedback counters for a given selector.
+   * Useful for debug UI that wants to display live counters per draft.
+   * Bumps on every recordFeedback / resetFeedback call via `feedbackVersion`.
+   */
+  getLocalFeedback: (
+    selector: string | undefined,
+  ) => { shown: number; clicked: number; completed: number; skipped: number } | null;
+  /**
+   * Monotonically increasing counter that bumps whenever local feedback is
+   * recorded or reset. Consumers can include it in dependency arrays / re-read
+   * counters to force a re-render after each click.
+   */
+  feedbackVersion: number;
 }
 
 function toPublishStep(step: Step): PublishContextualDraftStep {
@@ -162,12 +230,19 @@ export function useContextualTourSuggestions(
   const enabled = options?.enabled ?? true;
   const autoGenerate = options?.autoGenerate ?? true;
   const autoPublish = options?.autoPublish ?? false;
+  const maxAutoPublishedTours = Math.max(0, options?.maxAutoPublishedTours ?? 3);
   const [drafts, setDrafts] = useState<SuggestedTourDraft[]>([]);
   const [isGenerating, setIsGenerating] = useState(false);
   const [isPublishing, setIsPublishing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [publishError, setPublishError] = useState<string | null>(null);
   const [lastPublishReport, setLastPublishReport] = useState<PublishContextualDraftsResponse['report'] | null>(null);
+
+  const optionsRef = useRef(options);
+  optionsRef.current = options;
+  const autoPublishInFlightRef = useRef(false);
+  const autoGenerateHasRunRef = useRef(false);
+
   const fallbackPolicy = useMemo(() => resolveFallbackPolicy(options), [
     options?.publishFallbackPolicy?.enabled,
     options?.publishFallbackPolicy?.maxAttempts,
@@ -179,12 +254,16 @@ export function useContextualTourSuggestions(
     options?.publishFallbackPolicy?.retryOnRejectedReasons?.join('|'),
   ]);
 
+  const draftsRef = useRef(drafts);
+  draftsRef.current = drafts;
+
   const publishDraftsInternal = useCallback(
     async (
       draftsToPublish: SuggestedTourDraft[] | undefined,
       attemptIndex: number,
     ): Promise<PublishContextualDraftsResponse['report'] | null> => {
-      const nextDrafts = draftsToPublish ?? drafts;
+      const currentOptions = optionsRef.current;
+      const nextDrafts = draftsToPublish ?? draftsRef.current;
       if (!enabled || nextDrafts.length === 0) {
         setLastPublishReport(null);
         return null;
@@ -194,7 +273,7 @@ export function useContextualTourSuggestions(
       setLastPublishReport(null);
 
       try {
-        const resolvedConfig = resolveSDKConfig(options?.publishConfig);
+        const resolvedConfig = resolveSDKConfig(currentOptions?.publishConfig);
         const sanitizedDrafts = toPublishPayloadDrafts(nextDrafts);
 
         if (sanitizedDrafts.length === 0) {
@@ -206,11 +285,12 @@ export function useContextualTourSuggestions(
         }
 
         console.info('[SDK] Publishing sanitized drafts:', sanitizedDrafts);
-        const defaultAutoActivate = process.env.NODE_ENV === 'production' ? false : true;
+        // Default to false so newly-generated tours are inactive on the dashboard.
+        // The developer decides which ones to activate from the dashboard UI.
         const response = await sdkApiClient.publishContextualDrafts(resolvedConfig, {
-          scenario: options?.publishScenario ?? 'medium',
+          scenario: currentOptions?.publishScenario ?? 'medium',
           drafts: sanitizedDrafts,
-          autoActivate: options?.autoActivatePublishedDrafts ?? defaultAutoActivate,
+          autoActivate: currentOptions?.autoActivatePublishedDrafts ?? false,
         });
         console.info('[SDK] Publish response report:', response.report);
         setLastPublishReport(response.report);
@@ -221,7 +301,7 @@ export function useContextualTourSuggestions(
           reportHasRetryableRejection(response.report, fallbackPolicy);
 
         if (canRetry) {
-          const fallbackDraftOptions = buildFallbackGenerationOptions(options, fallbackPolicy);
+          const fallbackDraftOptions = buildFallbackGenerationOptions(currentOptions, fallbackPolicy);
           const fallbackDrafts = generateContextualTourDrafts(fallbackDraftOptions);
 
           if (fallbackDrafts.length > 0) {
@@ -237,7 +317,7 @@ export function useContextualTourSuggestions(
         return null;
       }
     },
-    [drafts, enabled, fallbackPolicy, options?.autoActivatePublishedDrafts, options?.publishConfig, options?.publishScenario],
+    [enabled, fallbackPolicy],
   );
 
   const publishDrafts = useCallback(
@@ -252,7 +332,59 @@ export function useContextualTourSuggestions(
     [publishDraftsInternal],
   );
 
+  const selectAutoPublishCandidates = useCallback(
+    (allDrafts: SuggestedTourDraft[]): SuggestedTourDraft[] => {
+      if (allDrafts.length === 0) return [];
+      const alreadyPublished = readAutoPublishedSignatures();
+      const remainingCapacity = Math.max(0, maxAutoPublishedTours - alreadyPublished.size);
+      if (remainingCapacity === 0) return [];
+
+      const seenInBatch = new Set<string>();
+      const candidates: SuggestedTourDraft[] = [];
+
+      for (const draft of allDrafts) {
+        const signature = computeDraftDedupeSignature(draft);
+        if (alreadyPublished.has(signature) || seenInBatch.has(signature)) continue;
+        seenInBatch.add(signature);
+        candidates.push(draft);
+        if (candidates.length >= remainingCapacity) break;
+      }
+
+      return candidates;
+    },
+    [maxAutoPublishedTours],
+  );
+
+  const runAutoPublish = useCallback(
+    async (allDrafts: SuggestedTourDraft[]): Promise<void> => {
+      if (autoPublishInFlightRef.current) return;
+      const candidates = selectAutoPublishCandidates(allDrafts);
+      if (candidates.length === 0) {
+        console.info(
+          '[SDK] Auto-publish skipped: nothing new to publish (deduped or session cap reached).',
+        );
+        return;
+      }
+
+      autoPublishInFlightRef.current = true;
+      try {
+        const report = await publishDrafts(candidates);
+        if (report && report.created > 0) {
+          const signatures = readAutoPublishedSignatures();
+          for (const draft of candidates) {
+            signatures.add(computeDraftDedupeSignature(draft));
+          }
+          persistAutoPublishedSignatures(signatures);
+        }
+      } finally {
+        autoPublishInFlightRef.current = false;
+      }
+    },
+    [publishDrafts, selectAutoPublishCandidates],
+  );
+
   const refresh = useCallback((): SuggestedTourDraft[] => {
+    const currentOptions = optionsRef.current;
     if (!enabled || typeof document === 'undefined') {
       setDrafts([]);
       return [];
@@ -264,10 +396,10 @@ export function useContextualTourSuggestions(
     setLastPublishReport(null);
 
     try {
-      let next = generateContextualTourDrafts(options);
+      let next = generateContextualTourDrafts(currentOptions);
 
       if (next.length === 0 && fallbackPolicy.enabled && fallbackPolicy.maxAttempts > 1) {
-        const fallbackDraftOptions = buildFallbackGenerationOptions(options, fallbackPolicy);
+        const fallbackDraftOptions = buildFallbackGenerationOptions(currentOptions, fallbackPolicy);
         const fallbackDrafts = generateContextualTourDrafts(fallbackDraftOptions);
         if (fallbackDrafts.length > 0) {
           next = fallbackDrafts;
@@ -276,7 +408,7 @@ export function useContextualTourSuggestions(
 
       setDrafts(next);
       if (autoPublish && next.length > 0) {
-        void publishDrafts(next);
+        void runAutoPublish(next);
       } else {
         setLastPublishReport(null);
       }
@@ -289,18 +421,45 @@ export function useContextualTourSuggestions(
     } finally {
       setIsGenerating(false);
     }
-  }, [autoPublish, enabled, fallbackPolicy, options, publishDrafts]);
+  }, [autoPublish, enabled, fallbackPolicy, runAutoPublish]);
+
+  const [feedbackVersion, setFeedbackVersion] = useState(0);
 
   const recordFeedback = useCallback(
-    (input: { selector?: string; intent: SuggestedTourDraft['intent']; event: 'shown' | 'clicked' | 'completed' | 'skipped' }) => {
+    (input: { selector?: string; intent: SuggestedTourDraft['intent']; event: 'shown' | 'clicked' | 'completed' | 'skipped'; blueprintId?: string }) => {
+      // Local store: always update (this powers the inline live counters and
+      // feeds the per-blueprint aggregate when `blueprintId` is provided).
       recordTourSuggestionFeedback(input);
+      // Backend queue: only enqueue when feedback was explicitly opted-in by
+      // the host, to keep manual debug-panel clicks aligned with the runtime
+      // double-write done by TourViewer. Skipped silently otherwise.
+      if (optionsRef.current?.feedbackEnabled === true) {
+        enqueueContextualFeedback({
+          selector: input.selector,
+          intent: input.intent,
+          event: input.event,
+        });
+      }
+      setFeedbackVersion((v) => v + 1);
     },
     [],
   );
 
   const resetFeedback = useCallback(() => {
     resetTourSuggestionFeedback();
+    clearRemoteContextualFeedback();
+    setFeedbackVersion((v) => v + 1);
   }, []);
+
+  const getLocalFeedback = useCallback(
+    (selector: string | undefined) => {
+      // Read `feedbackVersion` here so React re-evaluates after each bump,
+      // even though we don't otherwise use it in the body.
+      void feedbackVersion;
+      return getLocalFeedbackForSelector(selector);
+    },
+    [feedbackVersion],
+  );
 
   const getDebugReport = useCallback((): ContextualGenerationDebugReport | null => {
     return getLastContextualGenerationDebugReport();
@@ -310,10 +469,75 @@ export function useContextualTourSuggestions(
     return getContextualFlowRegistry();
   }, []);
 
+  // Stability fix D: tracks whether the remote feedback aggregates bootstrap
+  // has settled (success OR failure). The first auto-generation waits for
+  // this to avoid the "cold start" race where scan #1 uses 100% local
+  // feedback and scan #2 uses 70% remote / 30% local, producing different
+  // drafts on identical DOMs. Resets to false whenever `feedbackEnabled`
+  // flips back off.
+  const [remoteFeedbackReady, setRemoteFeedbackReady] = useState(false);
+
   useEffect(() => {
     if (!autoGenerate) return;
+    if (autoGenerateHasRunRef.current) return;
+    // Stability fix D: when feedback is opted-in, gate the very first scan
+    // on remoteFeedbackReady. Subsequent calls go through `refresh()`
+    // directly, untouched by this gate.
+    if (options?.feedbackEnabled === true && !remoteFeedbackReady) return;
+    autoGenerateHasRunRef.current = true;
     refresh();
-  }, [autoGenerate, refresh]);
+  }, [autoGenerate, refresh, options?.feedbackEnabled, remoteFeedbackReady]);
+
+  // Backend feedback sync (Phase 2): only when feedback explicitly opted-in.
+  // Effect re-runs ONLY when the boolean opt-in flag toggles. publishConfig is
+  // read via optionsRef on each invocation to avoid the "object reference
+  // changes every render" feedback loop that would otherwise spam
+  // `GET /aggregates` on every parent re-render.
+  const remoteFeedbackBootstrappedRef = useRef(false);
+  useEffect(() => {
+    if (options?.feedbackEnabled !== true) {
+      setContextualFeedbackConfig(null);
+      clearRemoteContextualFeedback();
+      remoteFeedbackBootstrappedRef.current = false;
+      setRemoteFeedbackReady(false);
+      return;
+    }
+
+    if (remoteFeedbackBootstrappedRef.current) return;
+    remoteFeedbackBootstrappedRef.current = true;
+
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const resolvedConfig = resolveSDKConfig(optionsRef.current?.publishConfig);
+        setContextualFeedbackConfig(resolvedConfig);
+        const response = await sdkApiClient.getContextualFeedbackAggregates(resolvedConfig);
+        if (cancelled) return;
+        setRemoteContextualFeedback(response.aggregates ?? []);
+      } catch (err) {
+        if (typeof console !== 'undefined') {
+          console.warn('[TrustDev SDK] Failed to fetch contextual feedback aggregates', err);
+        }
+      } finally {
+        // Stability fix D: mark ready *whether the fetch succeeded or not*.
+        // A backend outage shouldn't permanently block draft generation; we
+        // just fall back to local-only feedback (or zero feedback) in a
+        // deterministic way.
+        if (!cancelled) setRemoteFeedbackReady(true);
+      }
+    })();
+
+    const flushInterval = setInterval(() => {
+      void flushFeedbackQueue();
+    }, 30_000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(flushInterval);
+      void flushFeedbackQueue();
+    };
+  }, [options?.feedbackEnabled]);
 
   return {
     drafts,
@@ -328,5 +552,7 @@ export function useContextualTourSuggestions(
     getFlowRegistry,
     recordFeedback,
     resetFeedback,
+    getLocalFeedback,
+    feedbackVersion,
   };
 }

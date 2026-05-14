@@ -1,8 +1,59 @@
-import { CSSProperties } from 'react';
+import {
+  CSSProperties,
+  TouchEvent as ReactTouchEvent,
+  WheelEvent as ReactWheelEvent,
+  useRef,
+} from 'react';
 import { TourPortal } from './TourPortal';
 import { OnboardingTheme, useThemeCssVars } from './theme';
 
 type RectLike = Pick<DOMRect, 'top' | 'left' | 'width' | 'height'>;
+
+function isScrollableElement(element: Element): element is HTMLElement {
+  if (!(element instanceof HTMLElement)) return false;
+  const style = window.getComputedStyle(element);
+  const overflowY = style.overflowY;
+  const overflowX = style.overflowX;
+  const canScrollY =
+    (overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay') &&
+    element.scrollHeight > element.clientHeight;
+  const canScrollX =
+    (overflowX === 'auto' || overflowX === 'scroll' || overflowX === 'overlay') &&
+    element.scrollWidth > element.clientWidth;
+  return canScrollY || canScrollX;
+}
+
+function findScrollableAtPoint(clientX: number, clientY: number): HTMLElement | null {
+  if (typeof document === 'undefined') return null;
+
+  const elementsAtPoint = document.elementsFromPoint(clientX, clientY);
+  for (const element of elementsAtPoint) {
+    if (element.closest('.td-layer')) continue;
+
+    let current: Element | null = element;
+    while (current && current !== document.body && current !== document.documentElement) {
+      if (isScrollableElement(current)) return current;
+      current = current.parentElement;
+    }
+  }
+
+  const documentScroller = document.scrollingElement;
+  return documentScroller instanceof HTMLElement ? documentScroller : null;
+}
+
+function scrollElementBy(
+  element: HTMLElement | null,
+  deltaX: number,
+  deltaY: number,
+): void {
+  if (!element) {
+    window.scrollBy({ left: deltaX, top: deltaY, behavior: 'auto' });
+    return;
+  }
+
+  element.scrollLeft += deltaX;
+  element.scrollTop += deltaY;
+}
 
 export interface HighlightProps {
   open: boolean;
@@ -28,6 +79,7 @@ export function Highlight({
   onOverlayClick,
 }: HighlightProps) {
   const cssVars = useThemeCssVars(theme);
+  const lastTouchRef = useRef<{ x: number; y: number } | null>(null);
 
   if (!open || !targetRect) return null;
 
@@ -58,6 +110,37 @@ export function Highlight({
     position: 'fixed',
     background: 'var(--td-overlay-color)',
     pointerEvents: 'auto',
+    touchAction: 'none',
+  };
+  const forwardWheelToPage = (event: ReactWheelEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    scrollElementBy(findScrollableAtPoint(event.clientX, event.clientY), event.deltaX, event.deltaY);
+  };
+  const rememberTouchY = (event: ReactTouchEvent<HTMLDivElement>) => {
+    const touch = event.touches[0];
+    lastTouchRef.current = touch ? { x: touch.clientX, y: touch.clientY } : null;
+  };
+  const forwardTouchToPage = (event: ReactTouchEvent<HTMLDivElement>) => {
+    const touch = event.touches[0];
+    const previous = lastTouchRef.current;
+    if (!touch || !previous) return;
+
+    event.preventDefault();
+    scrollElementBy(
+      findScrollableAtPoint(touch.clientX, touch.clientY),
+      previous.x - touch.clientX,
+      previous.y - touch.clientY,
+    );
+    lastTouchRef.current = { x: touch.clientX, y: touch.clientY };
+  };
+  const overlayInteractionProps = {
+    onClick: onOverlayClick,
+    onWheel: forwardWheelToPage,
+    onTouchStart: rememberTouchY,
+    onTouchMove: forwardTouchToPage,
+    onTouchEnd: () => {
+      lastTouchRef.current = null;
+    },
   };
 
   return (
@@ -73,7 +156,7 @@ export function Highlight({
                 right: 0,
                 height: overlayTop,
               }}
-              onClick={onOverlayClick}
+              {...overlayInteractionProps}
               aria-hidden="true"
             />
             <div
@@ -84,7 +167,7 @@ export function Highlight({
                 width: overlayLeft,
                 height: overlayMiddleHeight,
               }}
-              onClick={onOverlayClick}
+              {...overlayInteractionProps}
               aria-hidden="true"
             />
             <div
@@ -95,7 +178,7 @@ export function Highlight({
                 right: 0,
                 height: overlayMiddleHeight,
               }}
-              onClick={onOverlayClick}
+              {...overlayInteractionProps}
               aria-hidden="true"
             />
             <div
@@ -106,7 +189,7 @@ export function Highlight({
                 right: 0,
                 bottom: 0,
               }}
-              onClick={onOverlayClick}
+              {...overlayInteractionProps}
               aria-hidden="true"
             />
           </>

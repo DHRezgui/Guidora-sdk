@@ -1,8 +1,11 @@
 import {
   ActiveToursResponse,
+  ContextualFeedbackAggregatesResponse,
   NormalizedSDKConfig,
   PublishContextualDraftsRequest,
   PublishContextualDraftsResponse,
+  SubmitContextualFeedbackRequest,
+  SubmitContextualFeedbackResponse,
   TrackBatchResponse,
   TrackEventInput,
   TrackEventResponse,
@@ -96,6 +99,57 @@ export const sdkApiClient = {
       method: 'POST',
       body: JSON.stringify(payload),
     });
+  },
+
+  submitContextualFeedback(
+    config: NormalizedSDKConfig,
+    payload: SubmitContextualFeedbackRequest,
+  ): Promise<SubmitContextualFeedbackResponse> {
+    return request<SubmitContextualFeedbackResponse>(config, '/tours/contextual/feedback', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  submitContextualFeedbackKeepalive(
+    config: NormalizedSDKConfig,
+    payload: SubmitContextualFeedbackRequest,
+  ): void {
+    if (typeof window === 'undefined') return;
+    const body = JSON.stringify(payload);
+    if (typeof fetch === 'function') {
+      void fetch(`${config.apiUrl}/tours/contextual/feedback`, {
+        method: 'POST',
+        headers: { ...buildHeaders(config), 'Content-Type': 'application/json' },
+        body,
+        keepalive: true,
+      }).catch(() => {
+        if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+          const blob = new Blob([body], { type: 'application/json' });
+          navigator.sendBeacon(`${config.apiUrl}/tours/contextual/feedback`, blob);
+        }
+      });
+      return;
+    }
+    if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+      const blob = new Blob([body], { type: 'application/json' });
+      navigator.sendBeacon(`${config.apiUrl}/tours/contextual/feedback`, blob);
+    }
+  },
+
+  getContextualFeedbackAggregates(
+    config: NormalizedSDKConfig,
+    options?: { targetUrl?: string; limit?: number },
+  ): Promise<ContextualFeedbackAggregatesResponse> {
+    const params = new URLSearchParams();
+    if (options?.targetUrl) params.set('targetUrl', options.targetUrl);
+    if (options?.limit) params.set('limit', String(options.limit));
+    const qs = params.toString();
+    return request<ContextualFeedbackAggregatesResponse>(
+      config,
+      `/tours/contextual/feedback/aggregates${qs ? `?${qs}` : ''}`,
+      { method: 'GET' },
+    );
   },
 
   trackEvent(config: NormalizedSDKConfig, event: TrackEventInput): Promise<TrackEventResponse> {

@@ -15,12 +15,24 @@ import {
   TourDraftIntent,
   TourPersona,
 } from '../types';
+import { selectActiveBlueprints } from './journey-blueprints';
+import { BlueprintResolutionReport, resolveBlueprintsToDrafts } from './journey-resolver';
 
-interface DetectedElement {
+export interface DetectedElement {
   element: HTMLElement;
   selector: string;
   label: string;
   score: number;
+  /**
+   * Stability fix (instability source C): feedback signal is stored separately
+   * from `score` so it never influences `>= minScore` / `>= minConfidence`
+   * filtering. It is only added back in candidate-level `sort` comparators as
+   * a *ranking* bias (i.e. tie/near-tie nudging which selector becomes
+   * primary), so the *number* of drafts produced for a given DOM stays stable
+   * across sessions while the *order/choice* still benefits from
+   * cross-user feedback (`combinedFeedbackWeight`).
+   */
+  rankingBoost: number;
   confidence: number;
   intent: TourDraftIntent;
   reasons: string[];
@@ -44,6 +56,15 @@ interface FeedbackStats {
 interface FeedbackStore {
   selectors: Record<string, FeedbackStats>;
   intents: Record<TourDraftIntent, FeedbackStats>;
+  /**
+   * Per-blueprint aggregates. Populated when `recordTourSuggestionFeedback`
+   * receives a `blueprintId` (from blueprint-origin drafts). Used by
+   * `blueprintFeedbackBoost` to de-prioritize blueprints that historically
+   * underperform (low click/completion rate or high skip rate) without
+   * removing them from the catalog. Optional for backward compat — older
+   * stored payloads have no `blueprints` key.
+   */
+  blueprints?: Record<string, FeedbackStats>;
 }
 
 interface CandidateCacheEntry {
@@ -125,6 +146,8 @@ interface GenerationSeverityProfile {
 }
 
 const FEEDBACK_STORAGE_KEY = '__trustdev_contextual_tour_feedback_v2';
+const FEEDBACK_COUNTER_CAP = 10_000;
+const FEEDBACK_MAX_SELECTORS = 500;
 const FLOW_VERSION_REGISTRY_STORAGE_KEY = '__trustdev_contextual_flow_registry_v1';
 const MAX_TRACKED_ELEMENTS = 1200;
 const DEFAULT_MUTATION_BATCH_WINDOW_MS = 120;
@@ -174,6 +197,17 @@ const INTERACTIVE_SELECTOR = [
   '[data-cy]',
   '[data-qa]',
   '[aria-label]',
+  // Semantic containers — collected so blueprints targeting informational
+  // regions (dashboards, transactions lists, settings panels) can resolve
+  // even when the host app does not pose `data-tour-id` on the wrapper.
+  // We deliberately only collect containers that follow standard a11y
+  // conventions: `role="region"` (a labelled informational landmark) and
+  // `role="tabpanel"` (a Radix / Headless UI / Reach UI tab content).
+  // Plain `<div>` / `<section>` without ARIA roles are intentionally left
+  // out to keep noise and DOM-walk cost bounded.
+  '[role="region"]',
+  '[role="tabpanel"]',
+  '[aria-labelledby]',
 ].join(', ');
 
 const STABLE_ATTRIBUTES = ['data-tour-id', 'data-testid', 'data-cy', 'data-qa', 'name', 'aria-label'] as const;
@@ -335,6 +369,27 @@ const runtime: RuntimeState = {
 
 let activeDiagnostics: GenerationDiagnostics | null = null;
 let lastGenerationDebugReport: ContextualGenerationDebugReport | null = null;
+
+/**
+ * Stability fix (instability source B): feedback store snapshot captured ONCE
+ * at the start of each `generateTourSuggestions` invocation. All `scoreCandidate`
+ * calls during the same scan read from this snapshot instead of re-parsing
+ * `localStorage` for every candidate. This guarantees that scores cannot drift
+ * mid-scan if the user interacts with a tour while the generator is running.
+ *
+ * Reset to `null` in the `finally` block of `generateTourSuggestions` so any
+ * call to `scoreCandidate` outside a generation cycle falls back to the
+ * live store (used by the incremental MutationObserver path).
+ */
+let currentFeedbackSnapshot: FeedbackStore | null = null;
+
+/**
+ * Stability fix (instability source D, debug field E): true once the remote
+ * feedback aggregates have been bootstrapped at least once for this session.
+ * Used by the debug report so the developer can see whether the current
+ * scoring leveraged cross-user remote feedback or only local data.
+ */
+let remoteFeedbackBootstrapped = false;
 
 let stepCounter = 0;
 
@@ -709,11 +764,22 @@ function buildFlowVersioningMetadata(
 
 function persistFlowVersioningMetadata(drafts: SuggestedTourDraft[]): void {
   const entries = getFlowRegistry();
-  const next = [...entries];
+  // Deduplicate by (version + signature + targetUrl). When a draft yields the
+  // same fingerprint as a previously registered entry, we refresh its
+  // `generatedAt` and move it to the most-recent slot instead of accumulating
+  // a duplicate copy. This keeps the registry small and avoids the
+  // "Flow Registry (100) with the same row repeated" pollution.
+  const byKey = new Map<string, FlowRegistryEntry>();
+  for (const entry of entries) {
+    const key = `${entry.version}|${entry.signature}|${entry.targetUrl}`;
+    byKey.set(key, entry);
+  }
 
   for (const draft of drafts) {
     if (!draft.flowVersioning) continue;
-    next.push({
+    const key = `${draft.flowVersioning.flowVersion}|${draft.flowVersioning.flowSignature}|${draft.targetUrl}`;
+    byKey.delete(key);
+    byKey.set(key, {
       version: draft.flowVersioning.flowVersion,
       signature: draft.flowVersioning.flowSignature,
       generatedAt: draft.generatedAt,
@@ -721,7 +787,7 @@ function persistFlowVersioningMetadata(drafts: SuggestedTourDraft[]): void {
     });
   }
 
-  saveFlowRegistry(next);
+  saveFlowRegistry(Array.from(byKey.values()));
 }
 
 export function getContextualFlowRegistry(): Array<{
@@ -881,6 +947,7 @@ function createDefaultFeedbackStore(): FeedbackStore {
       'support-navigation': getDefaultFeedbackStats(),
       'form-flow': getDefaultFeedbackStats(),
     },
+    blueprints: {},
   };
 }
 
@@ -900,6 +967,7 @@ function getFeedbackStore(): FeedbackStore {
         'support-navigation': parsed.intents?.['support-navigation'] || getDefaultFeedbackStats(),
         'form-flow': parsed.intents?.['form-flow'] || getDefaultFeedbackStats(),
       },
+      blueprints: parsed.blueprints || {},
     };
   } catch {
     return createDefaultFeedbackStore();
@@ -916,13 +984,43 @@ function saveFeedbackStore(store: FeedbackStore): void {
 }
 
 function incrementFeedbackStats(stats: FeedbackStats, event: 'shown' | 'clicked' | 'completed' | 'skipped'): void {
-  stats[event] = (stats[event] || 0) + 1;
+  // Bounded counter to prevent unbounded growth and ratio collapse.
+  // Once we hit the cap, further events are ignored for this counter so the
+  // signal remains usable (ratios stay meaningful at the chosen scale).
+  const current = stats[event] || 0;
+  if (current >= FEEDBACK_COUNTER_CAP) return;
+  stats[event] = current + 1;
+}
+
+function pruneSelectorsIfNeeded(store: FeedbackStore): void {
+  const keys = Object.keys(store.selectors);
+  if (keys.length <= FEEDBACK_MAX_SELECTORS) return;
+
+  const scored = keys
+    .map((key) => {
+      const s = store.selectors[key];
+      const activity = s.shown + s.clicked + s.completed + s.skipped;
+      return [key, activity] as const;
+    })
+    .sort((a, b) => a[1] - b[1]);
+
+  const toRemove = scored.slice(0, keys.length - FEEDBACK_MAX_SELECTORS);
+  for (const [key] of toRemove) {
+    delete store.selectors[key];
+  }
 }
 
 export function recordTourSuggestionFeedback(input: {
   selector?: string;
   intent: TourDraftIntent;
   event: 'shown' | 'clicked' | 'completed' | 'skipped';
+  /**
+   * Optional. When provided (drafts from a journey blueprint), the feedback
+   * also feeds the per-blueprint aggregates used by `blueprintFeedbackBoost`
+   * during draft scoring. Pass `draft.origin.blueprintId` when calling from a
+   * blueprint-origin draft, undefined otherwise.
+   */
+  blueprintId?: string;
 }): void {
   const store = getFeedbackStore();
 
@@ -932,6 +1030,14 @@ export function recordTourSuggestionFeedback(input: {
     const existing = store.selectors[input.selector] || getDefaultFeedbackStats();
     incrementFeedbackStats(existing, input.event);
     store.selectors[input.selector] = existing;
+    pruneSelectorsIfNeeded(store);
+  }
+
+  if (input.blueprintId) {
+    if (!store.blueprints) store.blueprints = {};
+    const existingBp = store.blueprints[input.blueprintId] || getDefaultFeedbackStats();
+    incrementFeedbackStats(existingBp, input.event);
+    store.blueprints[input.blueprintId] = existingBp;
   }
 
   saveFeedbackStore(store);
@@ -946,6 +1052,26 @@ export function resetTourSuggestionFeedback(): void {
   }
 }
 
+/**
+ * Read the local (per-browser) feedback counters for a selector.
+ * Used by debug UI to display live, per-draft counters that reflect each
+ * Feedback shown/clicked button press immediately.
+ */
+export function getLocalFeedbackForSelector(
+  selector: string | undefined,
+): { shown: number; clicked: number; completed: number; skipped: number } | null {
+  if (!selector) return null;
+  const store = getFeedbackStore();
+  const stats = store.selectors[selector];
+  if (!stats) return null;
+  return {
+    shown: stats.shown,
+    clicked: stats.clicked,
+    completed: stats.completed,
+    skipped: stats.skipped,
+  };
+}
+
 function feedbackWeight(stats?: FeedbackStats): number {
   if (!stats) return 0;
   const shown = Math.max(1, stats.shown);
@@ -953,6 +1079,173 @@ function feedbackWeight(stats?: FeedbackStats): number {
   const completionRate = stats.completed / shown;
   const skipRate = stats.skipped / shown;
   return completionRate * 24 + clickRate * 10 - skipRate * 18;
+}
+
+/**
+ * Remote feedback aggregates cache.
+ * Populated by `setRemoteContextualFeedback` (called from the React hook after
+ * fetching `/tours/contextual/feedback/aggregates`). Consumed synchronously by
+ * `combinedFeedbackWeight` during draft scoring.
+ *
+ * Structure mirrors `FeedbackStore` but keyed on the same primary keys we use
+ * remotely: per-selector and per-intent rollups.
+ */
+interface RemoteFeedbackEntry {
+  shown: number;
+  clicked: number;
+  completed: number;
+  skipped: number;
+}
+
+interface RemoteFeedbackStore {
+  selectors: Record<string, RemoteFeedbackEntry>;
+  intents: Partial<Record<TourDraftIntent, RemoteFeedbackEntry>>;
+}
+
+let remoteFeedbackStore: RemoteFeedbackStore | null = null;
+
+export function setRemoteContextualFeedback(
+  rawAggregates: Array<{
+    selector: string;
+    intent: string;
+    shown: number;
+    clicked: number;
+    completed: number;
+    skipped: number;
+  }>,
+): void {
+  const selectors: Record<string, RemoteFeedbackEntry> = {};
+  const intents: Partial<Record<TourDraftIntent, RemoteFeedbackEntry>> = {};
+
+  for (const row of rawAggregates) {
+    const intentKey = row.intent as TourDraftIntent;
+    if (row.selector && row.selector !== '__unknown__') {
+      const existing = selectors[row.selector] ?? { shown: 0, clicked: 0, completed: 0, skipped: 0 };
+      existing.shown += row.shown;
+      existing.clicked += row.clicked;
+      existing.completed += row.completed;
+      existing.skipped += row.skipped;
+      selectors[row.selector] = existing;
+    }
+    const intentBucket = intents[intentKey] ?? { shown: 0, clicked: 0, completed: 0, skipped: 0 };
+    intentBucket.shown += row.shown;
+    intentBucket.clicked += row.clicked;
+    intentBucket.completed += row.completed;
+    intentBucket.skipped += row.skipped;
+    intents[intentKey] = intentBucket;
+  }
+
+  remoteFeedbackStore = { selectors, intents };
+  remoteFeedbackBootstrapped = true;
+}
+
+export function clearRemoteContextualFeedback(): void {
+  remoteFeedbackStore = null;
+  remoteFeedbackBootstrapped = false;
+}
+
+/**
+ * Stability fix (instability source D): expose whether remote feedback was
+ * bootstrapped, so the React hook can gate the first auto-generation on it
+ * (avoids "cold start" race where the first scan uses 100% local feedback and
+ * the next scan uses 70% remote / 30% local, leading to different drafts on
+ * identical DOMs).
+ */
+export function isRemoteContextualFeedbackBootstrapped(): boolean {
+  return remoteFeedbackBootstrapped;
+}
+
+function remoteFeedbackWeight(entry?: RemoteFeedbackEntry): number {
+  if (!entry) return 0;
+  const shown = Math.max(1, entry.shown);
+  const clickRate = entry.clicked / shown;
+  const completionRate = entry.completed / shown;
+  const skipRate = entry.skipped / shown;
+  return completionRate * 24 + clickRate * 10 - skipRate * 18;
+}
+
+/**
+ * Blended feedback bonus combining cross-user remote aggregates (when
+ * available) with the fresher per-browser local store.
+ *
+ * Weights:
+ * - Remote signal (more reliable, larger sample): 0.7
+ * - Local signal (fresher, single-browser): 0.3
+ *
+ * When no remote data is available, falls back fully to local. This avoids a
+ * "cold start zero-bonus" while remote is still bootstrapping.
+ */
+function combinedFeedbackWeight(args: {
+  selector: string;
+  intent: TourDraftIntent;
+  localStore: FeedbackStore;
+}): number {
+  const localSelector = args.localStore.selectors[args.selector];
+  const localIntent = args.localStore.intents[args.intent];
+  const localScore = feedbackWeight(localSelector) + feedbackWeight(localIntent) * 0.6;
+
+  if (!remoteFeedbackStore) return localScore;
+
+  const remoteSelector = remoteFeedbackStore.selectors[args.selector];
+  const remoteIntent = remoteFeedbackStore.intents[args.intent];
+  const remoteScore =
+    remoteFeedbackWeight(remoteSelector) + remoteFeedbackWeight(remoteIntent) * 0.6;
+
+  return remoteScore * 0.7 + localScore * 0.3;
+}
+
+/**
+ * Stability fix C helper: effective rank value combining the deterministic
+ * `score` (DOM/lexical only) with the `rankingBoost` (feedback bias). Used in
+ * candidate `sort()` comparators to let cross-user feedback influence which
+ * candidate becomes primary/support/etc., WITHOUT touching the filter
+ * thresholds (`>= minScore` / `>= minConfidence`) that determine whether a
+ * draft is produced at all.
+ */
+function effectiveRank(candidate: DetectedElement): number {
+  return candidate.score + candidate.rankingBoost;
+}
+
+/**
+ * Returns a bounded score delta in the range [-10, +10] that should be added
+ * to a blueprint draft's score based on its historical performance with end
+ * users. The signal is built from the same `feedbackWeight` formula used for
+ * selectors / intents (completion strongly positive, click positive, skip
+ * negative) to keep the ranking philosophy consistent across signals.
+ *
+ * Behavior:
+ *  - Unknown blueprint (never shown): returns 0 — no boost, no penalty
+ *    (otherwise we'd permanently bury freshly added blueprints).
+ *  - Confident positive signal (many completions, low skip): up to +10
+ *  - Confident negative signal (many skips, ~0 completion): down to -10
+ *
+ * This boost is applied AFTER the deterministic `computeBlueprintScore` so it
+ * cannot turn a viable blueprint into a sub-`minScore` one (which would break
+ * the stability guarantees of Phase 2). It only affects the final ordering /
+ * tiebreak between competing blueprint drafts.
+ */
+function blueprintFeedbackBoost(
+  blueprintId: string,
+  localStore: FeedbackStore,
+): number {
+  const localStats = localStore.blueprints?.[blueprintId];
+  // Remote feedback for blueprints isn't carried by the current `aggregates`
+  // endpoint schema (selector + intent only). For now we rely on local-only,
+  // and when the backend is extended to expose per-blueprint aggregates we
+  // can blend remote 0.7 / local 0.3 here (mirroring `combinedFeedbackWeight`).
+  if (!localStats) return 0;
+
+  // Require a minimum sample size before we trust the signal, otherwise a
+  // single accidental "skipped" event would bury the blueprint permanently.
+  const totalEvents = localStats.shown + localStats.clicked + localStats.completed + localStats.skipped;
+  if (totalEvents < 3) return 0;
+
+  // Use the same weight function as selectors/intents for consistency. The
+  // raw output of `feedbackWeight` is bounded by clickRate * 10 + completion *
+  // 24 - skip * 18, i.e. roughly [-18, +34]. We clamp to [-10, +10] so the
+  // blueprint score (60-100) is only nudged, not dominated.
+  const raw = feedbackWeight(localStats);
+  return Math.max(-10, Math.min(10, raw));
 }
 
 function isDisabled(element: HTMLElement): boolean {
@@ -1126,9 +1419,21 @@ function selectorStabilityDelta(selector: string): number {
 function getScoreFeatures(element: HTMLElement): ScoreFeatures {
   const rect = element.getBoundingClientRect();
   const area = rect.width * rect.height;
+
+  // Stability fix (instability source A): use document-relative position instead
+  // of viewport-relative. `rect.top` shifts with the user's current scrollY, so
+  // a same element would gain/lose up to +12 score points between two
+  // generations (and consequently change which draft becomes primary, which
+  // changes the number of steps and number of drafts). We now reward elements
+  // located in the first viewport-height of the document ("above the fold"),
+  // which is stable regardless of the user's scroll position.
+  const scrollY = typeof window !== 'undefined' ? window.scrollY || 0 : 0;
   const viewportHeight = Math.max(1, window.innerHeight || 1);
-  const centerY = rect.top + rect.height / 2;
-  const viewportWeight = Math.max(0, 12 - Math.abs(centerY - viewportHeight / 2) / (viewportHeight / 2) * 8);
+  const absoluteCenterY = rect.top + scrollY + rect.height / 2;
+  // Distance from the natural "first fold" center (i.e. viewportHeight/2 inside
+  // the document, independent of current scroll).
+  const distanceFromHeader = Math.abs(absoluteCenterY - viewportHeight / 2);
+  const viewportWeight = Math.max(0, 12 - (distanceFromHeader / viewportHeight) * 8);
   const zone = detectZone(element);
 
   return {
@@ -1381,10 +1686,10 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
   const reasons: string[] = [];
   const personaScore = buildPersonaAffinity(intent, options);
   const sequenceScore = buildSequenceAffinity(element, intent, options);
-  const feedbackStore = getFeedbackStore();
-  const selectorFeedback = feedbackStore.selectors[selector];
-  const intentFeedback = feedbackStore.intents[intent];
-  const feedbackBonus = feedbackWeight(selectorFeedback) + feedbackWeight(intentFeedback) * 0.6;
+  // Stability fix B: prefer the per-generation snapshot to a fresh localStorage
+  // read so all candidates in the same scan see the same feedback state.
+  const feedbackStore = currentFeedbackSnapshot ?? getFeedbackStore();
+  const feedbackBonus = combinedFeedbackWeight({ selector, intent, localStore: feedbackStore });
 
   let score = 0;
   score += semantic.totalHits * 10;
@@ -1475,7 +1780,17 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
     reasons.push('penalty: non-actionable element for navigation intent');
   }
 
-  score += feedbackBonus;
+  // Stability fix C: feedbackBonus is NOT added to `score`. The `score` is the
+  // deterministic, DOM-only signal that drives `>= minScore` / `>= minConfidence`
+  // filtering, so the *number* of drafts produced for a given DOM stays stable
+  // across sessions. The feedback signal is stored in `rankingBoost` and only
+  // applied inside `.sort()` comparators (see `pickBest*` / `pickAny*`) to
+  // nudge which candidate becomes primary/support, without ever silently
+  // promoting or demoting a draft below a filter threshold.
+  const rankingBoost = feedbackBonus;
+  if (feedbackBonus !== 0) {
+    reasons.push(`feedback ranking bias (not filter): ${feedbackBonus > 0 ? '+' : ''}${feedbackBonus.toFixed(1)}`);
+  }
 
   if (wasSelectorSeen(selector, sessionContext)) {
     score -= 8;
@@ -1504,12 +1819,18 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
   }
 
   const normalizedScore = Math.max(0, Math.min(100, Math.round(score)));
-  const confidence = confidenceFromSignals(normalizedScore, semanticScore, personaScore, sequenceScore, feedbackBonus);
+  // Stability fix C: confidence is computed from deterministic DOM/lexical
+  // signals only. Passing 0 as the feedbackBonus argument keeps backward
+  // compatibility with the `confidenceFromSignals` shape but removes the
+  // ±10-point oscillation that previously made drafts cross the
+  // `>= minConfidence` threshold between two sessions for unchanged DOMs.
+  const confidence = confidenceFromSignals(normalizedScore, semanticScore, personaScore, sequenceScore, 0);
   const detected: DetectedElement = {
     element,
     selector,
     label,
     score: normalizedScore,
+    rankingBoost,
     confidence,
     intent,
     reasons,
@@ -1684,7 +2005,7 @@ function collectCandidates(options?: TourDraftGenerationOptions): DetectedElemen
 
   const deduped = dedupeCandidates(detected, options);
   return deduped
-    .sort((a, b) => b.score - a.score)
+    .sort((a, b) => effectiveRank(b) - effectiveRank(a))
     .slice(0, maxCandidates);
 }
 
@@ -1745,7 +2066,8 @@ function pickBestCandidate(candidates: DetectedElement[], intent: TourDraftInten
     candidates
       .filter((candidate) => candidate.intent === intent && !blocked.has(candidate.selector))
       .sort((a, b) => {
-        if (b.score !== a.score) return b.score - a.score;
+        const rankDiff = effectiveRank(b) - effectiveRank(a);
+        if (rankDiff !== 0) return rankDiff;
         if (intent === 'primary-action') {
           const tie = primaryActionTieBreakerRank(b) - primaryActionTieBreakerRank(a);
           if (tie !== 0) return tie;
@@ -1761,7 +2083,8 @@ function pickBestActionableCandidate(candidates: DetectedElement[], excludedSele
     candidates
       .filter((candidate) => !blocked.has(candidate.selector) && isActionableElement(candidate.element))
       .sort((a, b) => {
-        if (b.score !== a.score) return b.score - a.score;
+        const rankDiff = effectiveRank(b) - effectiveRank(a);
+        if (rankDiff !== 0) return rankDiff;
         const tie = primaryActionTieBreakerRank(b) - primaryActionTieBreakerRank(a);
         if (tie !== 0) return tie;
         return b.confidence - a.confidence;
@@ -1782,7 +2105,8 @@ function pickBestPrimaryActionCandidate(candidates: DetectedElement[], excludedS
   return (
     pool
       .sort((a, b) => {
-        if (b.score !== a.score) return b.score - a.score;
+        const rankDiff = effectiveRank(b) - effectiveRank(a);
+        if (rankDiff !== 0) return rankDiff;
         const tie = primaryActionTieBreakerRank(b) - primaryActionTieBreakerRank(a);
         if (tie !== 0) return tie;
         return b.confidence - a.confidence;
@@ -1802,7 +2126,7 @@ function pickAnyCandidate(
       .sort((a, b) => {
         const zoneDiff = preferredZones.indexOf(a.zone) - preferredZones.indexOf(b.zone);
         if (zoneDiff !== 0) return zoneDiff;
-        return b.score - a.score;
+        return effectiveRank(b) - effectiveRank(a);
       })[0] || null
   );
 }
@@ -2340,11 +2664,76 @@ function diversifyDrafts(drafts: SuggestedTourDraft[]): SuggestedTourDraft[] {
   return output;
 }
 
+// ============================================================================
+// P3 quality filter — rejects trivial heuristic drafts that would harm
+// the developer's perception of the SDK (single-step nav, heading-only,
+// all-nav). Blueprint drafts bypass this filter.
+// ============================================================================
+
+const NAV_INTENT_SET: ReadonlySet<TourDraftIntent> = new Set(['support-navigation']);
+
+function classifyTrivialHeuristicDraft(draft: SuggestedTourDraft): string | null {
+  if (!draft.steps || draft.steps.length === 0) return 'no steps';
+  if (draft.steps.length === 1) {
+    // Single-step drafts are rarely valuable unless they point to a real
+    // action (primary-action or form-flow). Single navigation/discovery step
+    // = "look at this link" → trivial.
+    if (NAV_INTENT_SET.has(draft.intent) || draft.intent === 'discovery') {
+      return 'single-step draft with navigation/discovery intent';
+    }
+  }
+  // All-nav: every step targets a navigation/sidebar/header element. Such a
+  // draft is just a tour of the menus, which the user doesn't need.
+  const allNav = draft.steps.every((step) => {
+    const selector = step.targetSelector || '';
+    return /header|nav|sidebar|menu/i.test(selector);
+  });
+  if (allNav && draft.steps.length <= 2) {
+    return 'all-navigation draft (header/nav/sidebar only)';
+  }
+  // Heading-only: a draft that just points to the page H1 with no follow-up
+  // actionable step.
+  const headingOnly =
+    draft.steps.length === 1 &&
+    draft.steps[0].action === 'NEXT' &&
+    /^h[1-3]/.test(draft.steps[0].targetSelector || '');
+  if (headingOnly) return 'heading-only draft';
+  return null;
+}
+
+function aggregateRejectionReasons(rejections: Array<{ reason: string }>): Array<{ reason: string; count: number }> {
+  const counts = new Map<string, number>();
+  for (const { reason } of rejections) {
+    counts.set(reason, (counts.get(reason) || 0) + 1);
+  }
+  return Array.from(counts.entries()).map(([reason, count]) => ({ reason, count }));
+}
+
+function toBlueprintReportEntry(report: BlueprintResolutionReport) {
+  return {
+    blueprintId: report.blueprintId,
+    vertical: report.vertical,
+    declaredSteps: report.declaredSteps,
+    resolvedOnCurrentPage: report.resolvedOnCurrentPage,
+    resolvedCrossPage: report.resolvedCrossPage,
+    resolvedDeduced: report.resolvedDeduced,
+    unresolvedSteps: report.unresolvedSteps,
+    produced: report.produced,
+    rejectionReason: report.rejectionReason,
+  };
+}
+
 export function generateContextualTourDrafts(options?: TourDraftGenerationOptions): SuggestedTourDraft[] {
   if (typeof document === 'undefined') return [];
 
   const startedAt = Date.now();
   activeDiagnostics = createDiagnostics();
+  // Stability fix B: capture a single feedback snapshot for the whole scan.
+  // All `scoreCandidate` invocations below resolve the local feedback store
+  // from this constant value, so a tour event mid-scan (e.g. user clicks
+  // "Next" while a MutationObserver tick is in flight) cannot make two
+  // candidates of the same scan see different feedback states.
+  currentFeedbackSnapshot = getFeedbackStore();
 
   const generationProfile = resolveGenerationProfile(options);
   const maxDrafts = generationProfile.maxDrafts;
@@ -2381,8 +2770,19 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
         afterMaxDrafts: 0,
       },
       conflicts: [],
+      stability: {
+        viewportWeightMode: 'document-relative',
+        feedbackUsed: options?.feedbackEnabled === true,
+        remoteFeedbackReady: remoteFeedbackBootstrapped,
+        feedbackAppliedTo: 'ranking-only',
+      },
+      qualityFilter: {
+        rejectedAsTrivial: 0,
+        rejectedReasons: [],
+      },
     };
     activeDiagnostics = null;
+    currentFeedbackSnapshot = null;
     return [];
   }
 
@@ -2614,18 +3014,94 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
     }
   }
 
-  const draftsBeforeConflict = diversifyDrafts(drafts);
-  const confidenceFiltered = draftsBeforeConflict.filter((draft) => draft.confidence >= minConfidence);
-  const resolvedConflicts = resolveDraftConflicts(confidenceFiltered, options);
-  const limited = resolvedConflicts.drafts.slice(0, maxDrafts);
-
-  if (options?.feedbackEnabled !== false) {
-    for (const draft of limited) {
-      for (const selector of draft.detectedSelectors) {
-        recordTourSuggestionFeedback({ selector, intent: draft.intent, event: 'shown' });
+  // ============================================================================
+  // Journey blueprints (P1 + P2 + P3): produce business-meaningful, possibly
+  // multi-page drafts from declarative templates. Blueprint-based drafts are
+  // emitted BEFORE diversify/conflict-resolution so they participate in the
+  // same dedupe pipeline as heuristic drafts; they carry `origin.kind =
+  // 'blueprint'` so the quality filter and debug panel can distinguish them.
+  // ============================================================================
+  const activeBlueprints = selectActiveBlueprints(options?.journeyVerticals, options?.journeyBlueprints);
+  const blueprintOutcome = resolveBlueprintsToDrafts(activeBlueprints, candidates, options);
+  // Tag heuristic drafts with `origin.kind = 'heuristic'` so downstream
+  // filters/UIs can branch on origin reliably.
+  for (const draft of drafts) {
+    if (!draft.origin) draft.origin = { kind: 'heuristic' };
+  }
+  // Blueprint drafts are produced by the resolver in `journey-resolver.ts`,
+  // which is intentionally decoupled from the flow-versioning subsystem.
+  // We hydrate `flowVersioning` here so blueprint drafts share the exact same
+  // publish payload contract as heuristic drafts (`toPublishDraft` drops any
+  // draft missing `flowVersion`/`flowSignature`). Without this, blueprints
+  // would resolve and even appear in the debug panel but silently fail the
+  // publish path with "flowVersioning is missing".
+  // Phase 4: also apply a feedback-driven score boost per blueprintId so the
+  // ranking between competing blueprint drafts reflects historical user
+  // performance. Boost is bounded ([-10, +10]) and applied AFTER the
+  // deterministic `computeBlueprintScore` so it never demotes a draft below
+  // `minScore` (which would re-introduce the stability bug Phase 2 fixed).
+  const feedbackForBoost = currentFeedbackSnapshot ?? getFeedbackStore();
+  for (const blueprintDraft of blueprintOutcome.drafts) {
+    if (!blueprintDraft.flowVersioning) {
+      blueprintDraft.flowVersioning = buildFlowVersioningMetadata(blueprintDraft, options);
+    }
+    if (
+      options?.feedbackEnabled === true &&
+      blueprintDraft.origin?.kind === 'blueprint'
+    ) {
+      const boost = blueprintFeedbackBoost(blueprintDraft.origin.blueprintId, feedbackForBoost);
+      if (boost !== 0) {
+        blueprintDraft.score = Math.max(0, Math.min(100, blueprintDraft.score + boost));
       }
     }
   }
+  // Blueprint drafts are appended last so they don't get pre-empted by
+  // legacy `drafts.push` ordering, but they sort to the top later via score.
+  drafts.push(...blueprintOutcome.drafts);
+
+  // `blueprintsExclusive`: when at least one blueprint produced a draft and
+  // the host opted in, drop the heuristic drafts entirely.
+  let filteredByExclusive = drafts;
+  if (options?.blueprintsExclusive === true && blueprintOutcome.drafts.length > 0) {
+    filteredByExclusive = drafts.filter((d) => d.origin?.kind === 'blueprint');
+  }
+
+  // P3 quality filter — only applies to heuristic drafts; blueprint drafts
+  // are intrinsically business-meaningful so they bypass this filter.
+  const qualityRejected: Array<{ reason: string }> = [];
+  const qualityFiltered: SuggestedTourDraft[] = [];
+  for (const draft of filteredByExclusive) {
+    if (draft.origin?.kind === 'blueprint') {
+      qualityFiltered.push(draft);
+      continue;
+    }
+    const rejection = classifyTrivialHeuristicDraft(draft);
+    if (rejection) {
+      qualityRejected.push({ reason: rejection });
+      continue;
+    }
+    qualityFiltered.push(draft);
+  }
+
+  const qualityFilterCounts = aggregateRejectionReasons(qualityRejected);
+
+  const draftsBeforeConflict = diversifyDrafts(qualityFiltered);
+  const confidenceFiltered = draftsBeforeConflict.filter((draft) => draft.confidence >= minConfidence);
+  const resolvedConflicts = resolveDraftConflicts(confidenceFiltered, options);
+  // Blueprint drafts get priority in the final cap.
+  const blueprintFirst = [...resolvedConflicts.drafts].sort((a, b) => {
+    const aIsBlueprint = a.origin?.kind === 'blueprint' ? 1 : 0;
+    const bIsBlueprint = b.origin?.kind === 'blueprint' ? 1 : 0;
+    if (aIsBlueprint !== bIsBlueprint) return bIsBlueprint - aIsBlueprint;
+    return b.score - a.score;
+  });
+  const limited = blueprintFirst.slice(0, maxDrafts);
+
+  // NOTE: 'shown' is intentionally NOT auto-recorded here. Generation != display.
+  // Inflating 'shown' on every refresh broke the feedback signal (millions of
+  // shown events while clicks remained in single digits, diluting click-rate
+  // to ~0 in feedbackWeight()). 'shown' is now recorded by the tour runtime
+  // (TourViewer) when a step is actually displayed to the user.
 
   lastGenerationDebugReport = {
     generatedAt: new Date().toISOString(),
@@ -2653,9 +3129,26 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
       afterMaxDrafts: limited.length,
     },
     conflicts: resolvedConflicts.conflicts,
+    stability: {
+      viewportWeightMode: 'document-relative',
+      feedbackUsed: options?.feedbackEnabled === true,
+      remoteFeedbackReady: remoteFeedbackBootstrapped,
+      feedbackAppliedTo: 'ranking-only',
+    },
+    journeyBlueprints: activeBlueprints.length === 0 ? undefined : {
+      activeVerticals: options?.journeyVerticals ?? [],
+      totalBlueprintsConsidered: activeBlueprints.length,
+      blueprintsProducingDrafts: blueprintOutcome.reports.filter((r) => r.produced).length,
+      blueprintResults: blueprintOutcome.reports.map(toBlueprintReportEntry),
+    },
+    qualityFilter: {
+      rejectedAsTrivial: qualityRejected.length,
+      rejectedReasons: qualityFilterCounts,
+    },
   };
 
   activeDiagnostics = null;
+  currentFeedbackSnapshot = null;
   if (options?.flowVersioningEnabled !== false) {
     persistFlowVersioningMetadata(limited);
   }

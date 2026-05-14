@@ -4,6 +4,8 @@ import { findElement } from '../utils/dom-utils';
 export interface ResolveOptions {
   retries?: number;
   intervalMs?: number;
+  preferredText?: string;
+  preferActive?: boolean;
 }
 
 export interface UseTourTargetResolverResult {
@@ -28,7 +30,10 @@ export function useTourTargetResolver(): UseTourTargetResolverResult {
       setIsResolving(true);
       try {
         for (let i = 0; i <= retries; i += 1) {
-          const element = findElement(selector);
+          const element = findElement(selector, {
+            preferredText: options?.preferredText,
+            preferActive: options?.preferActive,
+          });
           if (element) return element;
           if (i < retries) await sleep(intervalMs);
         }

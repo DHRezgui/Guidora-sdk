@@ -58,6 +58,7 @@ export function TourRenderer({
   autoNavigating = false,
 }: TourRendererProps) {
   const [showFallback, setShowFallback] = useState(false);
+  const [showRouteFallback, setShowRouteFallback] = useState(false);
 
   useEffect(() => {
     if (!isOpen) {
@@ -72,6 +73,19 @@ export function TourRenderer({
       setShowFallback(false);
     }
   }, [isOpen, targetNotFound, retryingSelector]);
+
+  useEffect(() => {
+    if (!isOpen || !routeMismatch || autoNavigating) {
+      setShowRouteFallback(false);
+      return;
+    }
+
+    // Auto-navigation is scheduled by TourViewer after render. Delay the
+    // manual route fallback so users never see a flash during normal SPA page
+    // transitions, especially on heavier real-world Next.js apps.
+    const timer = setTimeout(() => setShowRouteFallback(true), 2200);
+    return () => clearTimeout(timer);
+  }, [autoNavigating, isOpen, routeMismatch, expectedRoute, currentRoute]);
 
   if (!isOpen || !currentStep) return null;
 
@@ -130,7 +144,7 @@ export function TourRenderer({
         />
       ) : null}
 
-      {routeMismatch && !autoNavigating ? (
+      {showRouteFallback && routeMismatch && !autoNavigating ? (
         <div
           style={{
             position: 'fixed',
@@ -138,24 +152,69 @@ export function TourRenderer({
             right: 24,
             zIndex: 2147483600,
             maxWidth: 420,
-            background: '#111827',
-            color: '#fff',
-            borderRadius: 12,
-            boxShadow: '0 10px 25px rgba(0,0,0,0.25)',
-            padding: '14px 16px',
+            background:
+              'linear-gradient(135deg, rgba(8, 13, 28, 0.98), rgba(18, 24, 42, 0.96) 52%, rgba(35, 13, 22, 0.96))',
+            color: '#f8fafc',
+            border: '1px solid rgba(251, 113, 133, 0.28)',
+            borderRadius: 16,
+            boxShadow: '0 22px 55px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.04) inset',
+            padding: '16px 18px',
             fontSize: 13,
             lineHeight: 1.45,
+            backdropFilter: 'blur(14px)',
           }}
         >
-          <div style={{ fontWeight: 700, marginBottom: 6 }}>Navigation requise pour continuer</div>
-          <div>
-            Cette étape attend la page <code>{expectedRoute || 'N/A'}</code>.
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              fontWeight: 800,
+              letterSpacing: '-0.01em',
+              marginBottom: 8,
+            }}
+          >
+            <span
+              style={{
+                width: 8,
+                height: 8,
+                borderRadius: 999,
+                background: 'linear-gradient(135deg, #fb7185, #f97316)',
+                boxShadow: '0 0 18px rgba(251, 113, 133, 0.75)',
+              }}
+            />
+            Navigation en attente
           </div>
-          <div style={{ opacity: 0.85, marginTop: 4 }}>
-            Route actuelle: <code>{currentRoute || 'N/A'}</code>
+          <div style={{ color: 'rgba(248, 250, 252, 0.82)' }}>
+            Le tour attend la page{' '}
+            <code
+              style={{
+                color: '#fecdd3',
+                background: 'rgba(251, 113, 133, 0.12)',
+                border: '1px solid rgba(251, 113, 133, 0.18)',
+                borderRadius: 6,
+                padding: '1px 5px',
+              }}
+            >
+              {expectedRoute || 'N/A'}
+            </code>
+            .
           </div>
-          <div style={{ opacity: 0.8, marginTop: 8 }}>
-            Naviguez vers la route attendue, le tour reprendra automatiquement.
+          <div style={{ color: 'rgba(203, 213, 225, 0.78)', marginTop: 6 }}>
+            Route actuelle:{' '}
+            <code
+              style={{
+                color: '#fed7aa',
+                background: 'rgba(249, 115, 22, 0.1)',
+                borderRadius: 6,
+                padding: '1px 5px',
+              }}
+            >
+              {currentRoute || 'N/A'}
+            </code>
+          </div>
+          <div style={{ color: 'rgba(203, 213, 225, 0.72)', marginTop: 10 }}>
+            Si la redirection automatique ne démarre pas, ouvrez cette route: le tour reprendra tout seul.
           </div>
         </div>
       ) : null}

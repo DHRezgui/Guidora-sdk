@@ -1,10 +1,50 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useOnboarding } from '../hooks/useOnboarding';
-import { PositionType, SDKConfig } from '../types';
+import { PositionType, SDKConfig, Step, TourDraftIntent } from '../types';
 import { UseContextualTourSuggestionsOptions } from '../hooks/useContextualTourSuggestions';
 import { ContextualSuggestionsPublisher, ContextualSuggestionsUIMode } from './ContextualSuggestionsPublisher';
 import { OnboardingTheme } from './theme';
 import { TourRenderer } from './TourRenderer';
+import { recordTourSuggestionFeedback } from '../utils/tour-suggestion-generator';
+import { enqueueContextualFeedback } from '../utils/contextual-feedback-flusher';
+import { findElement } from '../utils/dom-utils';
+
+const VALID_INTENTS: TourDraftIntent[] = ['discovery', 'primary-action', 'support-navigation', 'form-flow'];
+const NAVIGATION_CLICK_RESUME_DELAY_MS = 5000;
+const NAVIGATION_CLICK_RESUME_KEY = '__trustdev_navigation_click_resume_at_v1';
+type TargetRect = { top: number; left: number; width: number; height: number };
+
+function areRectsClose(a: TargetRect | null, b: TargetRect, tolerance = 0.5): boolean {
+  if (!a) return false;
+  return (
+    Math.abs(a.top - b.top) <= tolerance &&
+    Math.abs(a.left - b.left) <= tolerance &&
+    Math.abs(a.width - b.width) <= tolerance &&
+    Math.abs(a.height - b.height) <= tolerance
+  );
+}
+
+function toTourDraftIntent(raw: unknown): TourDraftIntent | null {
+  if (typeof raw !== 'string') return null;
+  const normalized = raw.toLowerCase() as TourDraftIntent;
+  return VALID_INTENTS.includes(normalized) ? normalized : null;
+}
+
+function readNavigationClickResumeAt(): number {
+  if (typeof window === 'undefined') return 0;
+  const raw = window.sessionStorage.getItem(NAVIGATION_CLICK_RESUME_KEY);
+  const parsed = raw ? Number(raw) : 0;
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function writeNavigationClickResumeAt(resumeAt: number): void {
+  if (typeof window === 'undefined') return;
+  if (resumeAt > Date.now()) {
+    window.sessionStorage.setItem(NAVIGATION_CLICK_RESUME_KEY, String(resumeAt));
+  } else {
+    window.sessionStorage.removeItem(NAVIGATION_CLICK_RESUME_KEY);
+  }
+}
 
 export interface TourViewerProps {
   config?: Partial<SDKConfig>;
@@ -46,45 +86,193 @@ export interface TourViewerProps {
   contextualSuggestions?: (UseContextualTourSuggestionsOptions & {
     /**
      * Defaults to 'auto':
+     * - hidden when developerMode=false (production-safe)
      * - hidden when autoPublish=true
-     * - minimal manual panel when autoPublish=false
+     * - minimal manual panel when developerMode=true and autoPublish=false
      */
     uiMode?: ContextualSuggestionsUIMode;
     title?: string;
     stableOnly?: boolean;
-    preset?: 'ecommerce-default';
+    /**
+     * Selects a built-in preset combining sensible defaults + the relevant
+     * `journeyVerticals`. Pick the one that matches your host app:
+     * - `ecommerce-default`: e-commerce funnel (browse / cart / checkout)
+     * - `saas-default`: SaaS onboarding + feature discovery + account settings
+     * - `marketing-default`: lead generation (CTA / contact form / demo)
+     * - `dashboard-default`: analytics / data exploration (filters, charts,
+     *   date pickers, exports)
+     * - `support-default`: in-app help surfaces (FAQ, docs, ticket creation,
+     *   live chat)
+     * - `multi-vertical-default`: activates ALL verticals — useful when the
+     *   app spans several contexts (e.g. an e-commerce site with a marketing
+     *   landing page and an analytics admin dashboard)
+     */
+    preset?:
+      | 'ecommerce-default'
+      | 'saas-default'
+      | 'marketing-default'
+      | 'dashboard-default'
+      | 'support-default'
+      | 'multi-vertical-default';
+    /**
+     * Enables the publishing panel UI. End-users consuming activated tours
+     * must never see this panel, so it is hidden by default. When omitted,
+     * TourViewer's `debug` prop is used as the implicit value, so the panel
+     * appears automatically only in development.
+     */
+    developerMode?: boolean;
   }) | null;
 }
 
+const SHARED_CONTEXTUAL_DEFAULTS: Partial<UseContextualTourSuggestionsOptions> = {
+  enabled: true,
+  autoGenerate: true,
+  autoPublish: false,
+  autoActivatePublishedDrafts: false,
+  maxAutoPublishedTours: 3,
+  publishScenario: 'simple',
+  maxDrafts: 4,
+  maxCandidates: 250,
+  ignoreTransientUi: true,
+  includeSupportDraft: true,
+  includeNavigationDraft: true,
+  includeFormDraft: true,
+  useSemanticRanking: true,
+  enableSequenceDetection: true,
+  noiseFilteringEnabled: true,
+  conflictResolutionEnabled: true,
+  conflictResolutionStrategy: 'hybrid',
+  explainabilityEnabled: true,
+  minConfidence: 45,
+  persona: 'admin',
+  flowVersioningEnabled: true,
+  flowCompatibilityMode: 'lenient',
+  feedbackEnabled: true,
+  // When at least one blueprint produces a draft, suppress the heuristic
+  // drafts. Blueprint drafts are business-meaningful by construction; the
+  // heuristic ones tend to be "tour of the navigation menu" / "look at the
+  // page H1" which add noise. Hosts that want to keep the heuristics on top
+  // can override this with `blueprintsExclusive: false`.
+  blueprintsExclusive: true,
+};
+
 const CONTEXTUAL_SUGGESTIONS_PRESETS: Record<string, Partial<UseContextualTourSuggestionsOptions>> = {
   'ecommerce-default': {
-    enabled: true,
-    autoGenerate: true,
-    autoPublish: false,
-    autoActivatePublishedDrafts: true,
-    publishScenario: 'simple',
-    maxDrafts: 4,
-    maxCandidates: 250,
-    ignoreTransientUi: true,
-    includeSupportDraft: true,
-    includeNavigationDraft: true,
-    includeFormDraft: true,
-    useSemanticRanking: true,
-    enableSequenceDetection: true,
-    noiseFilteringEnabled: true,
-    conflictResolutionEnabled: true,
-    conflictResolutionStrategy: 'hybrid',
-    explainabilityEnabled: true,
-    minConfidence: 45,
+    ...SHARED_CONTEXTUAL_DEFAULTS,
     projectDomain: 'e-commerce onboarding',
-    persona: 'admin',
     businessObjectives: ['discover products', 'add to cart', 'reach checkout'],
     semanticHints: ['shop', 'cart', 'checkout', 'contact'],
-    flowVersioningEnabled: true,
     flowVersion: 'ecommerce-v1',
     baselineFlowVersion: 'ecommerce-v0',
-    flowCompatibilityMode: 'lenient',
-    feedbackEnabled: true,
+    journeyVerticals: ['ecommerce'],
+  },
+  'saas-default': {
+    ...SHARED_CONTEXTUAL_DEFAULTS,
+    projectDomain: 'saas onboarding',
+    businessObjectives: [
+      'discover dashboard',
+      'create first resource',
+      'invite team',
+      'complete profile',
+      'discover new features',
+      'manage account settings',
+    ],
+    semanticHints: [
+      'dashboard',
+      'create',
+      'new',
+      'settings',
+      'team',
+      'invite',
+      'profile',
+      'billing',
+      'security',
+      'upgrade',
+      'whats new',
+    ],
+    flowVersion: 'saas-v1',
+    baselineFlowVersion: 'saas-v0',
+    journeyVerticals: ['saas'],
+  },
+  'marketing-default': {
+    ...SHARED_CONTEXTUAL_DEFAULTS,
+    projectDomain: 'marketing lead capture',
+    businessObjectives: ['capture leads', 'book demo', 'newsletter signup'],
+    semanticHints: ['contact', 'demo', 'newsletter', 'get started', 'pricing'],
+    flowVersion: 'marketing-v1',
+    baselineFlowVersion: 'marketing-v0',
+    journeyVerticals: ['marketing'],
+  },
+  'dashboard-default': {
+    ...SHARED_CONTEXTUAL_DEFAULTS,
+    projectDomain: 'analytics dashboard',
+    businessObjectives: ['explore data', 'apply filters', 'export reports', 'compare periods'],
+    semanticHints: [
+      'kpi',
+      'metric',
+      'filter',
+      'chart',
+      'date',
+      'period',
+      'export',
+      'download',
+      'csv',
+    ],
+    flowVersion: 'dashboard-v1',
+    baselineFlowVersion: 'dashboard-v0',
+    journeyVerticals: ['dashboard'],
+  },
+  'support-default': {
+    ...SHARED_CONTEXTUAL_DEFAULTS,
+    projectDomain: 'in-app help center',
+    businessObjectives: ['find answer in FAQ', 'browse documentation', 'open support ticket'],
+    semanticHints: [
+      'faq',
+      'help',
+      'support',
+      'documentation',
+      'docs',
+      'ticket',
+      'contact',
+      'chat',
+    ],
+    flowVersion: 'support-v1',
+    baselineFlowVersion: 'support-v0',
+    journeyVerticals: ['support'],
+  },
+  'multi-vertical-default': {
+    ...SHARED_CONTEXTUAL_DEFAULTS,
+    projectDomain: 'multi-vertical onboarding',
+    businessObjectives: [
+      'discover products',
+      'add to cart',
+      'capture leads',
+      'create first resource',
+      'explore analytics',
+      'manage account',
+      'find help',
+    ],
+    semanticHints: [
+      'shop',
+      'cart',
+      'checkout',
+      'contact',
+      'demo',
+      'dashboard',
+      'create',
+      'kpi',
+      'filter',
+      'chart',
+      'export',
+      'settings',
+      'billing',
+      'help',
+      'faq',
+      'docs',
+    ],
+    flowVersion: 'multi-v1',
+    baselineFlowVersion: 'multi-v0',
+    journeyVerticals: ['ecommerce', 'saas', 'marketing', 'dashboard', 'support'],
   },
 };
 
@@ -99,6 +287,73 @@ function normalizeRoutePath(value?: string): string {
   } catch {
     return trimmed.split('?')[0].split('#')[0].replace(/\/+$/, '') || '/';
   }
+}
+
+function getStepSearchText(step?: Step | null): string {
+  if (!step) return '';
+  return [step.title, step.content, step.targetSelector].filter(Boolean).join(' ');
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
+}
+
+function isActiveInPageNavigationTarget(element: HTMLElement): boolean {
+  return (
+    element.getAttribute('aria-selected') === 'true' ||
+    element.getAttribute('data-state') === 'active' ||
+    element.getAttribute('aria-current') === 'page'
+  );
+}
+
+function activateInPageNavigationForStep(step?: Step | null): boolean {
+  if (typeof window === 'undefined' || !step) return false;
+
+  const preferredText = getStepSearchText(step);
+  if (!preferredText) return false;
+
+  const target = findElement('[role="tab"], button[aria-controls], a[role="tab"]', {
+    preferredText,
+    requirePreferredMatch: true,
+  });
+
+  if (!target || isActiveInPageNavigationTarget(target)) return false;
+  if (target.getAttribute('aria-disabled') === 'true' || target.hasAttribute('disabled')) return false;
+
+  target.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+  target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+  target.click();
+  return true;
+}
+
+function isNavigationActivationTarget(element: HTMLElement): boolean {
+  const anchor = element.closest('a[href]') as HTMLAnchorElement | null;
+  if (anchor) {
+    const href = anchor.getAttribute('href') || '';
+    if (!href || href.startsWith('#')) return false;
+    if (
+      href.startsWith('mailto:') ||
+      href.startsWith('tel:') ||
+      href.startsWith('javascript:')
+    ) {
+      return false;
+    }
+
+    try {
+      const targetUrl = new URL(href, window.location.href);
+      const currentUrl = new URL(window.location.href);
+      return (
+        targetUrl.href !== currentUrl.href &&
+        (targetUrl.pathname !== currentUrl.pathname ||
+          targetUrl.search !== currentUrl.search ||
+          targetUrl.hash !== currentUrl.hash)
+      );
+    } catch {
+      return true;
+    }
+  }
+
+  return element.getAttribute('role') === 'link' || element.dataset.trustdevNavigates === 'true';
 }
 
 /**
@@ -134,15 +389,22 @@ export function TourViewer({
     origin: string;
   } | null>(null);
 
-  const [targetRect, setTargetRect] = useState<{ top: number; left: number; width: number; height: number } | null>(
-    null,
-  );
+  const [targetRect, setTargetRect] = useState<TargetRect | null>(null);
   const [targetNotFound, setTargetNotFound] = useState(false);
   const [resolveAttempt, setResolveAttempt] = useState(0);
   const [currentPathname, setCurrentPathname] = useState(() =>
     typeof window !== 'undefined' ? window.location.pathname : '',
   );
   const [autoNavigatingToRoute, setAutoNavigatingToRoute] = useState<string | null>(null);
+  const [navigationClickResumeAt, setNavigationClickResumeAt] = useState(readNavigationClickResumeAt);
+  const lastRouteAutoNavigateKeyRef = useRef<string | null>(null);
+  const suppressRouteAutoNavigateUntilRef = useRef(0);
+  const targetClickAdvanceInFlightRef = useRef(false);
+  const lastTargetAutoScrollKeyRef = useRef<string | null>(null);
+  const lastUserScrollIntentAtRef = useRef(0);
+  const runtimeFeedbackRecorderRef = useRef<
+    (event: 'shown' | 'clicked' | 'completed' | 'skipped', selectorOverride?: string) => void
+  >(() => undefined);
   const isEmbeddedSimulatorPreview =
     typeof window !== 'undefined' &&
     window.self !== window.top &&
@@ -158,15 +420,75 @@ export function TourViewer({
   const shouldHideTourUiInPreview = runtimeBehavior?.hideTourUiInPreview ?? true;
   const shouldDisableAutoStartInPreview = runtimeBehavior?.disableAutoStartInPreview ?? true;
   const effectiveAutoStart = isPreviewRuntime && shouldDisableAutoStartInPreview ? false : autoStart;
-  const effectiveShowHighlight = isPreviewRuntime && shouldHideTourUiInPreview ? false : showHighlight;
-  const effectiveShowBeacon = isPreviewRuntime && shouldHideTourUiInPreview ? false : showBeacon;
-  const effectiveShowTooltip = isPreviewRuntime && shouldHideTourUiInPreview ? false : showTooltip;
+  const isNavigationClickSuspended =
+    typeof window !== 'undefined' && navigationClickResumeAt > Date.now();
+  const shouldTemporarilyHideTourUi = isNavigationClickSuspended;
+  const effectiveShowHighlight =
+    shouldTemporarilyHideTourUi || (isPreviewRuntime && shouldHideTourUiInPreview) ? false : showHighlight;
+  const effectiveShowBeacon =
+    shouldTemporarilyHideTourUi || (isPreviewRuntime && shouldHideTourUiInPreview) ? false : showBeacon;
+  const effectiveShowTooltip =
+    shouldTemporarilyHideTourUi || (isPreviewRuntime && shouldHideTourUiInPreview) ? false : showTooltip;
 
   const onboarding = useOnboarding({
     config,
     autoStart: effectiveAutoStart,
     debug,
   });
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const resumeAt = readNavigationClickResumeAt();
+    if (resumeAt <= Date.now()) {
+      writeNavigationClickResumeAt(0);
+      setNavigationClickResumeAt(0);
+      return;
+    }
+
+    setNavigationClickResumeAt(resumeAt);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (navigationClickResumeAt <= Date.now()) return;
+
+    const timer = window.setTimeout(() => {
+      writeNavigationClickResumeAt(0);
+      setNavigationClickResumeAt(0);
+    }, navigationClickResumeAt - Date.now());
+
+    return () => window.clearTimeout(timer);
+  }, [navigationClickResumeAt]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const markUserScrollIntent = () => {
+      lastUserScrollIntentAtRef.current = Date.now();
+    };
+    const markKeyboardScrollIntent = (event: KeyboardEvent) => {
+      if (
+        event.key === 'ArrowDown' ||
+        event.key === 'ArrowUp' ||
+        event.key === 'PageDown' ||
+        event.key === 'PageUp' ||
+        event.key === 'Home' ||
+        event.key === 'End' ||
+        event.key === ' '
+      ) {
+        markUserScrollIntent();
+      }
+    };
+
+    window.addEventListener('wheel', markUserScrollIntent, { passive: true, capture: true });
+    window.addEventListener('touchmove', markUserScrollIntent, { passive: true, capture: true });
+    window.addEventListener('keydown', markKeyboardScrollIntent, { capture: true });
+    return () => {
+      window.removeEventListener('wheel', markUserScrollIntent, true);
+      window.removeEventListener('touchmove', markUserScrollIntent, true);
+      window.removeEventListener('keydown', markKeyboardScrollIntent, true);
+    };
+  }, []);
 
   const navigateToStepRoute = useCallback((rawRoute?: string): boolean => {
     if (typeof window === 'undefined') return false;
@@ -186,13 +508,14 @@ export function TourViewer({
     const el = activeTargetRef.current;
     if (!el) return;
     const domRect = el.getBoundingClientRect();
-    setTargetRect({
+    const nextRect: TargetRect = {
       // Tooltip/overlay are fixed-position layers, so keep viewport coordinates.
       top: domRect.top,
       left: domRect.left,
       width: domRect.width,
       height: domRect.height,
-    });
+    };
+    setTargetRect((prev) => (areRectsClose(prev, nextRect) ? prev : nextRect));
   }, []);
 
   useEffect(() => {
@@ -300,15 +623,11 @@ export function TourViewer({
 
     const observer = new MutationObserver(onViewportChange);
     if (document.body) {
-      observer.observe(document.body, {
-        subtree: true,
-        childList: true,
-        attributes: true,
-      });
+      observer.observe(document.body, { subtree: true, childList: true });
     }
 
     window.addEventListener('message', onMessage);
-    window.addEventListener('scroll', onViewportChange, true);
+    window.addEventListener('scroll', onViewportChange, { capture: true, passive: true });
     window.addEventListener('resize', onViewportChange);
 
     return () => {
@@ -320,7 +639,7 @@ export function TourViewer({
       window.removeEventListener('scroll', onViewportChange, true);
       window.removeEventListener('resize', onViewportChange);
     };
-  }, []);
+  }, [isPreviewRuntime]);
 
   const expectedStepRoute = normalizeRoutePath(onboarding.tour.currentStep?.stepTargetUrl);
   const normalizedCurrentRoute = normalizeRoutePath(currentPathname);
@@ -342,9 +661,95 @@ export function TourViewer({
     return () => window.clearTimeout(timer);
   }, [autoNavigatingToRoute]);
 
+  useEffect(() => {
+    if (!onboarding.tour.isOpen || !routeMismatch || !expectedStepRoute) return;
+    if (autoNavigatingToRoute === expectedStepRoute) return;
+    if (shouldTemporarilyHideTourUi) return;
+    if (Date.now() < suppressRouteAutoNavigateUntilRef.current) return;
+
+    const stepKey = [
+      onboarding.activeTour?.id ?? 'unknown',
+      onboarding.tour.currentStepIndex,
+      normalizedCurrentRoute,
+      expectedStepRoute,
+    ].join('|');
+    if (lastRouteAutoNavigateKeyRef.current === stepKey) return;
+
+    lastRouteAutoNavigateKeyRef.current = stepKey;
+    navigateToStepRoute(expectedStepRoute);
+  }, [
+    autoNavigatingToRoute,
+    expectedStepRoute,
+    navigateToStepRoute,
+    normalizedCurrentRoute,
+    onboarding.activeTour?.id,
+    onboarding.tour.currentStepIndex,
+    onboarding.tour.isOpen,
+    routeMismatch,
+    shouldTemporarilyHideTourUi,
+  ]);
+
+  useEffect(() => {
+    if (!onboarding.tour.isOpen) {
+      lastRouteAutoNavigateKeyRef.current = null;
+    }
+  }, [onboarding.tour.isOpen]);
+
+  const advanceAfterTargetActivation = useCallback((targetEl?: HTMLElement | null) => {
+    if (targetClickAdvanceInFlightRef.current) return;
+    targetClickAdvanceInFlightRef.current = true;
+    runtimeFeedbackRecorderRef.current('clicked');
+
+    const isLast = onboarding.tour.currentStepIndex >= onboarding.tour.steps.length - 1;
+    const isNavigationTarget = targetEl ? isNavigationActivationTarget(targetEl) : false;
+
+    if (isNavigationTarget) {
+      const resumeAt = Date.now() + NAVIGATION_CLICK_RESUME_DELAY_MS;
+      writeNavigationClickResumeAt(resumeAt);
+      setNavigationClickResumeAt(resumeAt);
+      suppressRouteAutoNavigateUntilRef.current = resumeAt + 500;
+
+      if (isLast) {
+        runtimeFeedbackRecorderRef.current('completed');
+        onboarding.tour.completeTour();
+        onTourComplete?.(onboarding.activeTour?.id);
+      } else {
+        onboarding.tour.nextStep();
+        setResolveAttempt((prev) => prev + 1);
+      }
+
+      window.setTimeout(() => {
+        targetClickAdvanceInFlightRef.current = false;
+      }, 900);
+      return;
+    }
+
+    suppressRouteAutoNavigateUntilRef.current = Date.now() + 2500;
+    if (isLast) {
+      runtimeFeedbackRecorderRef.current('completed');
+      onboarding.tour.completeTour();
+      onTourComplete?.(onboarding.activeTour?.id);
+    } else {
+      const nextStep = onboarding.tour.steps[onboarding.tour.currentStepIndex + 1];
+      onboarding.tour.nextStep();
+      setResolveAttempt((prev) => prev + 1);
+
+      window.setTimeout(() => {
+        navigateToStepRoute(nextStep?.stepTargetUrl);
+      }, 250);
+    }
+
+    window.setTimeout(() => {
+      targetClickAdvanceInFlightRef.current = false;
+    }, 900);
+  }, [navigateToStepRoute, onboarding.activeTour?.id, onboarding.tour, onTourComplete]);
+
   // Résoudre le sélecteur de la step courante
   useEffect(() => {
-    if (!onboarding.tour.isOpen || routeMismatch || !onboarding.tour.currentStep?.targetSelector) {
+    const currentStep = onboarding.tour.currentStep;
+    const currentSelector = currentStep?.targetSelector;
+    const currentStepSearchText = getStepSearchText(currentStep);
+    if (!onboarding.tour.isOpen || routeMismatch || !currentSelector) {
       activeTargetRef.current = null;
       setTargetRect(null);
       setTargetNotFound(false);
@@ -354,17 +759,44 @@ export function TourViewer({
     let cancelled = false;
     let raf1: number | null = null;
     let raf2: number | null = null;
+    let syncRaf: number | null = null;
     let observer: MutationObserver | null = null;
+    let resizeObserver: ResizeObserver | null = null;
+    let targetClickCleanup: (() => void) | null = null;
 
-    const onViewportChange = () => {
-      syncTargetRect();
+    const scheduleTargetRectSync = () => {
+      if (syncRaf !== null) return;
+      syncRaf = window.requestAnimationFrame(() => {
+        syncRaf = null;
+        if (cancelled) return;
+
+        const currentTarget = activeTargetRef.current;
+        const latestTarget = findElement(currentSelector, {
+          preferredText: currentStepSearchText,
+          preferActive: true,
+        });
+        if (!currentTarget?.isConnected || !latestTarget || latestTarget !== currentTarget) {
+          setResolveAttempt((prev) => prev + 1);
+          return;
+        }
+
+        syncTargetRect();
+      });
     };
 
     const resolveSelector = async () => {
       try {
-        const targetEl = await onboarding.resolver.resolveTarget(onboarding.tour.currentStep!.targetSelector, {
+        const activatedInPageNavigation = activateInPageNavigationForStep(currentStep);
+        if (activatedInPageNavigation) {
+          await wait(180);
+          if (cancelled) return;
+        }
+
+        const targetEl = await onboarding.resolver.resolveTarget(currentSelector, {
           retries: 8,
           intervalMs: 250,
+          preferredText: currentStepSearchText,
+          preferActive: true,
         });
 
         if (cancelled) return;
@@ -379,8 +811,19 @@ export function TourViewer({
             domRect.top > viewportHeight ||
             domRect.right < 0 ||
             domRect.left > viewportWidth;
+          const stepAutoScrollKey = [
+            onboarding.activeTour?.id ?? 'unknown',
+            onboarding.tour.currentStepIndex,
+            currentSelector,
+          ].join('|');
+          const userScrolledRecently = Date.now() - lastUserScrollIntentAtRef.current < 1500;
+          const canAutoScrollTarget =
+            isOutOfViewport &&
+            !userScrolledRecently &&
+            lastTargetAutoScrollKeyRef.current !== stepAutoScrollKey;
 
-          if (isOutOfViewport) {
+          if (canAutoScrollTarget) {
+            lastTargetAutoScrollKeyRef.current = stepAutoScrollKey;
             targetEl.scrollIntoView({
               behavior: 'smooth',
               block: 'center',
@@ -393,24 +836,36 @@ export function TourViewer({
               });
             });
           } else {
-            setTargetRect({
+            const nextRect: TargetRect = {
               // Tooltip/overlay are fixed-position layers, so keep viewport coordinates.
               top: domRect.top,
               left: domRect.left,
               width: domRect.width,
               height: domRect.height,
-            });
+            };
+            setTargetRect((prev) => (areRectsClose(prev, nextRect) ? prev : nextRect));
           }
 
-          window.addEventListener('scroll', onViewportChange, true);
-          window.addEventListener('resize', onViewportChange);
-          observer = new MutationObserver(onViewportChange);
+          window.addEventListener('scroll', scheduleTargetRectSync, { capture: true, passive: true });
+          document.addEventListener('scroll', scheduleTargetRectSync, { capture: true, passive: true });
+          window.addEventListener('resize', scheduleTargetRectSync);
+          if (typeof ResizeObserver !== 'undefined') {
+            resizeObserver = new ResizeObserver(scheduleTargetRectSync);
+            resizeObserver.observe(targetEl);
+          }
+          observer = new MutationObserver(scheduleTargetRectSync);
           if (document.body) {
-            observer.observe(document.body, {
-              subtree: true,
-              childList: true,
-              attributes: true,
-            });
+            observer.observe(document.body, { subtree: true, childList: true });
+          }
+
+          if (currentStep?.action === 'CLICK') {
+            const handleTargetClick = () => {
+              advanceAfterTargetActivation(targetEl);
+            };
+            targetEl.addEventListener('click', handleTargetClick);
+            targetClickCleanup = () => {
+              targetEl.removeEventListener('click', handleTargetClick);
+            };
           }
 
           setTargetNotFound(false);
@@ -434,48 +889,27 @@ export function TourViewer({
       activeTargetRef.current = null;
       if (raf1 !== null) window.cancelAnimationFrame(raf1);
       if (raf2 !== null) window.cancelAnimationFrame(raf2);
+      if (syncRaf !== null) window.cancelAnimationFrame(syncRaf);
       if (observer) observer.disconnect();
-      window.removeEventListener('scroll', onViewportChange, true);
-      window.removeEventListener('resize', onViewportChange);
+      if (resizeObserver) resizeObserver.disconnect();
+      if (targetClickCleanup) targetClickCleanup();
+      window.removeEventListener('scroll', scheduleTargetRectSync, true);
+      document.removeEventListener('scroll', scheduleTargetRectSync, true);
+      window.removeEventListener('resize', scheduleTargetRectSync);
     };
   }, [
     onboarding.tour.isOpen,
     onboarding.tour.currentStep?.targetSelector,
+    onboarding.tour.currentStep?.action,
+    onboarding.tour.currentStep?.title,
+    onboarding.tour.currentStep?.content,
     onboarding.resolver,
     onboarding.debug,
     routeMismatch,
     resolveAttempt,
     syncTargetRect,
+    advanceAfterTargetActivation,
   ]);
-
-  const handleNext = useCallback(() => {
-    const isLast = onboarding.tour.currentStepIndex >= onboarding.tour.steps.length - 1;
-    if (isLast) {
-      onboarding.tour.completeTour();
-      onTourComplete?.(onboarding.activeTour?.id);
-    } else {
-      const nextStep = onboarding.tour.steps[onboarding.tour.currentStepIndex + 1];
-      onboarding.tour.nextStep();
-      setResolveAttempt((prev) => prev + 1); // Trigger re-resolution
-      navigateToStepRoute(nextStep?.stepTargetUrl);
-    }
-  }, [onboarding.tour, onboarding.activeTour?.id, onTourComplete, navigateToStepRoute]);
-
-  const handlePrev = useCallback(() => {
-    const prevStep = onboarding.tour.steps[onboarding.tour.currentStepIndex - 1];
-    onboarding.tour.prevStep();
-    setResolveAttempt((prev) => prev + 1);
-    navigateToStepRoute(prevStep?.stepTargetUrl);
-  }, [onboarding.tour, navigateToStepRoute]);
-
-  const handleSkip = useCallback(() => {
-    onboarding.tour.skipTour();
-    onTourSkipped?.(onboarding.activeTour?.id);
-  }, [onboarding.tour, onboarding.activeTour?.id, onTourSkipped]);
-
-  const handleClose = useCallback(() => {
-    onboarding.stop();
-  }, [onboarding]);
 
   const resolvedContextualSuggestions = (() => {
     if (!contextualSuggestions) return null;
@@ -490,10 +924,135 @@ export function TourViewer({
     };
   })();
 
+  const activeTourIntent = (() => {
+    const meta = onboarding.activeTour?.triggerConditions as
+      | { contextualEngine?: { intent?: string } }
+      | undefined;
+    return toTourDraftIntent(meta?.contextualEngine?.intent);
+  })();
+  // Blueprint origin marker propagated through `triggerConditions.contextualEngine.blueprintId`.
+  // When present, runtime feedback events are also aggregated per blueprintId
+  // via `blueprintFeedbackBoost`, so the resolver can de-prioritize blueprints
+  // that historically underperform on end users.
+  const activeTourBlueprintId = (() => {
+    const meta = onboarding.activeTour?.triggerConditions as
+      | { contextualEngine?: { blueprintId?: string } }
+      | undefined;
+    return meta?.contextualEngine?.blueprintId;
+  })();
+  const isContextualTour = activeTourIntent !== null;
+  // Strict opt-in: runtime feedback recording is OFF by default. The host app
+  // must explicitly set `contextualSuggestions.feedbackEnabled: true` (or use a
+  // preset that does, e.g. 'ecommerce-default'). End-users in production who
+  // do not configure contextualSuggestions never trigger any local storage
+  // writes, preventing silent pollution of feedback counters.
+  const runtimeFeedbackEnabled =
+    isContextualTour &&
+    isPreviewRuntime === false &&
+    resolvedContextualSuggestions?.feedbackEnabled === true;
+
+  const recordRuntimeFeedback = useCallback(
+    (event: 'shown' | 'clicked' | 'completed' | 'skipped', selectorOverride?: string) => {
+      if (!runtimeFeedbackEnabled || !activeTourIntent) return;
+      const selector =
+        selectorOverride ?? onboarding.tour.currentStep?.targetSelector ?? undefined;
+      recordTourSuggestionFeedback({
+        selector,
+        intent: activeTourIntent,
+        event,
+        blueprintId: activeTourBlueprintId,
+      });
+      enqueueContextualFeedback({
+        selector,
+        intent: activeTourIntent,
+        event,
+        targetUrl: typeof window !== 'undefined' ? window.location.pathname : undefined,
+      });
+    },
+    [
+      runtimeFeedbackEnabled,
+      activeTourIntent,
+      activeTourBlueprintId,
+      onboarding.tour.currentStep?.targetSelector,
+    ],
+  );
+
+  useEffect(() => {
+    runtimeFeedbackRecorderRef.current = recordRuntimeFeedback;
+  }, [recordRuntimeFeedback]);
+
+  const lastShownKeyRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!runtimeFeedbackEnabled) return;
+    if (!onboarding.tour.isOpen || !onboarding.tour.currentStep) return;
+    if (shouldTemporarilyHideTourUi) return;
+    if (routeMismatch || targetNotFound || !targetRect) return;
+
+    const tourId = onboarding.activeTour?.id ?? 'unknown';
+    const stepKey = `${tourId}|${onboarding.tour.currentStepIndex}|${onboarding.tour.currentStep.targetSelector ?? ''}`;
+    if (lastShownKeyRef.current === stepKey) return;
+    lastShownKeyRef.current = stepKey;
+    recordRuntimeFeedback('shown');
+  }, [
+    runtimeFeedbackEnabled,
+    onboarding.tour.isOpen,
+    onboarding.tour.currentStep,
+    onboarding.tour.currentStepIndex,
+    onboarding.activeTour?.id,
+    routeMismatch,
+    shouldTemporarilyHideTourUi,
+    targetNotFound,
+    targetRect,
+    recordRuntimeFeedback,
+  ]);
+
+  useEffect(() => {
+    if (!onboarding.tour.isOpen) {
+      lastShownKeyRef.current = null;
+    }
+  }, [onboarding.tour.isOpen]);
+
+  const handleNext = useCallback(() => {
+    const isLast = onboarding.tour.currentStepIndex >= onboarding.tour.steps.length - 1;
+    if (isLast) {
+      recordRuntimeFeedback('clicked');
+      recordRuntimeFeedback('completed');
+      onboarding.tour.completeTour();
+      onTourComplete?.(onboarding.activeTour?.id);
+    } else {
+      recordRuntimeFeedback('clicked');
+      const nextStep = onboarding.tour.steps[onboarding.tour.currentStepIndex + 1];
+      onboarding.tour.nextStep();
+      setResolveAttempt((prev) => prev + 1); // Trigger re-resolution
+      navigateToStepRoute(nextStep?.stepTargetUrl);
+    }
+  }, [onboarding.tour, onboarding.activeTour?.id, onTourComplete, navigateToStepRoute, recordRuntimeFeedback]);
+
+  const handlePrev = useCallback(() => {
+    const prevStep = onboarding.tour.steps[onboarding.tour.currentStepIndex - 1];
+    onboarding.tour.prevStep();
+    setResolveAttempt((prev) => prev + 1);
+    navigateToStepRoute(prevStep?.stepTargetUrl);
+  }, [onboarding.tour, navigateToStepRoute]);
+
+  const handleSkip = useCallback(() => {
+    recordRuntimeFeedback('skipped');
+    onboarding.tour.skipTour();
+    onTourSkipped?.(onboarding.activeTour?.id);
+  }, [onboarding.tour, onboarding.activeTour?.id, onTourSkipped, recordRuntimeFeedback]);
+
+  const handleClose = useCallback(() => {
+    const isLast = onboarding.tour.currentStepIndex >= onboarding.tour.steps.length - 1;
+    if (!isLast) {
+      recordRuntimeFeedback('skipped');
+    }
+    onboarding.stop();
+  }, [onboarding, recordRuntimeFeedback]);
+
   return (
     <>
       <TourRenderer
-        isOpen={onboarding.tour.isOpen}
+        isOpen={onboarding.tour.isOpen && !shouldTemporarilyHideTourUi}
         currentStep={onboarding.tour.currentStep}
         currentIndex={onboarding.tour.currentStepIndex}
         totalSteps={onboarding.tour.steps.length}
@@ -520,6 +1079,7 @@ export function TourViewer({
           uiMode={resolvedContextualSuggestions.uiMode ?? 'auto'}
           title={resolvedContextualSuggestions.title}
           stableOnly={resolvedContextualSuggestions.stableOnly}
+          developerMode={resolvedContextualSuggestions.developerMode ?? debug}
           publishConfig={{
             ...(config ?? {}),
             ...(resolvedContextualSuggestions.publishConfig ?? {}),
