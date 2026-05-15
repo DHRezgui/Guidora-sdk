@@ -16,6 +16,7 @@ import {
   clearRemoteContextualFeedback,
   getContextualFlowRegistry,
   generateContextualTourDrafts,
+  generateContextualTourDraftsAsync,
   getLastContextualGenerationDebugReport,
   getLocalFeedbackForSelector,
   recordTourSuggestionFeedback,
@@ -27,6 +28,11 @@ import {
   flushFeedbackQueue,
   enqueueContextualFeedback,
 } from '../utils/contextual-feedback-flusher';
+import {
+  computeDraftDedupeSignature,
+  readAutoPublishedSignatures,
+  recordAutoPublishedSignaturesFromReport,
+} from '../utils/auto-publish-session-dedupe';
 
 export interface UseContextualTourSuggestionsOptions extends TourDraftGenerationOptions {
   enabled?: boolean;
@@ -46,41 +52,6 @@ export interface UseContextualTourSuggestionsOptions extends TourDraftGeneration
   maxAutoPublishedTours?: number;
   publishScenario?: ContextualScenario;
   publishConfig?: Partial<SDKConfig>;
-}
-
-const AUTOPUBLISHED_SIGNATURES_STORAGE_KEY = '__trustdev_autopublished_signatures_v1';
-
-function readAutoPublishedSignatures(): Set<string> {
-  if (typeof window === 'undefined') return new Set();
-  try {
-    const raw = window.sessionStorage.getItem(AUTOPUBLISHED_SIGNATURES_STORAGE_KEY);
-    if (!raw) return new Set();
-    const parsed = JSON.parse(raw);
-    return new Set(Array.isArray(parsed) ? parsed.filter((value) => typeof value === 'string') : []);
-  } catch {
-    return new Set();
-  }
-}
-
-function persistAutoPublishedSignatures(signatures: Set<string>): void {
-  if (typeof window === 'undefined') return;
-  try {
-    window.sessionStorage.setItem(
-      AUTOPUBLISHED_SIGNATURES_STORAGE_KEY,
-      JSON.stringify(Array.from(signatures)),
-    );
-  } catch {
-    // ignore storage failures
-  }
-}
-
-function computeDraftDedupeSignature(draft: SuggestedTourDraft): string {
-  const flowSignature = draft.flowVersioning?.flowSignature ?? 'no-sig';
-  const url = draft.targetUrl ?? '';
-  const intent = draft.intent ?? '';
-  const firstSelector = draft.steps[0]?.targetSelector ?? '';
-  const stepCount = draft.steps.length;
-  return [flowSignature, url, intent, firstSelector, String(stepCount)].join('|');
 }
 
 export interface UseContextualTourSuggestionsResult {
@@ -363,6 +334,18 @@ export function useContextualTourSuggestions(
         console.info(
           '[SDK] Auto-publish skipped: nothing new to publish (deduped or session cap reached).',
         );
+        setLastPublishReport({
+          processed: 0,
+          created: 0,
+          activated: 0,
+          rejected: 0,
+          skipped: allDrafts.length,
+          details: allDrafts.map((draft) => ({
+            draftName: draft.name,
+            outcome: 'skipped' as const,
+            reasons: ['auto_publish_session_dedup_or_cap'],
+          })),
+        });
         return;
       }
 
@@ -370,11 +353,7 @@ export function useContextualTourSuggestions(
       try {
         const report = await publishDrafts(candidates);
         if (report && report.created > 0) {
-          const signatures = readAutoPublishedSignatures();
-          for (const draft of candidates) {
-            signatures.add(computeDraftDedupeSignature(draft));
-          }
-          persistAutoPublishedSignatures(signatures);
+          recordAutoPublishedSignaturesFromReport(report, candidates);
         }
       } finally {
         autoPublishInFlightRef.current = false;
@@ -411,6 +390,28 @@ export function useContextualTourSuggestions(
         void runAutoPublish(next);
       } else {
         setLastPublishReport(null);
+      }
+
+      // Hybrid / backend semantic modes: run an additional async pass so
+      // backend hints can fuse with the heuristic result. The sync path
+      // above already produced a fully-usable local-only output, so this
+      // is purely additive and any failure leaves the local result in place.
+      const semanticMode = currentOptions?.semanticEngineMode;
+      if (
+        currentOptions?.semanticEnhancementEnabled === true &&
+        (semanticMode === 'hybrid' || semanticMode === 'backend') &&
+        currentOptions?.semanticBackendUrl
+      ) {
+        generateContextualTourDraftsAsync(currentOptions)
+          .then((asyncDrafts) => {
+            if (Array.isArray(asyncDrafts) && asyncDrafts.length > 0) {
+              setDrafts(asyncDrafts);
+              if (autoPublish) void runAutoPublish(asyncDrafts);
+            }
+          })
+          .catch(() => {
+            // backend semantic fetch failed → keep local-only result.
+          });
       }
       return next;
     } catch (err) {

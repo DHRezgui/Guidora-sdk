@@ -73,6 +73,8 @@ export interface Step {
   skipAllowed?: boolean;
   highlightElement?: boolean;
   waitTimeoutMs?: number;
+  /** Étape utilisée par le backend pour les contrôles qualité (sélecteur stable / actionnable). */
+  isPrimary?: boolean;
 }
 
 export type TourDraftIntent = 'discovery' | 'primary-action' | 'support-navigation' | 'form-flow';
@@ -515,6 +517,133 @@ export interface ContextualGenerationDebugReport {
     rejectedAsTrivial: number;
     rejectedReasons: Array<{ reason: string; count: number }>;
   };
+  /**
+   * Telemetry for the hybrid semantic enhancement layer. Present only when
+   * `semanticEnhancementEnabled` was true at scan time. Always purely
+   * informational — never alters publish behavior.
+   *
+   * IMPORTANT — what "semantic" means here:
+   *
+   * The **local** engine is NOT a learned semantic model. It is a
+   * deterministic *rule + keyword voting* engine on top of structural
+   * DOM signals (tagName, form/nav membership, ARIA, lexical patterns).
+   * Each step report exposes:
+   *  - `localRoleSource: 'rules'` (always today),
+   *  - `decisionSource` ('local' | 'backend' | 'merged'): which side
+   *    produced the role that was finally applied,
+   *  - `lowConfidence`: true when `roleConfidence` is below the safety
+   *    threshold; in that case the role is **kept for observability**
+   *    but `appliedDelta` is forced to 0 so it cannot move the score.
+   *
+   * Use these flags to avoid confusing keyword-matched results with
+   * actual learned semantic decisions from the backend.
+   */
+  semanticEnhancement?: {
+    enabled: boolean;
+    engineMode: 'local' | 'hybrid' | 'backend';
+    backendUsed: boolean;
+    backendStatus?: 'ok' | 'timeout' | 'error' | 'disabled' | 'unconfigured';
+    /** Below this confidence the fusion is suppressed for the step. */
+    minRoleConfidence: number;
+    /**
+     * Honest tag of the roll-out phase. Lab tests run in `phase-1-local`
+     * today: both the SDK local engine and the backend endpoint are
+     * deterministic rule-vote classifiers. `phase-2-embeddings` will
+     * mean the backend has been switched to a learned model (e.g.
+     * `ml/rag/semantic_embedder.py`).
+     */
+    validationPhase: 'phase-1-local' | 'phase-2-embeddings';
+    /**
+     * Detailed implementation status per backend signal. Surfaces
+     * whether the backend hint endpoint is powered by rules (today) or
+     * by a learned model. Populated dynamically from the backend
+     * response when available, otherwise falls back to the local rule
+     * engine description.
+     */
+    backendImplementation: {
+      endpointLive: boolean;
+      kind: 'rule-based-mirror' | 'sentence-transformers' | 'unknown';
+      /** Free-text note printed verbatim in the lab. */
+      disclaimer: string;
+      /** Sentence-transformers model id, when the backend used it. */
+      model?: string;
+      /**
+       * When the backend tried the embeddings path but had to fall back
+       * to the rule mirror, this reports the reason transparently.
+       */
+      fallbackReason?: 'embeddings_disabled' | 'embeddings_timeout' | 'embeddings_error';
+    };
+    /**
+     * Snapshot of the DOM-stability gate at run time.
+     *  - `stable: true` means the semantic layer ran.
+     *  - `stable: false` means it was bypassed because the DOM was
+     *    still settling (lazy mount, Suspense, streaming). The legacy
+     *    heuristic output is returned unchanged.
+     */
+    domStability: {
+      stable: boolean;
+      domAgeMs: number;
+      requiredAgeMs: number;
+      observerInstalled: boolean;
+      bypassReason?: 'dom_unsettled' | 'observer_unavailable';
+    };
+    /**
+     * Caveat the lab UI should print verbatim. Set whenever the local
+     * engine ran with rule-based classification (always, today). When
+     * the SDK ships an embedding-backed engine the threshold above will
+     * need to be re-calibrated against the model's score distribution.
+     */
+    calibrationNote?: string;
+    pageSummary: {
+      hasForm: boolean;
+      hasNavigation: boolean;
+      formFieldCount: number;
+      navigationLinkCount: number;
+      ctaCount: number;
+    };
+    /** One entry per draft that the semantic layer reviewed. */
+    drafts: Array<{
+      draftName: string;
+      intent: TourDraftIntent;
+      steps: Array<{
+        selector: string;
+        heuristicRole: string;
+        semanticRole:
+          | 'entry'
+          | 'navigation'
+          | 'cta-primary'
+          | 'form-field'
+          | 'form-submit'
+          | 'utility'
+          | 'secondary'
+          | 'result'
+          | 'generic-click';
+        roleConfidence: number;
+        rationale: string[];
+        /**
+         * Marker for the source of the local decision. Today the SDK
+         * only ships a rule-based local engine; this leaves room to
+         * swap in a learned model later without breaking telemetry.
+         */
+        localRoleSource: 'rules';
+        /** Which side won the merge for this step. */
+        decisionSource: 'local' | 'backend' | 'merged';
+        /** True when confidence is below `minRoleConfidence`. */
+        lowConfidence: boolean;
+        fusion: {
+          heuristicScore: number;
+          semanticDelta: number;
+          appliedDelta: number;
+          /** Reason the delta was zeroed, if any. */
+          suppressedReason?: 'low_confidence' | 'neutral' | 'cap_clamped';
+        };
+      }>;
+      orderChanged: boolean;
+      copyRewriteCount: number;
+      /** Steps the fusion silently dropped because of low confidence. */
+      suppressedLowConfidence: number;
+    }>;
+  };
 }
 
 export interface SuggestedTourDraft extends GuidedTour {
@@ -569,6 +698,12 @@ export interface TourDraftGenerationOptions {
   noiseFilteringEnabled?: boolean;
   ignoreTransientUi?: boolean;
   noiseSelectors?: string[];
+  /**
+   * Limite le scan DOM aux descendants de ce conteneur (zone app hôte, iframe, panneau).
+   * Les éléments hors périmètre sont ignorés. Adapte aussi la génération (ex. pas de 3e draft
+   * découverte redondant quand un parcours séquentiel couvre déjà l'entrée).
+   */
+  analysisRootSelector?: string;
   mutationBatchWindowMs?: number;
   maxDirtyNodesPerBatch?: number;
   enableSequenceDetection?: boolean;
@@ -609,6 +744,90 @@ export interface TourDraftGenerationOptions {
    * are kept as additional suggestions, ranked below blueprint drafts.
    */
   blueprintsExclusive?: boolean;
+  /**
+   * Hybrid semantic enhancement layer.
+   *
+   * When enabled (default: false to preserve backward compatibility), an
+   * extra semantic reasoning stage runs on top of the heuristic candidates
+   * to:
+   *
+   * - classify each follow-up candidate into a stable role (entry,
+   *   navigation, form-field, form-submit, utility, secondary, result),
+   * - propose a coherent ordering of the sequence chain,
+   * - replace step copy with role-appropriate phrasing.
+   *
+   * The semantic layer NEVER bypasses publish quality gates or conflict
+   * resolution: its output is fused with the heuristic score within bounded
+   * deltas. If the semantic stage fails or returns low-confidence signals,
+   * the legacy heuristic decision is kept.
+   */
+  semanticEnhancementEnabled?: boolean;
+  /**
+   * Engine mode for the semantic layer.
+   *
+   * - `local`: deterministic role + ordering inference computed in the SDK
+   *   from the DOM snapshot and lexical signals. No network call.
+   * - `backend`: delegate semantic inference to a server endpoint (typically
+   *   reusing the embedding stack in `ml/rag/`). The SDK still uses local
+   *   inference as a fallback when the network is unavailable.
+   * - `hybrid` (default when `semanticEnhancementEnabled` is true): merge
+   *   local + backend signals when both are available, fall back to local
+   *   on timeout / error.
+   */
+  semanticEngineMode?: 'local' | 'hybrid' | 'backend';
+  /**
+   * Bounded weights applied during fusion. Each weight is clamped to
+   * [0, 1]; the resulting score deltas are themselves clamped so they
+   * cannot push a draft past `minScore` or `minConfidence` on their own.
+   *
+   * - `role`: bonus when the semantic role matches the heuristic intent.
+   * - `order`: bonus for sequence chains whose order matches the semantic
+   *   plan.
+   * - `copy`: bonus when the rewritten copy is consistent with the element
+   *   type (e.g. form input vs CTA).
+   */
+  semanticRoleWeights?: {
+    role?: number;
+    order?: number;
+    copy?: number;
+  };
+  /**
+   * Optional backend endpoint used in `hybrid` / `backend` modes.
+   * Example: `https://api.example.com/api/v1/contextual/semantic-hints`.
+   * Required when `semanticEngineMode === 'backend'`.
+   */
+  semanticBackendUrl?: string;
+  /**
+   * Timeout (ms) for backend semantic inference calls. Defaults to 600ms.
+   * On timeout the SDK falls back to local inference silently.
+   */
+  semanticBackendTimeoutMs?: number;
+  /**
+   * Minimum age (ms) the DOM must have been quiescent before the
+   * semantic layer is allowed to run. Defaults to 300ms.
+   *
+   * Rationale: React lazy mounts, Suspense boundaries and streaming SSR
+   * can expose the semantic layer to a "half-loaded" snapshot where
+   * critical elements (form fields, nav links) are not yet in the DOM.
+   * Running the classifier in that window produces incorrect roles
+   * (e.g. labelling a still-rendering button as `generic-click`).
+   *
+   * The SDK installs a single shared `MutationObserver` (lazily) on the
+   * analysis root and bumps `lastMutationAt` on every mutation batch.
+   * Before fusion runs the generator checks
+   * `Date.now() - lastMutationAt >= semanticSnapshotMinDomAgeMs`. When
+   * the DOM is still settling, the semantic layer is bypassed for this
+   * run; the legacy heuristic output is returned unchanged and the
+   * debug report records the reason. Set to `0` to disable the gate
+   * (not recommended).
+   */
+  semanticSnapshotMinDomAgeMs?: number;
+  /**
+   * Optional access token forwarder for the semantic backend. The SDK
+   * never persists this value; it is passed verbatim as `Authorization`
+   * header.
+   */
+  semanticBackendAccessToken?: string | (() => string | null | undefined);
 }
 
 export interface GuidedTour {

@@ -17,6 +17,22 @@ import {
 } from '../types';
 import { selectActiveBlueprints } from './journey-blueprints';
 import { BlueprintResolutionReport, resolveBlueprintsToDrafts } from './journey-resolver';
+import {
+  buildSemanticPageSnapshot,
+  buildSemanticStepCopy,
+  classifyCandidate,
+  computeSemanticScoreDelta,
+  resolveSemanticWeights,
+  type SemanticCandidateInput,
+  type SemanticCandidateRole,
+  type SemanticPageSnapshot,
+  type SemanticRole,
+} from './semantic-step-intelligence';
+import {
+  fetchBackendSemanticHints,
+  mergeBackendHints,
+  type BackendSemanticInferenceStatus,
+} from './semantic-backend-client';
 
 export interface DetectedElement {
   element: HTMLElement;
@@ -934,6 +950,16 @@ export function getLastContextualGenerationDebugReport(): ContextualGenerationDe
   return lastGenerationDebugReport;
 }
 
+export function restoreLastContextualGenerationDebugReport(
+  report: ContextualGenerationDebugReport | null,
+): void {
+  lastGenerationDebugReport = report;
+}
+
+export function clearLastContextualGenerationDebugReport(): void {
+  lastGenerationDebugReport = null;
+}
+
 function getDefaultFeedbackStats(): FeedbackStats {
   return { shown: 0, clicked: 0, completed: 0, skipped: 0 };
 }
@@ -1273,6 +1299,29 @@ function getNoiseSelectors(options?: TourDraftGenerationOptions): string[] {
   return Array.from(new Set([...DEFAULT_NOISE_SELECTORS, ...options.noiseSelectors]));
 }
 
+function resolveAnalysisRoot(options?: TourDraftGenerationOptions): ParentNode {
+  const selector = normalizeText(options?.analysisRootSelector);
+  if (!selector || typeof document === 'undefined') return document;
+
+  try {
+    const root = document.querySelector(selector);
+    if (root instanceof HTMLElement && root.isConnected) return root;
+  } catch {
+    // invalid selector — fall back to full document
+  }
+
+  return document;
+}
+
+function isWithinAnalysisRoot(element: HTMLElement, options?: TourDraftGenerationOptions): boolean {
+  const selector = normalizeText(options?.analysisRootSelector);
+  if (!selector) return true;
+
+  const root = resolveAnalysisRoot(options);
+  if (root === document) return true;
+  return root instanceof Element && root.contains(element);
+}
+
 function hasTransientKeyword(value?: string | null): boolean {
   const normalized = normalizeText(value);
   if (!normalized) return false;
@@ -1292,6 +1341,8 @@ function shouldIgnoreTransientContainer(element: HTMLElement): boolean {
 }
 
 function isNoiseElement(element: HTMLElement, options?: TourDraftGenerationOptions): boolean {
+  if (!isWithinAnalysisRoot(element, options)) return true;
+
   const selectors = getNoiseSelectors(options);
   const noiseMatch = selectors.some((selector) => {
     try {
@@ -1301,7 +1352,10 @@ function isNoiseElement(element: HTMLElement, options?: TourDraftGenerationOptio
     }
   });
 
-  if (noiseMatch) return true;
+  if (noiseMatch) {
+    const hasStableTourAnchor = STABLE_ATTRIBUTES.some((attributeName) => element.hasAttribute(attributeName));
+    if (!hasStableTourAnchor) return true;
+  }
 
   if (element.closest('[aria-hidden="true"], [hidden], [inert]')) return true;
   if (element.closest('[data-testid*="loader"], [data-testid*="tooltip"], [data-testid*="toast"]')) return true;
@@ -1455,6 +1509,11 @@ function tryUniqueSelector(selector: string): boolean {
   } catch {
     return false;
   }
+}
+
+function isStableSelectorForPublish(selector?: string): boolean {
+  if (!selector) return false;
+  return /data-tour-id|data-testid|data-cy|data-qa|#[A-Za-z][\w-]*\b|\[aria-label/i.test(selector);
 }
 
 function buildSelectorPart(element: HTMLElement): string {
@@ -1959,7 +2018,8 @@ function collectCandidates(options?: TourDraftGenerationOptions): DetectedElemen
     runtime.dirtyNodes.clear();
     runtime.domVersion += 1;
 
-    const all = harvestInteractiveNodesFromRoot(document).slice(0, MAX_TRACKED_ELEMENTS);
+    const scanRoot = resolveAnalysisRoot(options);
+    const all = harvestInteractiveNodesFromRoot(scanRoot).slice(0, MAX_TRACKED_ELEMENTS);
     runtime.trackedElements = new Set(all);
 
     for (const element of runtime.trackedElements) nodesToEvaluate.add(element);
@@ -2162,11 +2222,18 @@ function buildSecondaryStepCopy(candidate: DetectedElement, draftIntent: TourDra
   };
 }
 
-function getPageHeading(): HTMLElement | null {
-  const headingSelectors = ['main h1', 'h1', 'main h2', 'h2', '[role="heading"]'];
-  for (const selector of headingSelectors) {
-    const element = document.querySelector(selector) as HTMLElement | null;
-    if (element && isVisible(element)) return element;
+function getPageHeading(options?: TourDraftGenerationOptions): HTMLElement | null {
+  const headingSelectors = ['h1', 'h2', '[role="heading"]', 'main h1', 'main h2'];
+  const scopes: ParentNode[] = [];
+  const root = resolveAnalysisRoot(options);
+  scopes.push(root);
+  if (root !== document) scopes.push(document);
+
+  for (const scope of scopes) {
+    for (const selector of headingSelectors) {
+      const element = scope.querySelector(selector) as HTMLElement | null;
+      if (element && isVisible(element) && isWithinAnalysisRoot(element, options)) return element;
+    }
   }
   return null;
 }
@@ -2356,6 +2423,7 @@ function buildStep(
   position?: PositionType,
   action: Step['action'] = 'NEXT',
   context?: StepBuildContext,
+  options?: { isPrimary?: boolean; targetSelector?: string },
 ): Step {
   const inferredPosition = inferStepPosition(element);
   const resolvedPosition = !position || position === 'BOTTOM' ? inferredPosition : position;
@@ -2367,25 +2435,32 @@ function buildStep(
     title,
     content,
     stepType,
-    targetSelector: buildUniqueSelector(element),
+    targetSelector: options?.targetSelector ?? buildUniqueSelector(element),
     position: resolvedPosition,
     action,
     skipAllowed: true,
     highlightElement: shouldHighlightElement(stepType),
+    isPrimary: options?.isPrimary,
   };
 }
 
-function createDraft(
-  name: string,
-  description: string,
+function computeHeuristicDraftScores(
   intent: TourDraftIntent,
   steps: Step[],
   sourceCandidates: DetectedElement[],
   reasons: string[],
-  targetUrl: string,
   options?: TourDraftGenerationOptions,
-): SuggestedTourDraft {
-  const reasonsWithAdjustments = reasons.slice();
+): {
+  score: number;
+  confidence: number;
+  semanticScore: number;
+  sequenceScore: number;
+  selectorStabilityBonus: number;
+  selectorFragilityPenalty: number;
+  actionabilityPenalty: number;
+  adjustments: string[];
+} {
+  const adjustments: string[] = [];
   const averageCandidateScore = sourceCandidates.length
     ? sourceCandidates.reduce((total, candidate) => total + candidate.score, 0) / sourceCandidates.length
     : 0;
@@ -2407,11 +2482,26 @@ function createDraft(
   const averageActionabilityPenalty = sourceCandidates.length
     ? sourceCandidates.reduce((total, candidate) => total + candidate.actionabilityPenalty, 0) / sourceCandidates.length
     : 0;
+
   let score = Math.min(100, Math.round(averageCandidateScore * 0.55 + steps.length * 10 + reasons.length * 3));
   if (intent === 'discovery') {
     score = Math.min(score, 92);
   }
+
+  const stableStepCount = steps.filter(
+    (step) => step.targetSelector && isStableSelectorForPublish(step.targetSelector),
+  ).length;
+  if (intent === 'discovery' && steps.length >= 2 && stableStepCount >= 2) {
+    score = Math.min(92, score + 10);
+    adjustments.push('multi-step stable sequence boost');
+  }
+
   let confidence = confidenceFromSignals(score, averageSemanticScore, averagePersonaScore, averageSequenceScore, 0);
+
+  if (intent === 'discovery' && steps.length >= 2 && stableStepCount >= 2) {
+    confidence = Math.min(100, Math.max(confidence, 62));
+    adjustments.push('multi-step sequence confidence boost');
+  }
 
   const dynamicContext = options?.noiseFilteringEnabled !== false && options?.ignoreTransientUi !== false;
   const hasStableActionControl = sourceCandidates.some((candidate) => {
@@ -2422,7 +2512,6 @@ function createDraft(
       candidate.selector.includes('[data-tour-id=') ||
       candidate.selector.includes('[data-testid=') ||
       candidate.selector.startsWith('#');
-    // Dynamic layouts often report zones as 'other'; keep strict actionable/stable checks but relax zone guard.
     return isActionControl && isStableSelector;
   });
 
@@ -2430,13 +2519,519 @@ function createDraft(
 
   if (intent === 'primary-action' && dynamicContext && hasStableActionControl) {
     confidence = Math.min(100, confidence + 12);
-    reasonsWithAdjustments.push('dynamic-context confidence boost: stable action control');
+    adjustments.push('dynamic-context confidence boost: stable action control');
   }
 
   if (intent === 'primary-action' && dynamicContext && hasDynamicActionMarker) {
     confidence = Math.min(100, confidence + 6);
-    reasonsWithAdjustments.push('dynamic-context confidence boost: explicit dynamic action marker');
+    adjustments.push('dynamic-context confidence boost: explicit dynamic action marker');
   }
+
+  return {
+    score,
+    confidence,
+    semanticScore: Math.round(averageSemanticScore * 100),
+    sequenceScore: Math.round(averageSequenceScore * 100),
+    selectorStabilityBonus: Math.round(averageSelectorStabilityBonus),
+    selectorFragilityPenalty: Math.round(averageSelectorFragilityPenalty),
+    actionabilityPenalty: Math.round(averageActionabilityPenalty),
+    adjustments,
+  };
+}
+
+// ============================================================================
+// Hybrid semantic fusion (Phase 4)
+// ============================================================================
+
+/**
+ * Module-level handoff used by `generateContextualTourDraftsAsync`. The
+ * async wrapper computes/awaits backend semantic hints, stashes the
+ * result here, then invokes the synchronous generator. The synchronous
+ * generator consumes the value once (and clears it) when constructing
+ * its semantic context. This keeps `generateContextualTourDrafts` fully
+ * synchronous while still allowing backend enrichment.
+ */
+let pendingBackendSemanticHints: {
+  status: BackendSemanticInferenceStatus;
+  hints: import('./semantic-backend-client').BackendSemanticHint[];
+  preferredOrder: string[] | null;
+  implementation: import('./semantic-backend-client').BackendSemanticImplementation | null;
+} | null = null;
+
+interface SemanticContext {
+  enabled: boolean;
+  engineMode: 'local' | 'hybrid' | 'backend';
+  snapshot: SemanticPageSnapshot;
+  rolesBySelector: Map<string, SemanticCandidateRole>;
+  /** Selectors whose role was decided by the backend (its confidence dominated). */
+  backendSelectors: Set<string>;
+  /** Selectors whose role was averaged between local and backend. */
+  mergedSelectors: Set<string>;
+  preferredOrder: string[] | null;
+  backendStatus: BackendSemanticInferenceStatus;
+  /**
+   * Self-description of the backend engine that produced the response
+   * (when there is one). Used by the debug report to advertise whether
+   * the run was Phase 1 (rule-mirror) or Phase 2 (sentence-transformers).
+   */
+  backendImplementation: import('./semantic-backend-client').BackendSemanticImplementation | null;
+  domStability: DomStabilitySnapshot;
+  draftReports: NonNullable<ContextualGenerationDebugReport['semanticEnhancement']>['drafts'];
+}
+
+const MAX_DRAFT_SEMANTIC_DELTA = 10;
+
+/**
+ * Minimum role confidence required for the semantic layer to influence
+ * a step. Below this value the fusion zero-clamps the delta and refuses
+ * to rewrite copy: the heuristic decision wins. The role is still
+ * surfaced in the debug report (with `lowConfidence: true`) so the lab
+ * can identify silent-bad classifications.
+ *
+ * NOTE: today the local engine is a rule-vote classifier where the
+ * "confidence" is the max single vote weight, already normalised to
+ * [0, 1]. If/when we wire an embedding-based engine (e.g.
+ * sentence-transformers), this threshold MUST be re-calibrated against
+ * the model's score distribution — typical same-domain embedding
+ * similarity sits in [0.3, 0.7] so 0.55 may be too aggressive.
+ */
+const MIN_SEMANTIC_ROLE_CONFIDENCE = 0.55;
+
+const DEFAULT_SEMANTIC_DOM_SETTLE_MS = 300;
+
+const LOCAL_ENGINE_CALIBRATION_NOTE =
+  "Le moteur local est un classifieur par règles + mots-clés (pas d'embeddings). " +
+  'La confiance est le poids maximal de vote, normalisée sur [0, 1]. ' +
+  'Si un moteur à embeddings est introduit, recalibrer ce seuil contre la distribution réelle ' +
+  'du modèle (les similarités cosinus pratiques se situent souvent dans [0.3, 0.7]).';
+
+/**
+ * Phase 1 disclaimer used when the backend ran the rule-vote mirror
+ * (either because the embeddings path is disabled, timed out, or
+ * failed, or because the engine mode is `local`). Lab tests with this
+ * label validate the fusion mechanics + rule classifier precision, not
+ * learned semantic quality.
+ */
+const BACKEND_IMPLEMENTATION_DISCLAIMER_RULES =
+  "Backend endpoint actif. Implémentation actuelle : règles miroir du moteur local (pas d'embeddings). " +
+  'Les tests lab valident la mécanique de fusion + la précision du classifieur par règles, ' +
+  'pas la qualité sémantique apprise.';
+
+/**
+ * Phase 2 disclaimer used when the backend actually ran the
+ * sentence-transformers embeddings path. The confidence reported is
+ * margin-calibrated so the SDK's 0.55 guard stays meaningful even
+ * though raw cosine similarities live in a tighter [0.2, 0.7] range.
+ */
+const BACKEND_IMPLEMENTATION_DISCLAIMER_EMBEDDINGS =
+  'Backend endpoint actif. Implémentation actuelle : sentence-transformers (embeddings) avec ' +
+  'recalibration par marge top-1/top-2. Les tests lab valident la mécanique de fusion + la qualité ' +
+  'sémantique apprise sur des prototypes de rôles multilingues.';
+
+/**
+ * Derive the validation phase from the backend self-description. Phase
+ * 2 only when the backend actually ran sentence-transformers — a
+ * silent fallback to the rule mirror still reports phase-1-local so
+ * the lab and the reviewer can tell the difference at a glance.
+ */
+function deriveValidationPhase(
+  context: SemanticContext,
+): 'phase-1-local' | 'phase-2-embeddings' {
+  if (context.backendImplementation?.kind === 'sentence-transformers') {
+    return 'phase-2-embeddings';
+  }
+  return 'phase-1-local';
+}
+
+/**
+ * Build the backend implementation block surfaced in the debug report.
+ * Mirrors what the backend actually advertised; when no backend was
+ * called (local mode), we report the rule mirror as the implicit
+ * baseline so the lab UI always shows a complete record.
+ */
+function deriveBackendImplementationReport(
+  context: SemanticContext,
+): NonNullable<ContextualGenerationDebugReport['semanticEnhancement']>['backendImplementation'] {
+  const impl = context.backendImplementation;
+  if (impl?.kind === 'sentence-transformers') {
+    return {
+      endpointLive: true,
+      kind: 'sentence-transformers',
+      disclaimer: impl.note ?? BACKEND_IMPLEMENTATION_DISCLAIMER_EMBEDDINGS,
+      ...(impl.model ? { model: impl.model } : {}),
+    };
+  }
+  if (impl?.kind === 'rule-based-mirror') {
+    return {
+      endpointLive: true,
+      kind: 'rule-based-mirror',
+      disclaimer: impl.note ?? BACKEND_IMPLEMENTATION_DISCLAIMER_RULES,
+      ...(impl.fallbackReason ? { fallbackReason: impl.fallbackReason } : {}),
+    };
+  }
+  return {
+    endpointLive: context.backendStatus !== 'unconfigured' && context.backendStatus !== 'disabled',
+    kind: context.backendStatus === 'ok' ? 'unknown' : 'rule-based-mirror',
+    disclaimer: BACKEND_IMPLEMENTATION_DISCLAIMER_RULES,
+  };
+}
+
+/**
+ * Lazy shared MutationObserver used to track the last DOM mutation
+ * timestamp. The observer is installed once per host page; subsequent
+ * calls reuse it. We deliberately observe a wide subtree because the
+ * analysis root may change between scans (the host can update
+ * `analysisRootSelector` at runtime).
+ */
+interface DomMutationTracker {
+  observer: MutationObserver | null;
+  lastMutationAt: number;
+  installedAt: number;
+  mutationCount: number;
+  observerAvailable: boolean;
+}
+
+let domMutationTracker: DomMutationTracker | null = null;
+
+function ensureDomMutationTracker(): DomMutationTracker {
+  if (domMutationTracker) return domMutationTracker;
+  const now = Date.now();
+  if (typeof window === 'undefined' || typeof document === 'undefined' || typeof MutationObserver === 'undefined') {
+    const headless: DomMutationTracker = {
+      observer: null,
+      lastMutationAt: now,
+      installedAt: now,
+      mutationCount: 0,
+      observerAvailable: false,
+    };
+    domMutationTracker = headless;
+    return headless;
+  }
+  const tracker: DomMutationTracker = {
+    observer: null,
+    lastMutationAt: now,
+    installedAt: now,
+    mutationCount: 0,
+    observerAvailable: true,
+  };
+  try {
+    const target = document.body || document.documentElement;
+    if (target) {
+      // We only care about *structural* mutations to detect a page still
+      // streaming content. Tracking attribute changes (class, style,
+      // aria-*) would flag every :hover, focus ring, or React render
+      // caused by clicking the Analyse button — that is way too
+      // sensitive for a "is the page still loading?" signal.
+      const observer = new MutationObserver((mutations) => {
+        let structural = 0;
+        for (const mutation of mutations) {
+          if (mutation.type === 'childList' && (mutation.addedNodes.length > 0 || mutation.removedNodes.length > 0)) {
+            structural += 1;
+          }
+        }
+        if (structural === 0) return;
+        tracker.mutationCount += structural;
+        tracker.lastMutationAt = Date.now();
+      });
+      observer.observe(target, {
+        childList: true,
+        subtree: true,
+      });
+      tracker.observer = observer;
+    } else {
+      tracker.observerAvailable = false;
+    }
+  } catch {
+    tracker.observerAvailable = false;
+  }
+  domMutationTracker = tracker;
+  return tracker;
+}
+
+/**
+ * Visible only for tests: clear the shared mutation tracker so each
+ * test can simulate a fresh environment.
+ */
+export function __resetSemanticDomMutationTrackerForTests(): void {
+  if (domMutationTracker?.observer) {
+    try {
+      domMutationTracker.observer.disconnect();
+    } catch {
+      /* noop */
+    }
+  }
+  domMutationTracker = null;
+}
+
+interface DomStabilitySnapshot {
+  stable: boolean;
+  domAgeMs: number;
+  requiredAgeMs: number;
+  observerInstalled: boolean;
+  bypassReason?: 'dom_unsettled' | 'observer_unavailable';
+}
+
+function evaluateDomStability(options?: TourDraftGenerationOptions): DomStabilitySnapshot {
+  const required = Math.max(0, options?.semanticSnapshotMinDomAgeMs ?? DEFAULT_SEMANTIC_DOM_SETTLE_MS);
+  if (required === 0) {
+    return { stable: true, domAgeMs: Number.POSITIVE_INFINITY, requiredAgeMs: 0, observerInstalled: false };
+  }
+  const tracker = ensureDomMutationTracker();
+  if (!tracker.observerAvailable) {
+    // Without an observer we cannot prove the DOM is settled. We choose
+    // the conservative path here: bypass the semantic layer rather than
+    // run on a potentially half-loaded DOM. This matches the safer
+    // behavior the user asked for in the verification pass.
+    return {
+      stable: false,
+      domAgeMs: 0,
+      requiredAgeMs: required,
+      observerInstalled: false,
+      bypassReason: 'observer_unavailable',
+    };
+  }
+  // If we have never observed a structural mutation since the tracker
+  // was installed, the host page is presumably static — treat it as
+  // stable immediately. Reporting a quiescence age of "infinity" is
+  // factually accurate here (no mutation has *ever* been seen).
+  if (tracker.mutationCount === 0) {
+    return {
+      stable: true,
+      domAgeMs: Number.POSITIVE_INFINITY,
+      requiredAgeMs: required,
+      observerInstalled: true,
+    };
+  }
+  const now = Date.now();
+  const domAgeMs = now - tracker.lastMutationAt;
+  if (domAgeMs >= required) {
+    return { stable: true, domAgeMs, requiredAgeMs: required, observerInstalled: true };
+  }
+  return {
+    stable: false,
+    domAgeMs,
+    requiredAgeMs: required,
+    observerInstalled: true,
+    bypassReason: 'dom_unsettled',
+  };
+}
+
+/**
+ * Async helper used by `generateContextualTourDraftsAsync` to actively
+ * wait for the DOM to settle before running the semantic backend hop.
+ * Returns the stability snapshot once the DOM has been quiescent for
+ * `requiredAgeMs`, or after `maxWaitMs` (in which case `stable` may
+ * still be false and the caller can decide to fall back).
+ */
+async function waitForDomToSettle(
+  options?: TourDraftGenerationOptions,
+  maxWaitMs: number = 1500,
+): Promise<DomStabilitySnapshot> {
+  let snapshot = evaluateDomStability(options);
+  if (snapshot.stable || snapshot.bypassReason === 'observer_unavailable') return snapshot;
+  const start = Date.now();
+  while (!snapshot.stable && Date.now() - start < maxWaitMs) {
+    const wait = Math.max(20, snapshot.requiredAgeMs - snapshot.domAgeMs);
+    await new Promise<void>((resolve) => setTimeout(resolve, wait));
+    snapshot = evaluateDomStability(options);
+  }
+  return snapshot;
+}
+
+function buildSemanticInputs(candidates: DetectedElement[]): SemanticCandidateInput[] {
+  return candidates.map((candidate) => ({
+    element: candidate.element,
+    selector: candidate.selector,
+    label: candidate.label,
+    intent: candidate.intent,
+    zone: candidate.zone,
+    isActionable: isActionableElement(candidate.element),
+    isFormControl: isFormControlElement(candidate.element),
+    documentTop: (() => {
+      try {
+        return candidate.element.getBoundingClientRect().top + (typeof window !== 'undefined' ? window.scrollY : 0);
+      } catch {
+        return 0;
+      }
+    })(),
+  }));
+}
+
+function shouldRewriteCopyForRole(role: SemanticRole, confidence: number, step: Step): boolean {
+  if (confidence < 0.6) return false;
+  if (role === 'generic-click') return false;
+  const title = (step.title || '').toLowerCase();
+  const content = (step.content || '').toLowerCase();
+  const blob = `${title} ${content}`;
+
+  switch (role) {
+    case 'form-field':
+      return !/form|champ|saisir|renseign|remplir/i.test(blob);
+    case 'form-submit':
+      return !/valid|enregistr|publier|confirmer|soumettre|sauvegarder/i.test(blob);
+    case 'navigation':
+      return !/navigation|menu|aller|section/i.test(blob);
+    case 'utility':
+      return !/réglage|reglage|options|paramètr|parametr|préférence|preference/i.test(blob);
+    case 'secondary':
+      return !/aide|découv|decouv|guide|tutoriel|tutorial/i.test(blob);
+    case 'entry':
+      return !/entrée|entree|commencer|début|debut|prise en main|bienvenue/i.test(blob);
+    case 'cta-primary':
+      return !/action principale|action clé|action cle|cta principal|lancez|déclenchez|declenchez|démarrez|demarrez/i.test(blob);
+    case 'result':
+      return !/résultat|resultat|statut|status|terminé|termine|fini/i.test(blob);
+    default:
+      return false;
+  }
+}
+
+function applySemanticFusionToDraft(
+  draft: SuggestedTourDraft,
+  context: SemanticContext | null,
+  options?: TourDraftGenerationOptions,
+): void {
+  if (!context || !context.enabled) return;
+  if (!draft.steps || draft.steps.length === 0) return;
+
+  const weights = resolveSemanticWeights(options);
+  const stepReports: NonNullable<ContextualGenerationDebugReport['semanticEnhancement']>['drafts'][number]['steps'] = [];
+
+  let effectiveTotalDelta = 0;
+  let copyRewriteCount = 0;
+  let suppressedLowConfidence = 0;
+  const originalOrder = draft.steps
+    .map((step) => step.targetSelector)
+    .filter((value): value is string => Boolean(value));
+
+  for (let i = 0; i < draft.steps.length; i += 1) {
+    const step = draft.steps[i];
+    const selector = step.targetSelector;
+    if (!selector) continue;
+    const role = context.rolesBySelector.get(selector);
+    if (!role) continue;
+
+    const fusion = computeSemanticScoreDelta({
+      heuristicIntent: draft.intent,
+      semanticRole: role.role,
+      confidence: role.confidence,
+      weights,
+    });
+
+    const lowConfidence = role.confidence < MIN_SEMANTIC_ROLE_CONFIDENCE;
+    const effectiveDelta = lowConfidence ? 0 : fusion.delta;
+    effectiveTotalDelta += effectiveDelta;
+    if (lowConfidence) suppressedLowConfidence += 1;
+
+    let suppressedReason: 'low_confidence' | 'neutral' | undefined;
+    if (lowConfidence) suppressedReason = 'low_confidence';
+    else if (fusion.delta === 0) suppressedReason = 'neutral';
+
+    if (!lowConfidence && shouldRewriteCopyForRole(role.role, role.confidence, step)) {
+      const copy = buildSemanticStepCopy(role.role, step.title);
+      const rewrittenStep: Step = {
+        ...step,
+        title: copy.title,
+        content: copy.content,
+      };
+      draft.steps[i] = rewrittenStep;
+      copyRewriteCount += 1;
+    }
+
+    const decisionSource = context.backendSelectors.has(selector)
+      ? 'backend'
+      : context.mergedSelectors.has(selector)
+        ? 'merged'
+        : 'local';
+
+    stepReports.push({
+      selector,
+      heuristicRole: draft.intent,
+      semanticRole: role.role,
+      roleConfidence: Number(role.confidence.toFixed(3)),
+      rationale: role.rationale.slice(0, 3),
+      localRoleSource: 'rules',
+      decisionSource,
+      lowConfidence,
+      fusion: {
+        heuristicScore: draft.score,
+        semanticDelta: Number(fusion.delta.toFixed(2)),
+        appliedDelta: 0,
+        ...(suppressedReason ? { suppressedReason } : {}),
+      },
+    });
+  }
+
+  const cappedDelta = Math.max(
+    -MAX_DRAFT_SEMANTIC_DELTA,
+    Math.min(MAX_DRAFT_SEMANTIC_DELTA, effectiveTotalDelta),
+  );
+  const wasClamped = cappedDelta !== effectiveTotalDelta;
+  if (cappedDelta !== 0) {
+    const adjustedScore = Math.max(0, Math.min(100, draft.score + cappedDelta));
+    const adjustedConfidence = Math.max(
+      0,
+      Math.min(100, draft.confidence + Math.round(cappedDelta * 0.6)),
+    );
+    draft.score = adjustedScore;
+    draft.confidence = adjustedConfidence;
+    if (draft.explainability) {
+      draft.explainability = {
+        ...draft.explainability,
+        signalScores: {
+          ...draft.explainability.signalScores,
+          confidence: adjustedConfidence,
+        },
+        generatedFrom: [
+          ...draft.explainability.generatedFrom,
+          `semantic fusion: ${cappedDelta > 0 ? '+' : ''}${cappedDelta.toFixed(1)}${wasClamped ? ' (capped)' : ''}`,
+        ].slice(0, 12),
+      };
+    }
+  }
+
+  for (const stepReport of stepReports) {
+    const rawDelta = stepReport.fusion.semanticDelta;
+    // Distribute the capped delta proportionally across the contributing
+    // steps. Low-confidence steps already have a 0 raw delta, so they
+    // also get 0 applied delta naturally.
+    stepReport.fusion.appliedDelta = Number(
+      ((cappedDelta * (stepReport.lowConfidence ? 0 : rawDelta)) / (effectiveTotalDelta || 1)).toFixed(2),
+    );
+    if (wasClamped && stepReport.fusion.appliedDelta !== 0 && !stepReport.fusion.suppressedReason) {
+      stepReport.fusion.suppressedReason = 'cap_clamped';
+    }
+  }
+
+  const stillMatchesOrder =
+    context.preferredOrder === null ||
+    originalOrder.every((selector, idx) => selector === context.preferredOrder?.[idx]);
+
+  context.draftReports.push({
+    draftName: draft.name,
+    intent: draft.intent,
+    steps: stepReports,
+    orderChanged: !stillMatchesOrder,
+    copyRewriteCount,
+    suppressedLowConfidence,
+  });
+}
+
+function createDraft(
+  name: string,
+  description: string,
+  intent: TourDraftIntent,
+  steps: Step[],
+  sourceCandidates: DetectedElement[],
+  reasons: string[],
+  targetUrl: string,
+  options?: TourDraftGenerationOptions,
+): SuggestedTourDraft {
+  const reasonsWithAdjustments = reasons.slice();
+  const metrics = computeHeuristicDraftScores(intent, steps, sourceCandidates, reasons, options);
+  reasonsWithAdjustments.push(...metrics.adjustments);
+  const score = metrics.score;
+  const confidence = metrics.confidence;
 
   const sessionContext = getSessionContext(options);
   const stage = normalizeStage(sessionContext?.currentStage);
@@ -2456,8 +3051,8 @@ function createDraft(
     intent,
     score,
     confidence,
-    semanticScore: Math.round(averageSemanticScore * 100),
-    sequenceScore: Math.round(averageSequenceScore * 100),
+    semanticScore: metrics.semanticScore,
+    sequenceScore: metrics.sequenceScore,
     reasons: reasonsWithAdjustments,
     detectedSelectors: sourceCandidates.map((candidate) => candidate.selector),
     explainability: explainabilityEnabled(options)
@@ -2465,12 +3060,12 @@ function createDraft(
           generatedFrom: reasonsWithAdjustments.slice(0, 8),
           sourceCandidateCount: sourceCandidates.length,
           signalScores: {
-            semantic: Math.round(averageSemanticScore * 100),
-            sequence: Math.round(averageSequenceScore * 100),
+            semantic: metrics.semanticScore,
+            sequence: metrics.sequenceScore,
             confidence,
-            selectorStabilityBonus: Math.round(averageSelectorStabilityBonus),
-            selectorFragilityPenalty: Math.round(averageSelectorFragilityPenalty),
-            actionabilityPenalty: Math.round(averageActionabilityPenalty),
+            selectorStabilityBonus: metrics.selectorStabilityBonus,
+            selectorFragilityPenalty: metrics.selectorFragilityPenalty,
+            actionabilityPenalty: metrics.actionabilityPenalty,
           },
           conflictNotes: [],
         }
@@ -2501,8 +3096,385 @@ function createDraft(
   };
 }
 
+function chainMemberToDetected(
+  candidate: DetectedElement & { rankingBoost?: number },
+): DetectedElement {
+  if (typeof candidate.rankingBoost === 'number') return candidate as DetectedElement;
+  return { ...candidate, rankingBoost: 0 };
+}
+
 function isSequenceCandidate(candidate: DetectedElement): boolean {
   return candidate.semanticScore > 0.08 || candidate.sequenceScore > 0.08 || candidate.tokenHits > 0;
+}
+
+function isCoreSequenceCandidate(candidate: DetectedElement, options?: TourDraftGenerationOptions): boolean {
+  // Chrome navigation (dashboard shell) is already excluded by `analysisRootSelector`.
+  // In-app menus (`aside` > `nav` > `a`) are tagged `navigation` but must stay in sequence chains.
+  return candidate.zone !== 'header' && isWithinAnalysisRoot(candidate.element, options);
+}
+
+function hasScopedAnalysis(options?: TourDraftGenerationOptions): boolean {
+  return Boolean(normalizeText(options?.analysisRootSelector));
+}
+
+function excludesPrimaryFromSequence(
+  candidate: DetectedElement,
+  primary: DetectedElement | null,
+): boolean {
+  return Boolean(primary?.selector && candidate.selector === primary.selector) || candidate.intent === 'primary-action';
+}
+
+const SEQUENCE_UTILITY_LABEL =
+  /réglages|settings|reglages|preferences|préférences|options|configuration|configurer|paramètres|parametres/i;
+const SEQUENCE_SECONDARY_LABEL =
+  /guide|learn|découvrir|decouvrir|discover|aide|help|documentation|doc\b|en savoir|tutoriel|tutorial/i;
+const SEQUENCE_SUBMIT_LABEL =
+  /confirm|validate|submit|valider|confirmer|soumettre|enregistrer|publier|sauvegarder|save|prévisualiser|preview|appliquer|apply/i;
+const SEQUENCE_RESULT_LABEL = /result|status|done|complete|success|résultat|terminé|termine|fini/i;
+
+type SequenceFollowUpRole = 'form-field' | 'form-submit' | 'utility' | 'secondary' | 'navigation' | 'generic-click';
+
+const SEQUENCE_FORM_NAV_LABEL = /formulaire|form|configuration|validation|aperçu|overview|saisie/i;
+
+function isSubmitLikeControl(element: HTMLElement): boolean {
+  const tagName = element.tagName.toLowerCase();
+  if (tagName === 'button') return true;
+  if (tagName === 'a' && SEQUENCE_SUBMIT_LABEL.test(normalizeText(getLabel(element)))) return true;
+  if (tagName === 'input') {
+    const inputType = (element.getAttribute('type') || '').toLowerCase();
+    return inputType === 'submit' || inputType === 'button';
+  }
+  return false;
+}
+
+function hasFormContextInCandidates(candidates: DetectedElement[]): boolean {
+  return candidates.some(
+    (candidate) =>
+      candidate.intent === 'form-flow' ||
+      isFormControlElement(candidate.element) ||
+      Boolean(candidate.element.closest('form')),
+  );
+}
+
+function isInNavigationArea(candidate: DetectedElement): boolean {
+  return (
+    candidate.zone === 'navigation' ||
+    candidate.zone === 'sidebar' ||
+    Boolean(candidate.element.closest('nav, aside, [role="navigation"]'))
+  );
+}
+
+function hasNavigationContextInCandidates(candidates: DetectedElement[]): boolean {
+  return candidates.some((candidate) => isInNavigationArea(candidate) && isActionableElement(candidate.element));
+}
+
+function pickSequenceNavigationStep(
+  pools: DetectedElement[][],
+  options: TourDraftGenerationOptions | undefined,
+  primary: DetectedElement | null,
+): DetectedElement | null {
+  const formSectionNav = pickBestSequenceFollowUpFromPools(
+    pools,
+    options,
+    primary,
+    (candidate) =>
+      isInNavigationArea(candidate) &&
+      (SEQUENCE_FORM_NAV_LABEL.test(candidate.label) ||
+        /#form|form-section|validation/i.test(candidate.element.getAttribute('href') || '')),
+  );
+  if (formSectionNav) return formSectionNav;
+
+  return pickBestSequenceFollowUpFromPools(
+    pools,
+    options,
+    primary,
+    (candidate) => isInNavigationArea(candidate) && candidate.element.tagName.toLowerCase() === 'a',
+  );
+}
+
+function classifySequenceFollowUpRole(candidate: DetectedElement): SequenceFollowUpRole {
+  const label = normalizeText(candidate.label) || '';
+  const element = candidate.element;
+
+  if (isFormControlElement(element) && !isSubmitLikeControl(element)) {
+    return 'form-field';
+  }
+
+  if (isSubmitLikeControl(element) && SEQUENCE_SUBMIT_LABEL.test(label)) {
+    return 'form-submit';
+  }
+
+  if (SEQUENCE_UTILITY_LABEL.test(label)) {
+    return 'utility';
+  }
+
+  if (isInNavigationArea(candidate) && candidate.element.tagName.toLowerCase() === 'a') {
+    return 'navigation';
+  }
+
+  if (candidate.intent === 'support-navigation' || SEQUENCE_SECONDARY_LABEL.test(label)) {
+    return 'secondary';
+  }
+
+  if (candidate.intent === 'form-flow' && !isSubmitLikeControl(element)) {
+    return 'form-field';
+  }
+
+  if (isSubmitLikeControl(element)) {
+    return 'form-submit';
+  }
+
+  return 'generic-click';
+}
+
+function buildSequenceFollowUpStepCopy(
+  candidate: DetectedElement,
+  role: SequenceFollowUpRole,
+): { title: string; content: string; action: Step['action'] } {
+  const label = candidate.label || 'cet élément';
+
+  switch (role) {
+    case 'form-field':
+      return {
+        title: 'Renseigner le formulaire',
+        content: `Saisissez ou vérifiez les informations attendues dans ce champ: ${label}.`,
+        action: 'NEXT',
+      };
+    case 'form-submit':
+      return {
+        title: 'Valider et enregistrer',
+        content: `Une fois les champs complétés, confirmez l’étape avec: ${label}.`,
+        action: 'CLICK',
+      };
+    case 'utility':
+      return {
+        title: 'Réglages et options',
+        content: `Ce contrôle ouvre les préférences ou réglages associés au parcours: ${label}.`,
+        action: 'CLICK',
+      };
+    case 'secondary':
+      return {
+        title: 'Découverte et aide',
+        content: `Consultez les ressources d’aide ou de découverte liées à: ${label}.`,
+        action: 'CLICK',
+      };
+    case 'navigation':
+      return {
+        title: 'Navigation métier',
+        content: `Ce lien de navigation permet d’accéder à la section utile du parcours: ${label}.`,
+        action: 'CLICK',
+      };
+    default:
+      return {
+        title: 'Étape suivante',
+        content: `Poursuivez le parcours avec: ${label}.`,
+        action: 'CLICK',
+      };
+  }
+}
+
+function buildSyntheticSequenceCandidate(element: HTMLElement): DetectedElement {
+  const selector = buildUniqueSelector(element);
+  const label = normalizeText(getLabel(element)) || selector;
+  const zone = detectZone(element);
+  let intent: TourDraftIntent = 'discovery';
+  if (isFormControlElement(element) && !isSubmitLikeControl(element)) {
+    intent = 'form-flow';
+  } else if (SEQUENCE_UTILITY_LABEL.test(label)) {
+    intent = 'discovery';
+  } else if (SEQUENCE_SECONDARY_LABEL.test(label)) {
+    intent = 'support-navigation';
+  } else if (isSubmitLikeControl(element)) {
+    intent = 'primary-action';
+  }
+
+  return {
+    element,
+    selector,
+    label,
+    score: 48,
+    rankingBoost: 0,
+    confidence: 62,
+    intent,
+    reasons: ['sequence follow-up anchor (stable DOM)'],
+    tokenHits: 1,
+    zone,
+    semanticScore: 0.12,
+    personaScore: 0.08,
+    sequenceScore: 0.14,
+    selectorStabilityBonus: Math.max(0, selectorStabilityDelta(selector)),
+    selectorFragilityPenalty: Math.min(0, selectorStabilityDelta(selector)),
+    actionabilityPenalty: 0,
+  };
+}
+
+function pickBestSequenceFollowUpFromPools(
+  pools: DetectedElement[][],
+  options: TourDraftGenerationOptions | undefined,
+  primary: DetectedElement | null,
+  predicate: (candidate: DetectedElement) => boolean,
+): DetectedElement | null {
+  const matches: DetectedElement[] = [];
+
+  for (const pool of pools) {
+    for (const candidate of pool) {
+      if (!isCoreSequenceCandidate(candidate, options)) continue;
+      if (excludesPrimaryFromSequence(candidate, primary)) continue;
+      if (!predicate(candidate)) continue;
+      matches.push(candidate);
+    }
+  }
+
+  if (matches.length === 0) return null;
+
+  matches.sort(
+    (a, b) =>
+      b.score + b.selectorStabilityBonus + b.rankingBoost - (a.score + a.selectorStabilityBonus + a.rankingBoost),
+  );
+  return matches[0];
+}
+
+function pickStableActionableFollowUpFromDom(
+  candidates: DetectedElement[],
+  primary: DetectedElement | null,
+  options?: TourDraftGenerationOptions,
+): DetectedElement | null {
+  if (typeof document === 'undefined') return null;
+
+  const root = resolveAnalysisRoot(options);
+  const elements = root.querySelectorAll(
+    'button, a[href], [role="button"], input[type="submit"], input[type="button"], [data-tour-id], [data-testid]',
+  );
+
+  const ranked: Array<{ element: HTMLElement; selector: string; rank: number }> = [];
+
+  for (const node of elements) {
+    if (!(node instanceof HTMLElement)) continue;
+    if (!isVisible(node) || !isWithinAnalysisRoot(node, options)) continue;
+    if (!isActionableElement(node)) continue;
+
+    const selector = buildUniqueSelector(node);
+    if (!selector || !isStableSelectorForPublish(selector)) continue;
+    if (primary?.selector && selector === primary.selector) continue;
+
+    const existing = candidates.find((candidate) => candidate.element === node || candidate.selector === selector);
+    if (existing && excludesPrimaryFromSequence(existing, primary)) continue;
+
+    const label = normalizeText(getLabel(node)) || selector;
+    let rank = selectorStabilityDelta(selector) + (existing?.score || 0) + (existing?.rankingBoost || 0);
+    if (isFormControlElement(node) && !isSubmitLikeControl(node)) rank += 28;
+    else if (SEQUENCE_UTILITY_LABEL.test(label)) rank += 22;
+    else if (SEQUENCE_SECONDARY_LABEL.test(label)) rank += 18;
+    else if (existing?.intent === 'support-navigation') rank += 12;
+    else if (SEQUENCE_SUBMIT_LABEL.test(label)) rank += 14;
+
+    ranked.push({ element: node, selector, rank });
+  }
+
+  ranked.sort((a, b) => b.rank - a.rank);
+  const best = ranked[0];
+  if (!best) return null;
+
+  const existing = candidates.find(
+    (candidate) => candidate.element === best.element || candidate.selector === best.selector,
+  );
+  if (existing && !excludesPrimaryFromSequence(existing, primary)) return existing;
+
+  return buildSyntheticSequenceCandidate(best.element);
+}
+
+function pickBestFormFieldFollowUp(
+  pools: DetectedElement[][],
+  options: TourDraftGenerationOptions | undefined,
+  primary: DetectedElement | null,
+): DetectedElement | null {
+  const matches: DetectedElement[] = [];
+
+  for (const pool of pools) {
+    for (const candidate of pool) {
+      if (!isCoreSequenceCandidate(candidate, options)) continue;
+      if (excludesPrimaryFromSequence(candidate, primary)) continue;
+      if (!isFormControlElement(candidate.element) || isSubmitLikeControl(candidate.element)) continue;
+      matches.push(candidate);
+    }
+  }
+
+  if (matches.length === 0) return null;
+
+  matches.sort((a, b) => {
+    const topDiff = a.element.getBoundingClientRect().top - b.element.getBoundingClientRect().top;
+    if (Math.abs(topDiff) > 8) return topDiff;
+    return b.score + b.selectorStabilityBonus - (a.score + a.selectorStabilityBonus);
+  });
+
+  return matches[0];
+}
+
+function resolveSequenceFollowUpCandidate(
+  orderedCandidates: DetectedElement[],
+  allCandidates: DetectedElement[],
+  options: TourDraftGenerationOptions | undefined,
+  form: DetectedElement | null,
+  primary: DetectedElement | null,
+): DetectedElement | null {
+  const pools = [orderedCandidates, allCandidates];
+  const formContext = hasFormContextInCandidates(allCandidates);
+
+  if (form && isCoreSequenceCandidate(form, options) && !excludesPrimaryFromSequence(form, primary)) {
+    return form;
+  }
+
+  if (formContext) {
+    const formField = pickBestFormFieldFollowUp(pools, options, primary);
+    if (formField) return formField;
+
+    const submit = pickBestSequenceFollowUpFromPools(
+      pools,
+      options,
+      primary,
+      (candidate) =>
+        isSubmitLikeControl(candidate.element) && SEQUENCE_SUBMIT_LABEL.test(candidate.label),
+    );
+    if (submit) return submit;
+  }
+
+  const utility = pickBestSequenceFollowUpFromPools(
+    pools,
+    options,
+    primary,
+    (candidate) => SEQUENCE_UTILITY_LABEL.test(candidate.label) && !isFormControlElement(candidate.element),
+  );
+  if (utility) return utility;
+
+  const secondary = pickBestSequenceFollowUpFromPools(
+    pools,
+    options,
+    primary,
+    (candidate) =>
+      candidate.intent === 'support-navigation' || SEQUENCE_SECONDARY_LABEL.test(candidate.label),
+  );
+  if (secondary) return secondary;
+
+  if (!formContext) {
+    const submit = pickBestSequenceFollowUpFromPools(
+      pools,
+      options,
+      primary,
+      (candidate) =>
+        isSubmitLikeControl(candidate.element) && SEQUENCE_SUBMIT_LABEL.test(candidate.label),
+    );
+    if (submit) return submit;
+  }
+
+  const actionable = pickBestSequenceFollowUpFromPools(
+    pools,
+    options,
+    primary,
+    (candidate) => isActionableElement(candidate.element),
+  );
+  if (actionable) return actionable;
+
+  return pickStableActionableFollowUpFromDom(allCandidates, primary, options);
 }
 
 function buildSequenceDraft(
@@ -2518,9 +3490,26 @@ function buildSequenceDraft(
   const stage = normalizeStage(sessionContext?.currentStage);
   const progress = getProgress(sessionContext);
 
-  const entry = heading
-    ? { element: heading, selector: buildUniqueSelector(heading), label: normalizeText(heading.textContent), score: 72, confidence: 68, intent: 'discovery' as const, reasons: ['entry heading'], tokenHits: 1, zone: 'main' as CandidateZone, semanticScore: 0.35, personaScore: 0.1, sequenceScore: 0.6, selectorStabilityBonus: 0, selectorFragilityPenalty: 0, actionabilityPenalty: 0 }
-    : null;
+  const entry =
+    heading && isStableSelectorForPublish(buildUniqueSelector(heading))
+      ? {
+          element: heading,
+          selector: buildUniqueSelector(heading),
+          label: normalizeText(heading.textContent),
+          score: 72,
+          confidence: 68,
+          intent: 'discovery' as const,
+          reasons: ['entry heading'],
+          tokenHits: 1,
+          zone: 'main' as CandidateZone,
+          semanticScore: 0.35,
+          personaScore: 0.1,
+          sequenceScore: 0.6,
+          selectorStabilityBonus: 0,
+          selectorFragilityPenalty: 0,
+          actionabilityPenalty: 0,
+        }
+      : null;
 
   const orderedCandidates = candidates
     .filter(isSequenceCandidate)
@@ -2531,52 +3520,136 @@ function buildSequenceDraft(
       return b.score - a.score;
     });
 
-  const action = primary || orderedCandidates.find((candidate) => candidate.intent === 'primary-action') || orderedCandidates[0] || null;
-  const validation = form || orderedCandidates.find((candidate) => candidate.intent === 'form-flow' || /confirm|validate|submit|save|valider|confirmer|soumettre/i.test(candidate.label)) || null;
+  const dedicatedPrimaryDraftExists = Boolean(primary);
+  const action = dedicatedPrimaryDraftExists
+    ? null
+    : primary || orderedCandidates.find((candidate) => candidate.intent === 'primary-action') || orderedCandidates[0] || null;
+  const formContext = hasFormContextInCandidates(candidates);
+  const navContext = hasNavigationContextInCandidates(candidates);
+  const navStep =
+    formContext && navContext
+      ? pickSequenceNavigationStep([orderedCandidates, candidates], options, primary)
+      : null;
+  const followUp = resolveSequenceFollowUpCandidate(orderedCandidates, candidates, options, form, primary);
   const result =
-    orderedCandidates.find((candidate) => /result|status|done|complete|success|résultat|terminé/i.test(candidate.label)) ||
-    support ||
-    orderedCandidates[1] ||
-    null;
+    orderedCandidates.find(
+      (candidate) => isCoreSequenceCandidate(candidate, options) && SEQUENCE_RESULT_LABEL.test(candidate.label),
+    ) || (support && isCoreSequenceCandidate(support, options) ? support : null) || null;
 
-  const chain = [entry, action, validation, result].filter(Boolean) as Array<DetectedElement | { element: HTMLElement; selector: string; label: string; score: number; confidence: number; intent: TourDraftIntent; reasons: string[]; tokenHits: number; zone: CandidateZone; semanticScore: number; personaScore: number; sequenceScore: number; selectorStabilityBonus: number; selectorFragilityPenalty: number; actionabilityPenalty: number }>;
+  let chain = [entry, action, navStep, followUp, result].filter(Boolean) as Array<
+    DetectedElement | {
+      element: HTMLElement;
+      selector: string;
+      label: string;
+      score: number;
+      confidence: number;
+      intent: TourDraftIntent;
+      reasons: string[];
+      tokenHits: number;
+      zone: CandidateZone;
+      semanticScore: number;
+      personaScore: number;
+      sequenceScore: number;
+      selectorStabilityBonus: number;
+      selectorFragilityPenalty: number;
+      actionabilityPenalty: number;
+    }
+  >;
+
+  if (dedicatedPrimaryDraftExists && primary?.selector) {
+    chain = chain.filter((candidate) => candidate.selector !== primary.selector);
+  }
+
   const uniqueChain = chain.filter((candidate, index) => chain.findIndex((item) => item.selector === candidate.selector) === index);
 
-  if (uniqueChain.length < 3) return null;
+  if (uniqueChain.length < 2) return null;
 
   const hasActionableStep = uniqueChain.some((candidate) => isActionableElement(candidate.element));
   if (!hasActionableStep) return null;
 
-  const steps: Step[] = uniqueChain.slice(0, 4).map((candidate, index) => {
-    const titles = ['Point d\'entrée', 'Action clé', 'Validation', 'Résultat'];
-    const actions: Step['action'][] = ['NEXT', 'CLICK', 'CLICK', 'NEXT'];
-    const positions: PositionType[] = ['BOTTOM', 'BOTTOM', 'RIGHT', 'TOP'];
+  const steps: Step[] = uniqueChain.map((candidate, index) => {
+    const isEntry = candidate === entry;
+    const isActionStep = candidate === action;
+    const isNavStep = candidate === navStep;
+    const isFollowUp = candidate === followUp;
+    const isResult = candidate === result;
+    const selector = candidate.selector;
+
+    let title = `Etape ${index + 1}`;
+    let content = `Continuer le flux: ${candidate.label}.`;
+    let stepAction: Step['action'] = 'NEXT';
+    let position: PositionType = 'BOTTOM';
+    let followUpRole: SequenceFollowUpRole | null = null;
+
+    if (isEntry) {
+      title = 'Point d\'entrée';
+      const entryLabel = candidate.label || '';
+      const mentionsNavAndForm = /navigation/i.test(entryLabel) && /formulaire|form/i.test(entryLabel);
+      content = mentionsNavAndForm
+        ? `Ce parcours enchaîne la navigation métier puis le formulaire à partir de: ${entryLabel}.`
+        : `Le parcours commence ici avec le contexte visible: ${entryLabel}.`;
+    } else if (isActionStep) {
+      title = 'Action clé';
+      content = `L'IA légère classe cette action comme la plus probable pour lancer le flux: ${candidate.label}.`;
+      stepAction = 'CLICK';
+    } else if (isNavStep) {
+      const chainCandidate = chainMemberToDetected(candidate as DetectedElement);
+      const navCopy = buildSequenceFollowUpStepCopy(chainCandidate, 'navigation');
+      title = navCopy.title;
+      content = navCopy.content;
+      stepAction = navCopy.action;
+      position = 'RIGHT';
+    } else if (isFollowUp) {
+      const chainCandidate = chainMemberToDetected(candidate as DetectedElement);
+      followUpRole = classifySequenceFollowUpRole(chainCandidate);
+      const followUpCopy = buildSequenceFollowUpStepCopy(chainCandidate, followUpRole);
+      title = followUpCopy.title;
+      content = followUpCopy.content;
+      stepAction = followUpCopy.action;
+      position = followUpRole === 'form-field' ? 'RIGHT' : 'BOTTOM';
+    } else if (isResult) {
+      title = 'Résultat';
+      content = `Le résultat ou l'état final attendu se trouve ici: ${candidate.label}.`;
+      position = 'TOP';
+    }
+
     return buildStep(
-      titles[index] || `Etape ${index + 1}`,
-      index === 0
-        ? `Le parcours commence ici avec le contexte visible: ${candidate.label}.`
-        : index === 1
-          ? `L'IA légère classe cette action comme la plus probable pour lancer le flux: ${candidate.label}.`
-          : index === 2
-            ? `Cette étape correspond à la validation ou à l'envoi du flux: ${candidate.label}.`
-            : `Le résultat ou l'état final attendu se trouve ici: ${candidate.label}.`,
+      title,
+      content,
       candidate.element,
-      positions[index] || 'BOTTOM',
-      actions[index] || 'NEXT',
+      position,
+      stepAction,
       {
         intent: candidate.intent,
         stepIndex: index,
-        totalSteps: Math.min(4, uniqueChain.length),
+        totalSteps: uniqueChain.length,
+      },
+      {
+        isPrimary:
+          isActionStep || (dedicatedPrimaryDraftExists && isFollowUp && followUpRole === 'form-submit' && stepAction === 'CLICK'),
+        targetSelector: selector,
       },
     );
   });
+  if (!steps.some((step) => step.isPrimary)) {
+    const firstClick = steps.findIndex((step) => step.action === 'CLICK');
+    if (firstClick >= 0) {
+      steps[firstClick] = { ...steps[firstClick], isPrimary: true };
+    }
+  }
 
-  const sequenceScore = uniqueChain.reduce((total, candidate) => total + candidate.sequenceScore + candidate.semanticScore, 0) / uniqueChain.length;
-  const sequenceSelectorStabilityBonus = uniqueChain.reduce((total, candidate) => total + candidate.selectorStabilityBonus, 0) / uniqueChain.length;
-  const sequenceSelectorFragilityPenalty = uniqueChain.reduce((total, candidate) => total + candidate.selectorFragilityPenalty, 0) / uniqueChain.length;
-  const sequenceActionabilityPenalty = uniqueChain.reduce((total, candidate) => total + candidate.actionabilityPenalty, 0) / uniqueChain.length;
-  const confidence = Math.min(100, Math.round(58 + sequenceScore * 30 + uniqueChain.length * 4));
-  if (confidence < 45) return null;
+  const chainDetected = uniqueChain.map((candidate) => chainMemberToDetected(candidate as DetectedElement));
+  const sequenceReasons = [
+    'sequence detection enabled',
+    ...(entry ? ['entry detected'] : []),
+    ...(action ? action.reasons.slice(0, 2) : []),
+      ...(navStep ? ['navigation step detected'] : []),
+      ...(followUp ? ['follow-up step detected'] : []),
+    ...(result ? ['result detected'] : []),
+  ];
+  const metrics = computeHeuristicDraftScores('discovery', steps, chainDetected, sequenceReasons, options);
+  if (metrics.confidence < 45) return null;
+
   const previewContext = buildPreviewContextSnapshot(
     uniqueChain.map((candidate) => ({
       element: candidate.element,
@@ -2590,29 +3663,23 @@ function buildSequenceDraft(
     generatedBy: 'contextual-tour-generator',
     generatedAt: new Date().toISOString(),
     intent: 'discovery',
-    score: Math.min(100, Math.round(sequenceScore * 100)),
-    confidence,
-    semanticScore: Math.round(sequenceScore * 100),
-    sequenceScore: Math.round(sequenceScore * 100),
-    reasons: [
-      'sequence detection enabled',
-      ...(entry ? ['entry detected'] : []),
-      ...(action ? action.reasons.slice(0, 2) : []),
-      ...(validation ? ['validation detected'] : []),
-      ...(result ? ['result detected'] : []),
-    ],
+    score: metrics.score,
+    confidence: metrics.confidence,
+    semanticScore: metrics.semanticScore,
+    sequenceScore: metrics.sequenceScore,
+    reasons: [...sequenceReasons, ...metrics.adjustments],
     detectedSelectors: uniqueChain.map((candidate) => candidate.selector),
     explainability: explainabilityEnabled(options)
       ? {
           generatedFrom: ['sequence detection enabled', 'ordered candidate chain', 'semantic + sequence scoring'],
           sourceCandidateCount: uniqueChain.length,
           signalScores: {
-            semantic: Math.round(sequenceScore * 100),
-            sequence: Math.round(sequenceScore * 100),
-            confidence,
-            selectorStabilityBonus: Math.round(sequenceSelectorStabilityBonus),
-            selectorFragilityPenalty: Math.round(sequenceSelectorFragilityPenalty),
-            actionabilityPenalty: Math.round(sequenceActionabilityPenalty),
+            semantic: metrics.semanticScore,
+            sequence: metrics.sequenceScore,
+            confidence: metrics.confidence,
+            selectorStabilityBonus: metrics.selectorStabilityBonus,
+            selectorFragilityPenalty: metrics.selectorFragilityPenalty,
+            actionabilityPenalty: metrics.actionabilityPenalty,
           },
           conflictNotes: [],
         }
@@ -2723,6 +3790,84 @@ function toBlueprintReportEntry(report: BlueprintResolutionReport) {
   };
 }
 
+/**
+ * Async wrapper around `generateContextualTourDrafts` that optionally
+ * fetches backend semantic hints (when `semanticEngineMode` is
+ * `'hybrid'` or `'backend'` and `semanticBackendUrl` is configured) and
+ * merges them with the local semantic inference. On timeout / error /
+ * disabled mode, this falls through to the sync local path without any
+ * regression vs. the legacy heuristic behavior.
+ */
+export async function generateContextualTourDraftsAsync(
+  options?: TourDraftGenerationOptions,
+): Promise<SuggestedTourDraft[]> {
+  if (typeof document === 'undefined') return [];
+  if (options?.semanticEnhancementEnabled !== true) {
+    return generateContextualTourDrafts(options);
+  }
+  const mode = options?.semanticEngineMode ?? 'hybrid';
+  if (mode === 'local') {
+    return generateContextualTourDrafts(options);
+  }
+
+  // Honour the DOM-settled gate before doing any work: in async mode we
+  // can actively wait for the DOM to quiesce before scanning, which is
+  // much friendlier than the sync path's "skip and try later" behavior.
+  // If the gate cannot prove stability after the max wait, we fall
+  // through to the sync local-only path which will record the bypass
+  // reason in the debug report.
+  const stability = await waitForDomToSettle(options);
+  if (!stability.stable) {
+    return generateContextualTourDrafts(options);
+  }
+
+  let preCandidates: DetectedElement[] = [];
+  try {
+    preCandidates = collectCandidates(options);
+  } catch {
+    return generateContextualTourDrafts(options);
+  }
+  if (preCandidates.length === 0) {
+    return generateContextualTourDrafts(options);
+  }
+
+  const inputs = buildSemanticInputs(preCandidates);
+  const snapshot = buildSemanticPageSnapshot(inputs, options);
+  const request = {
+    snapshot,
+    candidates: inputs.map((candidate) => ({
+      selector: candidate.selector,
+      label: candidate.label,
+      tag: candidate.element.tagName.toLowerCase(),
+      intent: candidate.intent,
+      zone: candidate.zone,
+    })),
+    hints: options?.semanticHints,
+    objectives: options?.businessObjectives,
+    persona: typeof options?.persona === 'string' ? options?.persona : undefined,
+    pathname: typeof window !== 'undefined' ? window.location.pathname : undefined,
+  };
+
+  let inferenceResult;
+  try {
+    inferenceResult = await fetchBackendSemanticHints(request, options);
+  } catch {
+    inferenceResult = {
+      status: 'error' as const,
+      hints: [],
+      preferredOrder: null,
+      implementation: null,
+    };
+  }
+
+  pendingBackendSemanticHints = inferenceResult;
+  try {
+    return generateContextualTourDrafts(options);
+  } finally {
+    pendingBackendSemanticHints = null;
+  }
+}
+
 export function generateContextualTourDrafts(options?: TourDraftGenerationOptions): SuggestedTourDraft[] {
   if (typeof document === 'undefined') return [];
 
@@ -2786,20 +3931,105 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
     return [];
   }
 
-  const heading = getPageHeading();
+  const heading = getPageHeading(options);
   const headingSelector = heading ? buildUniqueSelector(heading) : '';
   const primary =
     pickBestPrimaryActionCandidate(candidates, headingSelector ? [headingSelector] : []) ||
     pickBestCandidate(candidates, 'primary-action') ||
     pickBestActionableCandidate(candidates, headingSelector ? [headingSelector] : []) ||
     pickAnyCandidate(candidates, headingSelector ? [headingSelector] : []);
+
+  // Phase 4: hybrid semantic enhancement layer. The legacy heuristic
+  // pipeline above is the source of truth; the semantic layer is opt-in
+  // and only nudges the score/copy of generated drafts within bounded
+  // margins (see `applySemanticFusionToDraft`).
+  const stashedBackendHints = pendingBackendSemanticHints;
+  pendingBackendSemanticHints = null;
+  const semanticContext: SemanticContext | null = (() => {
+    if (options?.semanticEnhancementEnabled !== true) return null;
+    try {
+      const inputs = buildSemanticInputs(candidates);
+      const snapshot = buildSemanticPageSnapshot(inputs, options);
+      const mode = (options?.semanticEngineMode ?? 'hybrid') as 'local' | 'hybrid' | 'backend';
+      const stability = evaluateDomStability(options);
+
+      // DOM-stability gate. When the DOM is still settling (lazy mount,
+      // Suspense, streaming SSR), we keep the legacy heuristic output
+      // and skip the semantic enhancement entirely. We still build a
+      // "telemetry-only" context so the lab can SEE that semantic was
+      // bypassed and why — instead of silently returning to legacy.
+      if (!stability.stable) {
+        return {
+          enabled: false,
+          engineMode: mode,
+          snapshot,
+          rolesBySelector: new Map(),
+          backendSelectors: new Set(),
+          mergedSelectors: new Set(),
+          preferredOrder: null,
+          backendStatus: stashedBackendHints?.status ?? (mode === 'local' ? 'disabled' : 'unconfigured'),
+          backendImplementation: stashedBackendHints?.implementation ?? null,
+          domStability: stability,
+          draftReports: [],
+        };
+      }
+
+      const localRoles = inputs.map((candidate) => classifyCandidate(candidate, snapshot));
+      const localBySelector = new Map<string, SemanticCandidateRole>();
+      for (const role of localRoles) localBySelector.set(role.selector, role);
+
+      const backendSelectors = new Set<string>();
+      const mergedSelectors = new Set<string>();
+      let finalRoles: SemanticCandidateRole[] = localRoles;
+      if (stashedBackendHints?.hints?.length) {
+        finalRoles = mergeBackendHints(localRoles, stashedBackendHints.hints);
+        const hintBySelector = new Map(stashedBackendHints.hints.map((hint) => [hint.selector, hint]));
+        for (const role of finalRoles) {
+          const local = localBySelector.get(role.selector);
+          const backend = hintBySelector.get(role.selector);
+          if (!backend) continue;
+          if (local && role.role === backend.role && role.role !== local.role) {
+            backendSelectors.add(role.selector);
+          } else if (local) {
+            mergedSelectors.add(role.selector);
+          }
+        }
+      }
+
+      const rolesBySelector = new Map<string, SemanticCandidateRole>();
+      for (const role of finalRoles) rolesBySelector.set(role.selector, role);
+      const backendStatus: BackendSemanticInferenceStatus = stashedBackendHints
+        ? stashedBackendHints.status
+        : mode === 'local'
+          ? 'disabled'
+          : 'unconfigured';
+      return {
+        enabled: true,
+        engineMode: mode,
+        snapshot,
+        rolesBySelector,
+        backendSelectors,
+        mergedSelectors,
+        preferredOrder: stashedBackendHints?.preferredOrder ?? null,
+        backendStatus,
+        backendImplementation: stashedBackendHints?.implementation ?? null,
+        domStability: stability,
+        draftReports: [],
+      };
+    } catch {
+      return null;
+    }
+  })();
   const support = generationProfile.includeSupportDraft ? pickBestCandidate(candidates, 'support-navigation') : null;
   const navigation = generationProfile.includeNavigationDraft ? pickAnyCandidate(candidates, [primary?.selector || ''], ['navigation', 'sidebar', 'main']) : null;
   const form = generationProfile.includeFormDraft ? pickBestCandidate(candidates, 'form-flow') : null;
 
   const drafts: SuggestedTourDraft[] = [];
 
-  if (heading && primary) {
+  // Analyse limitée à un conteneur : le séquentiel couvre déjà l'entrée — éviter un 3e draft découverte redondant.
+  const skipHeadingDiscoveryDraft = hasScopedAnalysis(options);
+
+  if (heading && primary && !skipHeadingDiscoveryDraft) {
     const usedSelectors = new Set<string>([primary.selector, ...(headingSelector ? [headingSelector] : [])]);
     const steps: Step[] = [
       buildStep(
@@ -2858,12 +4088,24 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
       targetUrl,
       options,
     );
+    applySemanticFusionToDraft(draft, semanticContext, options);
 
     if (steps.length >= 2 && draft.score >= minScore) drafts.push(draft);
   }
 
   if (primary) {
-    const secondary = pickBestActionableCandidate(candidates, [primary.selector]) || pickAnyCandidate(candidates, [primary.selector]);
+    const scopedAnalysis = hasScopedAnalysis(options);
+    const sequenceCompanionDraft = scopedAnalysis && options?.enableSequenceDetection !== false;
+    const excludedAfterPrimary = [primary.selector];
+    const secondary = sequenceCompanionDraft
+      ? null
+      : pickBestActionableCandidate(
+          candidates.filter((candidate) => candidate.intent === 'primary-action' || candidate.intent === 'form-flow'),
+          excludedAfterPrimary,
+        ) ||
+        pickBestCandidate(candidates, 'form-flow', excludedAfterPrimary) ||
+        pickBestActionableCandidate(candidates, excludedAfterPrimary) ||
+        pickAnyCandidate(candidates, excludedAfterPrimary);
     const steps: Step[] = [
       buildStep(
         'Action principale',
@@ -2875,6 +4117,10 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
           intent: primary.intent,
           stepIndex: 0,
           totalSteps: maxSteps,
+        },
+        {
+          isPrimary: true,
+          targetSelector: primary.selector,
         },
       ),
     ];
@@ -2897,7 +4143,12 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
       );
     }
 
-    if (form && !steps.some((step) => step.targetSelector === form.selector) && steps.length < maxSteps) {
+    if (
+      form &&
+      !sequenceCompanionDraft &&
+      !steps.some((step) => step.targetSelector === form.selector) &&
+      steps.length < maxSteps
+    ) {
       const formCopy = buildSecondaryStepCopy(form, 'form-flow');
       steps.push(
         buildStep(
@@ -2925,6 +4176,7 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
       targetUrl,
       options,
     );
+    applySemanticFusionToDraft(draft, semanticContext, options);
 
     if (draft.score >= minScore) drafts.push(draft);
   }
@@ -2973,6 +4225,7 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
       targetUrl,
       options,
     );
+    applySemanticFusionToDraft(draft, semanticContext, options);
 
     if (draft.score >= minScore) drafts.push(draft);
   }
@@ -3003,14 +4256,18 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
       targetUrl,
       options,
     );
+    applySemanticFusionToDraft(draft, semanticContext, options);
 
     if (draft.score >= minScore) drafts.push(draft);
   }
 
   if (options?.enableSequenceDetection !== false) {
     const sequenceDraft = buildSequenceDraft(candidates, heading, primary, support, form, targetUrl, options);
-    if (sequenceDraft && sequenceDraft.score >= minScore && sequenceDraft.confidence >= minConfidence) {
-      drafts.push(sequenceDraft);
+    if (sequenceDraft) {
+      applySemanticFusionToDraft(sequenceDraft, semanticContext, options);
+      if (sequenceDraft.score >= minScore && sequenceDraft.confidence >= minConfidence) {
+        drafts.push(sequenceDraft);
+      }
     }
   }
 
@@ -3145,6 +4402,38 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
       rejectedAsTrivial: qualityRejected.length,
       rejectedReasons: qualityFilterCounts,
     },
+    semanticEnhancement: semanticContext
+      ? {
+          enabled: semanticContext.enabled,
+          engineMode: semanticContext.engineMode,
+          backendUsed: semanticContext.backendStatus === 'ok',
+          backendStatus: semanticContext.backendStatus,
+          minRoleConfidence: MIN_SEMANTIC_ROLE_CONFIDENCE,
+          validationPhase: deriveValidationPhase(semanticContext),
+          backendImplementation: deriveBackendImplementationReport(semanticContext),
+          domStability: {
+            stable: semanticContext.domStability.stable,
+            domAgeMs:
+              semanticContext.domStability.domAgeMs === Number.POSITIVE_INFINITY
+                ? -1
+                : Math.round(semanticContext.domStability.domAgeMs),
+            requiredAgeMs: semanticContext.domStability.requiredAgeMs,
+            observerInstalled: semanticContext.domStability.observerInstalled,
+            ...(semanticContext.domStability.bypassReason
+              ? { bypassReason: semanticContext.domStability.bypassReason }
+              : {}),
+          },
+          calibrationNote: LOCAL_ENGINE_CALIBRATION_NOTE,
+          pageSummary: {
+            hasForm: semanticContext.snapshot.hasForm,
+            hasNavigation: semanticContext.snapshot.hasNavigation,
+            formFieldCount: semanticContext.snapshot.formFieldCount,
+            navigationLinkCount: semanticContext.snapshot.navigationLinkCount,
+            ctaCount: semanticContext.snapshot.ctaCount,
+          },
+          drafts: semanticContext.draftReports,
+        }
+      : undefined,
   };
 
   activeDiagnostics = null;

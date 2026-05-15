@@ -2,6 +2,12 @@ export * from './useActiveToursForUrl';
 export * from './useFrictionDetection';
 export * from './useFrictionScore';
 export * from './useContextualTourSuggestions';
+export {
+  removeAutoPublishedSignaturesForTour,
+  computeAutoPublishDedupeSignatureFromTour,
+  reconcileAutoPublishedSessionWithTours,
+  pruneAutoPublishedSessionAgainstExistingTourIds,
+} from '../utils/auto-publish-session-dedupe';
 export * from './useOnboarding';
 export * from './useOnboardingDebug';
 export * from './useOnboardingSession';
