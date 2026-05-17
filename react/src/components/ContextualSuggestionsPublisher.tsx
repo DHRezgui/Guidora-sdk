@@ -1,6 +1,7 @@
 import { CSSProperties, useEffect, useMemo, useState } from 'react';
-import { SuggestedTourDraft } from '../types';
+import { ContextualScenario, SuggestedTourDraft } from '../types';
 import { UseContextualTourSuggestionsOptions, useContextualTourSuggestions } from '../hooks/useContextualTourSuggestions';
+import { isTrustdevContextualPanelSelector } from '../utils/tour-suggestion-generator';
 
 export type ContextualSuggestionsUIMode = 'auto' | 'hidden' | 'manual' | 'debug';
 
@@ -38,12 +39,28 @@ const HREF_ANCHOR_STABLE_PATTERN = /^a\[href=/;
 
 function isStableSelector(selector?: string): boolean {
   if (!selector) return false;
+  if (isTrustdevContextualPanelSelector(selector)) return false;
   if (STABLE_SELECTOR_HINTS.some((hint) => selector.includes(hint))) return true;
   if (HREF_ANCHOR_STABLE_PATTERN.test(selector)) return true;
   return false;
 }
 
-function isStableDraft(draft: SuggestedTourDraft): boolean {
+function hasCompleteFingerprint(step: SuggestedTourDraft['steps'][number]): boolean {
+  const fp = step.targetFingerprint;
+  return Boolean(fp?.tagName && fp?.role && (fp?.textSample || '').trim().length >= 3);
+}
+
+function isSemanticCompensationEligible(
+  step: SuggestedTourDraft['steps'][number],
+  scenario: ContextualScenario,
+): boolean {
+  if (scenario === 'stress') return false;
+  const confidence = typeof step.semanticRoleConfidence === 'number' ? step.semanticRoleConfidence : 0;
+  const stability = typeof step.stabilityScore === 'number' ? step.stabilityScore : 0;
+  return confidence >= 0.75 && stability >= 40 && hasCompleteFingerprint(step);
+}
+
+function isStableDraft(draft: SuggestedTourDraft, scenario: ContextualScenario): boolean {
   if (draft.steps.length === 0) return false;
   // Journey-blueprint drafts are intrinsically business-meaningful and built
   // from a curated template + a deterministic resolver: their selectors come
@@ -53,7 +70,13 @@ function isStableDraft(draft: SuggestedTourDraft): boolean {
   // legacy heuristic drafts where any kind of fragile selector
   // (e.g. `:nth-child(...)`) could sneak in.
   if (draft.origin?.kind === 'blueprint') return true;
-  return draft.steps.every((step) => isStableSelector(step.targetSelector));
+  return draft.steps.every((step) => {
+    if (isStableSelector(step.targetSelector)) return true;
+    if ((step.stabilityScore ?? 0) >= 70) return true;
+    if (step.selectorAlternatives?.some((selector) => isStableSelector(selector))) return true;
+    if (isSemanticCompensationEligible(step, scenario)) return true;
+    return false;
+  });
 }
 
 function resolveUIMode(
@@ -88,9 +111,10 @@ export function ContextualSuggestionsPublisher({
   const [publishPressed, setPublishPressed] = useState(false);
 
   const mode = resolveUIMode(uiMode, autoPublish, developerMode);
+  const publishScenario = options.publishScenario ?? 'medium';
   const publishableDrafts = useMemo(
-    () => (stableOnly ? suggestions.drafts.filter(isStableDraft) : suggestions.drafts),
-    [stableOnly, suggestions.drafts],
+    () => (stableOnly ? suggestions.drafts.filter((draft) => isStableDraft(draft, publishScenario)) : suggestions.drafts),
+    [stableOnly, suggestions.drafts, publishScenario],
   );
   const debugReport = suggestions.getDebugReport();
   const flowRegistry = suggestions.getFlowRegistry();
@@ -138,9 +162,14 @@ export function ContextualSuggestionsPublisher({
     setLocalMessage('Feedback reset (local + remote cache cleared).');
   };
 
+  const panelClassName = ['trustdev-contextual-debug-panel', className].filter(Boolean).join(' ');
+
   return (
     <div
-      className={className}
+      className={panelClassName}
+      data-trustdev-contextual-panel="true"
+      role="region"
+      aria-label="Trustdev contextual suggestions panel"
       style={{
         position: 'fixed',
         right: 16,
@@ -201,7 +230,7 @@ export function ContextualSuggestionsPublisher({
           <div style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
             <button
               type="button"
-              onClick={() => suggestions.refresh()}
+              onClick={() => void suggestions.refresh()}
               disabled={suggestions.isGenerating || suggestions.isPublishing}
               style={{
                 border: '1px solid rgba(255,255,255,0.22)',
@@ -303,6 +332,43 @@ export function ContextualSuggestionsPublisher({
                   <div>
                     After max drafts cap: <strong>{debugReport.draftMetrics.afterMaxDrafts}</strong>
                   </div>
+                  {debugReport.singlePageChainSlots?.length ? (
+                    <>
+                      <div style={{ marginTop: 6, marginBottom: 6, fontWeight: 700 }}>
+                        Single-page chain (7 slots)
+                      </div>
+                      {debugReport.singlePageChainSlots.map((row) => (
+                        <div
+                          key={`slot-${row.slot}-${row.slotId}`}
+                          style={{
+                            marginBottom: 2,
+                            color: row.status === 'filled' ? '#86efac' : '#94a3b8',
+                          }}
+                        >
+                          {row.line}
+                        </div>
+                      ))}
+                    </>
+                  ) : null}
+                  {debugReport.candidateRankings?.length ? (
+                    <>
+                      <div style={{ marginTop: 6, marginBottom: 6, fontWeight: 700 }}>
+                        Candidate rankings (top 5 / intent)
+                      </div>
+                      {debugReport.candidateRankings.map((group) => (
+                        <div key={group.intent} style={{ marginBottom: 8 }}>
+                          <div style={{ fontWeight: 600, marginBottom: 4, color: '#cbd5f5' }}>
+                            {group.intent}
+                          </div>
+                          {group.lines.map((line, idx) => (
+                            <div key={`${group.intent}-${idx}`} style={{ marginBottom: 2, color: '#e2e8f0' }}>
+                              {line}
+                            </div>
+                          ))}
+                        </div>
+                      ))}
+                    </>
+                  ) : null}
                   {debugReport.conflicts?.length ? (
                     <div style={{ marginTop: 6, color: '#fdba74' }}>
                       Conflicts resolved: {debugReport.conflicts.length}
@@ -396,6 +462,44 @@ export function ContextualSuggestionsPublisher({
                       ))}
                     </>
                   ) : null}
+                  {debugReport.semanticEnhancement ? (
+                    <>
+                      <div style={{ marginTop: 6, marginBottom: 6, fontWeight: 700, color: '#c4b5fd' }}>
+                        Semantic layer
+                      </div>
+                      {(() => {
+                        const sem = debugReport.semanticEnhancement;
+                        const impl = sem.backendImplementation;
+                        const dom = sem.domStability;
+                        const draftCount = sem.drafts?.length ?? 0;
+                        const stepTotal =
+                          sem.drafts?.reduce((acc, d) => acc + (d.steps?.length ?? 0), 0) ?? 0;
+                        const line1 = [
+                          sem.enabled ? 'layer on' : 'layer off (telemetry)',
+                          `engine ${sem.engineMode}`,
+                          `backend ${sem.backendStatus ?? (sem.backendUsed ? 'ok' : '—')}`,
+                        ].join(' · ');
+                        const implBits = [
+                          impl.kind,
+                          impl.model ? `model ${impl.model}` : null,
+                          impl.fallbackReason ? `fallback ${impl.fallbackReason}` : null,
+                        ].filter(Boolean);
+                        const line2 = `validation ${sem.validationPhase} · ${implBits.join(' · ') || 'impl n/a'}`;
+                        const domLine =
+                          dom.stable === false && dom.bypassReason
+                            ? `DOM bypass (${dom.bypassReason})`
+                            : `DOM ${dom.stable ? 'stable' : 'unstable'} · age ${dom.domAgeMs < 0 ? '∞' : `${dom.domAgeMs}ms`} / ≥${dom.requiredAgeMs}ms`;
+                        const line3 = `${domLine} · fusion reviewed ${draftCount} draft(s), ${stepTotal} step(s)`;
+                        return (
+                          <>
+                            <div style={{ fontSize: 11, color: '#e9d5ff', marginBottom: 3 }}>{line1}</div>
+                            <div style={{ fontSize: 11, color: '#ddd6fe', marginBottom: 3 }}>{line2}</div>
+                            <div style={{ fontSize: 11, color: '#cbd5f5' }}>{line3}</div>
+                          </>
+                        );
+                      })()}
+                    </>
+                  ) : null}
                   {debugReport.qualityFilter && debugReport.qualityFilter.rejectedAsTrivial > 0 ? (
                     <>
                       <div style={{ marginTop: 6, marginBottom: 6, fontWeight: 700 }}>
@@ -468,6 +572,19 @@ export function ContextualSuggestionsPublisher({
                     <div>Steps: {draft.steps.length}</div>
                     <div>Target: {draft.targetUrl}</div>
                     <div>Step 1 selector: {draft.steps[0]?.targetSelector || 'N/A'}</div>
+                    {Array.isArray((draft.metadata as { instrumentationSuggestions?: unknown } | undefined)?.instrumentationSuggestions) ? (
+                      <div style={{ marginTop: 4, color: '#fdba74', fontSize: 11 }}>
+                        Anchor hints:{' '}
+                        {(
+                          (draft.metadata as {
+                            instrumentationSuggestions?: Array<{ suggestedTourId?: string; stabilityScore?: number }>;
+                          }).instrumentationSuggestions || []
+                        )
+                          .slice(0, 2)
+                          .map((hint) => `${hint.suggestedTourId || 'tour-action'} (${Math.round(hint.stabilityScore ?? 0)}%)`)
+                          .join(' · ')}
+                      </div>
+                    ) : null}
                     {draft.steps.some((s) => s.stepTargetUrl) ? (
                       <div style={{ fontSize: 11, color: '#86efac', marginTop: 2 }}>
                         Multi-page tour: visits{' '}

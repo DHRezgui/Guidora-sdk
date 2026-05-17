@@ -34,6 +34,7 @@ const {
   buildSemanticStepCopy,
   runLocalSemanticInference,
   mergeBackendHints,
+  __applyPreferredSemanticOrderForTests,
   __resetSemanticDomMutationTrackerForTests,
   generateContextualTourDraftsAsync,
 } = sdk;
@@ -310,6 +311,18 @@ test('generateContextualTourDraftsAsync is exported and async', () => {
   assert.equal(typeof generateContextualTourDraftsAsync, 'function');
   const result = generateContextualTourDraftsAsync({ semanticEnhancementEnabled: false });
   assert.ok(result && typeof result.then === 'function', 'should return a Promise');
+});
+
+test('sequencer post-processing keeps orderIndex in sync', () => {
+  assert.equal(typeof __applyPreferredSemanticOrderForTests, 'function');
+  const input = [
+    { title: 'Step A', content: 'A', targetSelector: '#a', orderIndex: 7 },
+    { title: 'Step B', content: 'B', targetSelector: '#b', orderIndex: 2 },
+    { title: 'Step C', content: 'C', targetSelector: '#c' },
+  ];
+  const out = __applyPreferredSemanticOrderForTests(input, ['#b', '#c', '#a']);
+  assert.deepEqual(out.map((s) => s.targetSelector), ['#b', '#c', '#a']);
+  assert.deepEqual(out.map((s) => s.orderIndex), [0, 1, 2]);
 });
 
 let failed = 0;

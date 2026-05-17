@@ -2,6 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { sdkApiClient } from '../core/api-client';
 import { resolveSDKConfig } from '../core/sdk-state';
 import { GuidedTour, SDKConfig, Step } from '../types';
+import {
+  filterActiveToursByFlowVersion,
+  getActiveTourSessionStorageKey,
+  isActiveTourSnapshotCompatible,
+} from '../utils/tour-flow-version';
 import { increaseVisitCount } from '../utils/storage';
 import { getCurrentPageUrl } from '../utils/url';
 import { useActiveToursForUrl } from './useActiveToursForUrl';
@@ -20,9 +25,9 @@ export interface UseOnboardingOptions {
   autoStart?: boolean;
   debug?: boolean;
   role?: string;
+  /** When set (e.g. contextualSuggestions.flowVersion), only active tours for this flow are started. */
+  activeFlowVersion?: string;
 }
-
-const ACTIVE_TOUR_SESSION_KEY = '__trustdev_active_tour_session_v1';
 
 type ActiveTourSessionSnapshot = {
   tour: GuidedTour;
@@ -30,10 +35,10 @@ type ActiveTourSessionSnapshot = {
   savedAt: number;
 };
 
-function readActiveTourSnapshot(): ActiveTourSessionSnapshot | null {
+function readActiveTourSnapshot(storageKey: string): ActiveTourSessionSnapshot | null {
   if (typeof window === 'undefined') return null;
   try {
-    const raw = window.sessionStorage.getItem(ACTIVE_TOUR_SESSION_KEY);
+    const raw = window.sessionStorage.getItem(storageKey);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as ActiveTourSessionSnapshot;
     if (!parsed?.tour || !Array.isArray(parsed.tour.steps)) return null;
@@ -44,14 +49,14 @@ function readActiveTourSnapshot(): ActiveTourSessionSnapshot | null {
   }
 }
 
-function writeActiveTourSnapshot(snapshot: ActiveTourSessionSnapshot | null): void {
+function writeActiveTourSnapshot(storageKey: string, snapshot: ActiveTourSessionSnapshot | null): void {
   if (typeof window === 'undefined') return;
   try {
     if (!snapshot) {
-      window.sessionStorage.removeItem(ACTIVE_TOUR_SESSION_KEY);
+      window.sessionStorage.removeItem(storageKey);
       return;
     }
-    window.sessionStorage.setItem(ACTIVE_TOUR_SESSION_KEY, JSON.stringify(snapshot));
+    window.sessionStorage.setItem(storageKey, JSON.stringify(snapshot));
   } catch {
     // Ignore session storage write errors.
   }
@@ -126,7 +131,13 @@ export function useOnboarding(options?: UseOnboardingOptions) {
   );
 
   const session = useOnboardingSession();
+  const activeFlowVersion = options?.activeFlowVersion?.trim() || undefined;
+  const activeTourSessionKey = getActiveTourSessionStorageKey(activeFlowVersion);
   const activeTours = useActiveToursForUrl(options?.config, { autoFetch: true, url: pageUrl });
+  const toursForFlow = useMemo(
+    () => filterActiveToursByFlowVersion(activeTours.tours, activeFlowVersion),
+    [activeFlowVersion, activeTours.tours],
+  );
   const tour = useTour({
     autoOpen: false,
     onComplete: (completedTour) => {
@@ -135,7 +146,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       }
       // Prevent immediate restart from stale active tours response.
       suppressAutostartUntilRef.current = Date.now() + 12000;
-      writeActiveTourSnapshot(null);
+      writeActiveTourSnapshot(activeTourSessionKey, null);
       setActiveTour(null);
       void deactivateTour(completedTour, 'complete');
       void activeTours.refresh(pageUrl).catch(() => undefined);
@@ -146,7 +157,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       }
       // Prevent immediate restart from stale active tours response.
       suppressAutostartUntilRef.current = Date.now() + 12000;
-      writeActiveTourSnapshot(null);
+      writeActiveTourSnapshot(activeTourSessionKey, null);
       setActiveTour(null);
       void deactivateTour(skippedTour, 'skip');
       void activeTours.refresh(pageUrl).catch(() => undefined);
@@ -181,7 +192,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
 
   const start = useCallback(
     async (tourToStart?: GuidedTour) => {
-      const candidate = tourToStart || pickTour(activeTours.tours);
+      const candidate = tourToStart || pickTour(toursForFlow);
       if (!candidate) {
         debugInfo('No tour candidate for this page');
         return;
@@ -220,14 +231,14 @@ export function useOnboarding(options?: UseOnboardingOptions) {
         }
       }
     },
-    [activeTours.tours, debugInfo, debugWarn, pageUrl, pickTour, resolver, tour, tourProgress.progress?.stepIndex],
+    [toursForFlow, debugInfo, debugWarn, pageUrl, pickTour, resolver, tour, tourProgress.progress?.stepIndex],
   );
 
   const stop = useCallback(() => {
     tour.closeTour();
-    writeActiveTourSnapshot(null);
+    writeActiveTourSnapshot(activeTourSessionKey, null);
     debugInfo('Tour stopped');
-  }, [debugInfo, tour]);
+  }, [activeTourSessionKey, debugInfo, tour]);
 
   useEffect(() => {
     if (!activeTour?.id) return;
@@ -236,20 +247,24 @@ export function useOnboarding(options?: UseOnboardingOptions) {
 
   useEffect(() => {
     if (!tour.isOpen || !activeTour) return;
-    writeActiveTourSnapshot({
+    writeActiveTourSnapshot(activeTourSessionKey, {
       tour: activeTour,
       stepIndex: tour.currentStepIndex,
       savedAt: Date.now(),
     });
-  }, [activeTour, tour.currentStepIndex, tour.isOpen]);
+  }, [activeTour, activeTourSessionKey, tour.currentStepIndex, tour.isOpen]);
 
   useEffect(() => {
     if (!options?.autoStart) return;
     if (tour.isOpen) return;
     if (isSuppressed()) return;
-    const snapshot = readActiveTourSnapshot();
+    const snapshot = readActiveTourSnapshot(activeTourSessionKey);
     if (!snapshot) return;
     if (snapshot.tour?.id && dismissedTourIdsRef.current.has(snapshot.tour.id)) return;
+    if (!isActiveTourSnapshotCompatible(snapshot.tour, activeFlowVersion)) {
+      writeActiveTourSnapshot(activeTourSessionKey, null);
+      return;
+    }
 
     setActiveTour(snapshot.tour);
     tour.startTour(snapshot.tour, snapshot.stepIndex);
@@ -257,14 +272,14 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       tourId: snapshot.tour.id,
       stepIndex: snapshot.stepIndex,
     });
-  }, [debugInfo, options?.autoStart, tour.isOpen, tour.startTour]);
+  }, [activeFlowVersion, activeTourSessionKey, debugInfo, options?.autoStart, tour.isOpen, tour.startTour]);
 
   useEffect(() => {
     if (!options?.autoStart) return;
     if (tour.isOpen) return;
     if (isSuppressed()) return;
     if (activeTours.loading) return;
-    if (activeTours.tours.length === 0) return;
+    if (toursForFlow.length === 0) return;
     if (!triggerCheck.shouldStart) {
       debugInfo('Tour blocked by trigger conditions', triggerCheck.reasons);
       return;
@@ -297,10 +312,10 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     const maxIdx = Math.max(0, (fresh.steps?.length ?? 1) - 1);
     tour.startTour(fresh, Math.min(tour.currentStepIndex, maxIdx));
     debugInfo('Active tour definition refreshed from server', { tourId: fresh.id });
-  }, [activeTours.tours, activeTours.loading, tour.isOpen, activeTour, tour, debugInfo]);
+  }, [toursForFlow, activeTours.loading, tour.isOpen, activeTour, tour, debugInfo]);
 
   const refresh = useCallback(async () => {
-    const tours = await activeTours.refresh(pageUrl);
+    const tours = filterActiveToursByFlowVersion(await activeTours.refresh(pageUrl), activeFlowVersion);
     const activeTourIds = new Set(tours.map((tourItem) => tourItem.id).filter(Boolean));
     for (const dismissedId of dismissedTourIdsRef.current) {
       if (!activeTourIds.has(dismissedId)) {
@@ -308,7 +323,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       }
     }
     return tours;
-  }, [activeTours.refresh, pageUrl]);
+  }, [activeFlowVersion, activeTours.refresh, pageUrl]);
 
   useRealtimeToursSync({
     enabled: options?.config?.syncEnabled,
@@ -341,7 +356,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     }),
     [
       session,
-      activeTours.tours,
+      toursForFlow,
       activeTour,
       tour,
       friction,

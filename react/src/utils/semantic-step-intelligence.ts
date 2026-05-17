@@ -98,11 +98,61 @@ const SUBMIT_PATTERN =
   /confirm|validate|submit|valider|confirmer|soumettre|enregistrer|publier|sauvegarder|save|prévisualiser|preview|appliquer|apply/i;
 const RESULT_PATTERN = /result|status|done|complete|success|résultat|terminé|termine|fini/i;
 const ENTRY_PATTERN = /bienvenue|welcome|aperçu|apercu|overview|introduction|commencez|get started|prise en main/i;
+const PLACE_ORDER_CTA_PATTERN = /place\s*order|confirm\s*order|commander/i;
+const PAYMENT_METHOD_PATTERN =
+  /\b(cash|credit\s*\/?\s*debit|debit\s*card|credit\s*card|qr\s*code|carte|encaisser|encaissement|checkout|paiement|payment)\b/i;
+const SEARCH_PATTERN = /recherche|search|filtre|filter|sort|trier|chercher/i;
+const ORDER_SUMMARY_PATTERN = /panier|cart|ticket|subtotal|total|commande|table \d+/i;
+
+type SparseEmbedding = Map<string, number>;
+
+const ROLE_EMBEDDING_PROTOTYPES: Record<Exclude<SemanticRole, 'generic-click'>, string[]> = {
+  entry: [
+    'bienvenue introduction overview start here',
+    'point entree commencer prise en main',
+    'home dashboard main context',
+  ],
+  navigation: [
+    'menu navigation section side link',
+    'aller vers section parcourir categories',
+    'sidebar nav linker page',
+  ],
+  'cta-primary': [
+    'action principale lancer demarrer creer',
+    'start create generate activate primary call to action',
+    'nouveau ajouter commander reserver',
+  ],
+  'form-field': [
+    'champ formulaire saisie input recherche filtre',
+    'form field typing entry edit information',
+    'search query find filter input',
+  ],
+  'form-submit': [
+    'valider enregistrer confirmer publier appliquer',
+    'submit save confirm continue checkout',
+    'terminer finaliser envoyer',
+  ],
+  utility: [
+    'reglages options preferences configuration',
+    'settings options preference controls',
+    'paiement encaissement payment cash credit debit',
+  ],
+  secondary: [
+    'aide guide tutoriel documentation learn help',
+    'support onboarding assistance',
+    'decouverte conseils infos',
+  ],
+  result: [
+    'resultat statut termine succes complete',
+    'summary recap state done',
+    'total amount order status',
+  ],
+};
 // Primary-action verbs that signal a top-level CTA distinct from a form
 // submit. Tuned for French + English UI copy. Intentionally narrow: we
 // only want strong verbs, not generic words like "Voir" or "Ouvrir".
 const CTA_PRIMARY_PATTERN =
-  /\b(créer|creer|create|démarrer|demarrer|start|lancer|launch|ajouter|add|nouveau|nouvelle|new|get started|try|essayer|commencer|configurer|générer|generer|generate|inviter|invite|importer|import|exporter|export|connecter|connect|reserver|réserver|book|order|commander|acheter|buy|s'?inscrire|signup|sign up|register|déposer|deposer|upload|construire|build|publier un|publish a|relancer|recharger|rafraîchir|rafraichir|actualiser|refresh|reload|retry|réessayer|reessayer)\b/i;
+  /\b(créer|creer|create|démarrer|demarrer|start|lancer|launch|ajouter|add|nouveau|nouvelle|new|get started|try|essayer|commencer|configurer|générer|generer|generate|inviter|invite|importer|import|exporter|export|connecter|connect|reserver|réserver|book|acheter|buy|s'?inscrire|signup|sign up|register|déposer|deposer|upload|construire|build|publier un|publish a|relancer|recharger|rafraîchir|rafraichir|actualiser|refresh|reload|retry|réessayer|reessayer)\b/i;
 
 function normalize(value: string | null | undefined): string {
   return (value || '').toString().trim();
@@ -114,6 +164,157 @@ function tokenize(value: string): string[] {
     .replace(/[^a-zàâçéèêëîïôûùüÿñ0-9\s]/gi, ' ')
     .split(/\s+/)
     .filter(Boolean);
+}
+
+function buildCharTrigrams(value: string): string[] {
+  const compact = normalize(value)
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (compact.length < 3) return compact ? [compact] : [];
+  const out: string[] = [];
+  for (let i = 0; i <= compact.length - 3; i += 1) {
+    out.push(compact.slice(i, i + 3));
+  }
+  return out;
+}
+
+function buildEmbedding(text: string): SparseEmbedding {
+  const vector: SparseEmbedding = new Map();
+  for (const token of tokenize(text)) {
+    vector.set(`tok:${token}`, (vector.get(`tok:${token}`) || 0) + 1.2);
+  }
+  for (const trigram of buildCharTrigrams(text)) {
+    vector.set(`tri:${trigram}`, (vector.get(`tri:${trigram}`) || 0) + 0.35);
+  }
+  return vector;
+}
+
+function cosineSimilarity(a: SparseEmbedding, b: SparseEmbedding): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (const value of a.values()) normA += value * value;
+  for (const value of b.values()) normB += value * value;
+  const [small, large] = a.size <= b.size ? [a, b] : [b, a];
+  for (const [key, value] of small.entries()) {
+    const other = large.get(key);
+    if (typeof other === 'number') dot += value * other;
+  }
+  if (normA <= 0 || normB <= 0) return 0;
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+let rolePrototypeVectorsCache: Map<Exclude<SemanticRole, 'generic-click'>, SparseEmbedding[]> | null = null;
+
+function getRolePrototypeVectors(): Map<Exclude<SemanticRole, 'generic-click'>, SparseEmbedding[]> {
+  if (rolePrototypeVectorsCache) return rolePrototypeVectorsCache;
+  const cache = new Map<Exclude<SemanticRole, 'generic-click'>, SparseEmbedding[]>();
+  for (const [role, phrases] of Object.entries(ROLE_EMBEDDING_PROTOTYPES) as Array<
+    [Exclude<SemanticRole, 'generic-click'>, string[]]
+  >) {
+    cache.set(role, phrases.map((phrase) => buildEmbedding(phrase)));
+  }
+  rolePrototypeVectorsCache = cache;
+  return cache;
+}
+
+const SEMANTIC_ROLE_CACHE_MAX = 512;
+const semanticRoleCache = new Map<string, SemanticCandidateRole>();
+const semanticEmbeddingSignalCache = new Map<
+  string,
+  { role: SemanticRole; score: number; margin: number }
+>();
+
+function buildCandidateFingerprintKey(candidate: SemanticCandidateInput): string {
+  const el = candidate.element;
+  const tag = el.tagName.toLowerCase();
+  const role = normalize(el.getAttribute('role')).toLowerCase();
+  const aria = normalize(el.getAttribute('aria-label')).slice(0, 48);
+  const placeholder = normalize(el.getAttribute('placeholder')).slice(0, 48);
+  const name = normalize(el.getAttribute('name')).slice(0, 32);
+  const typeAttr = normalize(el.getAttribute('type')).toLowerCase();
+  const label = normalize(candidate.label).slice(0, 64);
+  const zone = normalize(candidate.zone);
+  return `${tag}|${role}|${aria}|${placeholder}|${name}|${typeAttr}|${label}|${zone}|${candidate.intent}`;
+}
+
+function rememberSemanticRoleCache(key: string, value: SemanticCandidateRole): SemanticCandidateRole {
+  if (semanticRoleCache.size >= SEMANTIC_ROLE_CACHE_MAX) {
+    const oldest = semanticRoleCache.keys().next().value;
+    if (oldest) semanticRoleCache.delete(oldest);
+  }
+  semanticRoleCache.set(key, value);
+  return value;
+}
+
+/** Test helper: clears in-memory semantic caches between runs. */
+export function __resetSemanticRoleCachesForTests(): void {
+  semanticRoleCache.clear();
+  semanticEmbeddingSignalCache.clear();
+}
+
+function computeEmbeddingRoleSignal(
+  candidate: SemanticCandidateInput,
+  snapshot: SemanticPageSnapshot,
+): { role: SemanticRole; score: number; margin: number } {
+  const fingerprintKey = buildCandidateFingerprintKey(candidate);
+  const cachedSignal = semanticEmbeddingSignalCache.get(fingerprintKey);
+  if (cachedSignal) return cachedSignal;
+
+  const aria = normalize(candidate.element.getAttribute('aria-label'));
+  const placeholder = normalize(candidate.element.getAttribute('placeholder'));
+  const name = normalize(candidate.element.getAttribute('name'));
+  const value = normalize(candidate.element.getAttribute('value'));
+  const roleAttr = normalize(candidate.element.getAttribute('role'));
+  const typeAttr = normalize(candidate.element.getAttribute('type'));
+  const titleAttr = normalize(candidate.element.getAttribute('title'));
+  const classAttr = normalize(candidate.element.className || '');
+  const zone = normalize(candidate.zone);
+  const text = [
+    candidate.label,
+    aria,
+    placeholder,
+    name,
+    value,
+    titleAttr,
+    classAttr,
+    roleAttr,
+    typeAttr,
+    zone,
+    snapshot.pageTitle,
+    snapshot.pageHeading,
+    snapshot.contextTokens.slice(0, 12).join(' '),
+  ]
+    .filter(Boolean)
+    .join(' ');
+  const candidateVector = buildEmbedding(text);
+  const prototypes = getRolePrototypeVectors();
+  const scored: Array<{ role: Exclude<SemanticRole, 'generic-click'>; score: number }> = [];
+  for (const [role, vectors] of prototypes.entries()) {
+    const maxScore = vectors.reduce((best, vector) => Math.max(best, cosineSimilarity(candidateVector, vector)), 0);
+    scored.push({ role, score: Number(maxScore.toFixed(4)) });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  const top = scored[0];
+  const second = scored[1];
+  if (!top) {
+    const empty = { role: 'generic-click' as const, score: 0, margin: 0 };
+    semanticEmbeddingSignalCache.set(fingerprintKey, empty);
+    return empty;
+  }
+  const result = {
+    role: top.role,
+    score: top.score,
+    margin: Math.max(0, top.score - (second?.score || 0)),
+  };
+  if (semanticEmbeddingSignalCache.size >= SEMANTIC_ROLE_CACHE_MAX) {
+    const oldest = semanticEmbeddingSignalCache.keys().next().value;
+    if (oldest) semanticEmbeddingSignalCache.delete(oldest);
+  }
+  semanticEmbeddingSignalCache.set(fingerprintKey, result);
+  return result;
 }
 
 function isSubmitLike(element: HTMLElement, label: string): boolean {
@@ -242,6 +443,29 @@ function voteRoles(candidate: SemanticCandidateInput, snapshot: SemanticPageSnap
     votes.push({ role: 'form-submit', weight: 0.55, rationale: `submit vocabulary "${label}"` });
   }
 
+  // ----- Place order / checkout CTA -----
+  if (
+    candidate.isActionable &&
+    tag === 'button' &&
+    PLACE_ORDER_CTA_PATTERN.test(label) &&
+    !isFormFieldLike(candidate.element)
+  ) {
+    votes.push({
+      role: 'cta-primary',
+      weight: 0.94,
+      rationale: `place order CTA "${label}"`,
+    });
+  }
+
+  // ----- Payment method tiles (utility, not primary CTA) -----
+  if (PAYMENT_METHOD_PATTERN.test(label) && !PLACE_ORDER_CTA_PATTERN.test(label)) {
+    votes.push({
+      role: 'utility',
+      weight: 0.88,
+      rationale: `payment method "${label}"`,
+    });
+  }
+
   // ----- Primary CTA (creation / activation verbs) -----
   // A primary CTA is an actionable element with a strong action verb that
   // is NOT a submit and NOT a form field. Confidence is intentionally
@@ -250,10 +474,11 @@ function voteRoles(candidate: SemanticCandidateInput, snapshot: SemanticPageSnap
     candidate.isActionable &&
     !isFormFieldLike(candidate.element) &&
     !isSubmitLike(candidate.element, label) &&
+    !PAYMENT_METHOD_PATTERN.test(label) &&
     CTA_PRIMARY_PATTERN.test(label)
   ) {
     const inNav = isInNavigation(candidate.element, candidate.zone);
-    const baseWeight = inNav ? 0.6 : 0.75;
+    const baseWeight = inNav ? 0.68 : 0.82;
     votes.push({
       role: 'cta-primary',
       weight: baseWeight,
@@ -302,6 +527,19 @@ function voteRoles(candidate: SemanticCandidateInput, snapshot: SemanticPageSnap
     }
   }
 
+  const embedding = computeEmbeddingRoleSignal(candidate, snapshot);
+  if (embedding.role !== 'generic-click' && embedding.score >= 0.16) {
+    const embeddingWeight = Math.max(
+      0.32,
+      Math.min(0.9, embedding.score * 1.25 + Math.min(0.2, embedding.margin * 0.8)),
+    );
+    votes.push({
+      role: embedding.role,
+      weight: Number(embeddingWeight.toFixed(3)),
+      rationale: `semantic embedding role=${embedding.role} sim=${embedding.score.toFixed(2)} margin=${embedding.margin.toFixed(2)}`,
+    });
+  }
+
   return votes;
 }
 
@@ -309,15 +547,19 @@ export function classifyCandidate(
   candidate: SemanticCandidateInput,
   snapshot: SemanticPageSnapshot,
 ): SemanticCandidateRole {
+  const cacheKey = `${buildCandidateFingerprintKey(candidate)}|f:${snapshot.hasForm ? 1 : 0}|n:${snapshot.hasNavigation ? 1 : 0}`;
+  const cachedRole = semanticRoleCache.get(cacheKey);
+  if (cachedRole) return cachedRole;
+
   const votes = voteRoles(candidate, snapshot);
 
   if (votes.length === 0) {
-    return {
+    return rememberSemanticRoleCache(cacheKey, {
       selector: candidate.selector,
       role: 'generic-click',
       confidence: 0.2,
       rationale: ['no semantic signal'],
-    };
+    });
   }
 
   // Aggregate votes per role and pick the strongest.
@@ -332,19 +574,26 @@ export function classifyCandidate(
 
   let bestRole: SemanticRole = 'generic-click';
   let bestEntry = { total: -Infinity, rationales: [] as string[], max: 0 };
+  let secondTotal = -Infinity;
   for (const [role, entry] of aggregated.entries()) {
     if (entry.total > bestEntry.total) {
+      secondTotal = bestEntry.total;
       bestRole = role;
       bestEntry = entry;
+    } else if (entry.total > secondTotal) {
+      secondTotal = entry.total;
     }
   }
+  const margin = Math.max(0, bestEntry.total - Math.max(0, secondTotal));
+  const normalizedMargin = bestEntry.total > 0 ? Math.min(1, margin / bestEntry.total) : 0;
+  const confidence = Math.max(0.2, Math.min(1, bestEntry.max * 0.65 + normalizedMargin * 0.35));
 
-  return {
+  return rememberSemanticRoleCache(cacheKey, {
     selector: candidate.selector,
     role: bestRole,
-    confidence: Math.min(1, bestEntry.max),
+    confidence,
     rationale: bestEntry.rationales.slice(0, 3),
-  };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -370,18 +619,134 @@ export function proposeSequenceOrder(
   if (candidates.length <= 1) return null;
 
   const roleBySelector = new Map<string, SemanticRole>();
-  for (const role of roles) roleBySelector.set(role.selector, role.role);
+  const confidenceBySelector = new Map<string, number>();
+  for (const role of roles) {
+    roleBySelector.set(role.selector, role.role);
+    confidenceBySelector.set(role.selector, role.confidence);
+  }
 
-  const ranked = candidates.slice().sort((a, b) => {
-    const roleA = roleBySelector.get(a.selector) || 'generic-click';
-    const roleB = roleBySelector.get(b.selector) || 'generic-click';
-    const ra = ROLE_ORDER.indexOf(roleA);
-    const rb = ROLE_ORDER.indexOf(roleB);
-    if (ra !== rb) return ra - rb;
-    return (a.documentTop ?? 0) - (b.documentTop ?? 0);
-  });
+  const roleIndex = new Map<SemanticRole, number>();
+  ROLE_ORDER.forEach((role, index) => roleIndex.set(role, index));
 
-  const proposedOrder = ranked.map((candidate) => candidate.selector);
+  const roleTransitionPreference = (fromRole: SemanticRole, toRole: SemanticRole): number => {
+    const direct: Record<string, number> = {
+      'entry->navigation': 0.98,
+      'entry->cta-primary': 0.92,
+      'navigation->cta-primary': 0.95,
+      'cta-primary->form-field': 0.97,
+      'form-field->form-field': 0.9,
+      'form-field->form-submit': 0.99,
+      'form-submit->utility': 0.86,
+      'form-submit->result': 0.98,
+      'utility->result': 0.9,
+      'secondary->result': 0.8,
+      'generic-click->result': 0.72,
+    };
+    const key = `${fromRole}->${toRole}`;
+    if (typeof direct[key] === 'number') return direct[key];
+    const from = roleIndex.get(fromRole) ?? ROLE_ORDER.length;
+    const to = roleIndex.get(toRole) ?? ROLE_ORDER.length;
+    const diff = to - from;
+    if (diff === 0) return 0.68;
+    if (diff > 0) return Math.max(0.25, 0.72 - diff * 0.09);
+    return Math.max(0.05, 0.22 - Math.abs(diff) * 0.05);
+  };
+
+  const topOf = (candidate: SemanticCandidateInput): number => candidate.documentTop ?? Number.POSITIVE_INFINITY;
+  const leftOf = (candidate: SemanticCandidateInput): number => {
+    try {
+      return candidate.element.getBoundingClientRect().left;
+    } catch {
+      return Number.POSITIVE_INFINITY;
+    }
+  };
+  const spatialContinuity = (from: SemanticCandidateInput, to: SemanticCandidateInput): number => {
+    const vertical = topOf(to) - topOf(from);
+    const leftDiff = Math.abs(leftOf(to) - leftOf(from));
+    const verticalScore = vertical >= -24 ? 1 / (1 + Math.abs(vertical) / 520) : 0.15;
+    const lateralScore = 1 / (1 + leftDiff / 700);
+    return verticalScore * 0.7 + lateralScore * 0.3;
+  };
+  const startPriority = (candidate: SemanticCandidateInput): number => {
+    const role = roleBySelector.get(candidate.selector) || 'generic-click';
+    const confidence = confidenceBySelector.get(candidate.selector) || 0;
+    const roleBias: Record<SemanticRole, number> = {
+      entry: 1,
+      navigation: 0.92,
+      'cta-primary': 0.84,
+      'form-field': 0.7,
+      'form-submit': 0.62,
+      utility: 0.58,
+      secondary: 0.52,
+      'generic-click': 0.42,
+      result: 0.38,
+    };
+    const top = topOf(candidate);
+    const topBias = Number.isFinite(top) ? Math.max(0, 1 - Math.min(1, top / 1800)) : 0;
+    return roleBias[role] * 0.65 + confidence * 0.25 + topBias * 0.1;
+  };
+
+  const remaining = candidates.slice();
+  let first: SemanticCandidateInput | undefined;
+  const entryCandidates = remaining
+    .filter((candidate) => (roleBySelector.get(candidate.selector) || 'generic-click') === 'entry')
+    .sort((a, b) => (confidenceBySelector.get(b.selector) || 0) - (confidenceBySelector.get(a.selector) || 0));
+  if (entryCandidates.length > 0) {
+    first = entryCandidates[0];
+    const idx = remaining.findIndex((candidate) => candidate.selector === first?.selector);
+    if (idx >= 0) remaining.splice(idx, 1);
+  } else {
+    remaining.sort((a, b) => startPriority(b) - startPriority(a));
+    first = remaining.shift();
+  }
+  if (!first) return null;
+
+  const ordered: SemanticCandidateInput[] = [first];
+  while (remaining.length > 0) {
+    const previous = ordered[ordered.length - 1];
+    const prevRole = roleBySelector.get(previous.selector) || 'generic-click';
+    if (prevRole === 'entry') {
+      const navigationIndex = remaining.findIndex(
+        (candidate) => (roleBySelector.get(candidate.selector) || 'generic-click') === 'navigation',
+      );
+      if (navigationIndex >= 0) {
+        ordered.push(remaining.splice(navigationIndex, 1)[0]);
+        continue;
+      }
+    }
+    const hasFormField = remaining.some(
+      (candidate) => (roleBySelector.get(candidate.selector) || 'generic-click') === 'form-field',
+    );
+    const hasFormSubmit = remaining.some(
+      (candidate) => (roleBySelector.get(candidate.selector) || 'generic-click') === 'form-submit',
+    );
+    if (hasFormField && hasFormSubmit && prevRole !== 'form-field') {
+      const formFieldIndex = remaining.findIndex(
+        (candidate) => (roleBySelector.get(candidate.selector) || 'generic-click') === 'form-field',
+      );
+      if (formFieldIndex >= 0) {
+        ordered.push(remaining.splice(formFieldIndex, 1)[0]);
+        continue;
+      }
+    }
+    let bestIndex = 0;
+    let bestScore = -Infinity;
+    for (let i = 0; i < remaining.length; i += 1) {
+      const candidate = remaining[i];
+      const role = roleBySelector.get(candidate.selector) || 'generic-click';
+      const confidence = confidenceBySelector.get(candidate.selector) || 0;
+      const transition = roleTransitionPreference(prevRole, role);
+      const continuity = spatialContinuity(previous, candidate);
+      const score = transition * 0.7 + continuity * 0.2 + confidence * 0.1;
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = i;
+      }
+    }
+    ordered.push(remaining.splice(bestIndex, 1)[0]);
+  }
+
+  const proposedOrder = ordered.map((candidate) => candidate.selector);
   const heuristicOrder = candidates.map((candidate) => candidate.selector);
 
   // Only emit a preferred order when it actually differs from the heuristic
@@ -421,6 +786,7 @@ export interface SemanticStepCopy {
 
 export function buildSemanticStepCopy(role: SemanticRole, label: string): SemanticStepCopy {
   const safeLabel = label || 'cet élément';
+  const normalizedLabel = normalize(label).toLowerCase();
   switch (role) {
     case 'entry':
       return {
@@ -438,6 +804,12 @@ export function buildSemanticStepCopy(role: SemanticRole, label: string): Semant
         content: `Lancez l'action clé du parcours en activant: ${safeLabel}.`,
       };
     case 'form-field':
+      if (SEARCH_PATTERN.test(normalizedLabel)) {
+        return {
+          title: 'Recherche et filtrage',
+          content: `Utilisez ce champ pour rechercher ou filtrer rapidement: ${safeLabel}.`,
+        };
+      }
       return {
         title: 'Renseigner le formulaire',
         content: `Saisissez ou vérifiez les informations attendues dans ce champ: ${safeLabel}.`,
@@ -448,6 +820,24 @@ export function buildSemanticStepCopy(role: SemanticRole, label: string): Semant
         content: `Une fois les champs complétés, confirmez l'étape avec: ${safeLabel}.`,
       };
     case 'utility':
+      if (PAYMENT_METHOD_PATTERN.test(normalizedLabel)) {
+        return {
+          title: 'Paiement et encaissement',
+          content: `Ce contrôle concerne la finalisation de commande ou le moyen de paiement: ${safeLabel}.`,
+        };
+      }
+      if (SEARCH_PATTERN.test(normalizedLabel)) {
+        return {
+          title: 'Recherche et filtrage',
+          content: `Utilisez ce contrôle pour retrouver rapidement les éléments pertinents: ${safeLabel}.`,
+        };
+      }
+      if (ORDER_SUMMARY_PATTERN.test(normalizedLabel)) {
+        return {
+          title: 'Suivi de la commande',
+          content: `Cette zone synthétise l'état de la commande en cours: ${safeLabel}.`,
+        };
+      }
       return {
         title: 'Réglages et options',
         content: `Ce contrôle ouvre les préférences ou réglages associés au parcours: ${safeLabel}.`,

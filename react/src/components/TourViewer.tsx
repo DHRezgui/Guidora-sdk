@@ -12,7 +12,44 @@ import { findElement } from '../utils/dom-utils';
 const VALID_INTENTS: TourDraftIntent[] = ['discovery', 'primary-action', 'support-navigation', 'form-flow'];
 const NAVIGATION_CLICK_RESUME_DELAY_MS = 5000;
 const NAVIGATION_CLICK_RESUME_KEY = '__trustdev_navigation_click_resume_at_v1';
+const SELECTOR_HEAL_STORAGE_KEY = '__trustdev_selector_heals_v1';
+const SELECTOR_HEAL_TTL_MS = 30 * 60 * 1000;
+const RUNTIME_FALLBACK_SELECTORS = [
+  'button',
+  'a[href]',
+  '[role="button"]',
+  '[role="tab"]',
+  'input[type="submit"]',
+  '[aria-label]',
+].join(', ');
+const MIN_RUNTIME_FALLBACK_MATCH_SCORE = 28;
+const LOW_CONFIDENCE_RUNTIME_MATCH_SCORE = 50;
+const TARGET_RECT_MIN_INTERVAL_MS = 120;
+const TARGET_RECT_HIDDEN_INTERVAL_MS = 500;
+const SELECTOR_HEAL_PERSIST_DEBOUNCE_MS = 400;
+const RUNTIME_RESOLUTION_CACHE_MAX = 64;
 type TargetRect = { top: number; left: number; width: number; height: number };
+type RuntimeResolvePath = 'primary' | 'alternative' | 'fingerprint' | 'semantic-fallback' | 'not-found';
+type PersistedSelectorHeal = {
+  selector: string;
+  expiresAt: number;
+  pageHash: string;
+};
+
+function hashString(value: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i += 1) {
+    hash ^= value.charCodeAt(i);
+    hash += (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function getPageUrlHash(): string {
+  if (typeof window === 'undefined') return 'unknown';
+  const base = `${window.location.origin}${window.location.pathname}`;
+  return hashString(base);
+}
 
 function areRectsClose(a: TargetRect | null, b: TargetRect, tolerance = 0.5): boolean {
   if (!a) return false;
@@ -44,6 +81,118 @@ function writeNavigationClickResumeAt(resumeAt: number): void {
   } else {
     window.sessionStorage.removeItem(NAVIGATION_CLICK_RESUME_KEY);
   }
+}
+
+let selectorHealsMemory: Record<string, PersistedSelectorHeal> | null = null;
+let selectorHealPersistTimer: ReturnType<typeof setTimeout> | null = null;
+
+function parseSelectorHealsFromStorage(): Record<string, PersistedSelectorHeal> {
+  if (typeof window === 'undefined') return {};
+  try {
+    const raw = window.sessionStorage.getItem(SELECTOR_HEAL_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, PersistedSelectorHeal | string>;
+    if (!parsed || typeof parsed !== 'object') return {};
+    const now = Date.now();
+    const pageHash = getPageUrlHash();
+    const next: Record<string, PersistedSelectorHeal> = {};
+    for (const [key, value] of Object.entries(parsed)) {
+      if (!value) continue;
+      if (typeof value === 'string') {
+        next[key] = {
+          selector: value,
+          expiresAt: now + SELECTOR_HEAL_TTL_MS,
+          pageHash,
+        };
+        continue;
+      }
+      if (typeof value.selector !== 'string' || !value.selector.trim()) continue;
+      if (typeof value.expiresAt !== 'number' || value.expiresAt <= now) continue;
+      if (typeof value.pageHash !== 'string' || value.pageHash !== pageHash) continue;
+      next[key] = value;
+    }
+    return next;
+  } catch {
+    return {};
+  }
+}
+
+function loadSelectorHealsMemory(): Record<string, PersistedSelectorHeal> {
+  if (!selectorHealsMemory) {
+    selectorHealsMemory = parseSelectorHealsFromStorage();
+  }
+  return selectorHealsMemory;
+}
+
+function persistSelectorHealsToStorage(): void {
+  if (typeof window === 'undefined' || !selectorHealsMemory) return;
+  try {
+    window.sessionStorage.setItem(SELECTOR_HEAL_STORAGE_KEY, JSON.stringify(selectorHealsMemory));
+  } catch {
+    // ignore storage write failures
+  }
+}
+
+function schedulePersistSelectorHeals(): void {
+  if (selectorHealPersistTimer) clearTimeout(selectorHealPersistTimer);
+  selectorHealPersistTimer = setTimeout(() => {
+    selectorHealPersistTimer = null;
+    persistSelectorHealsToStorage();
+  }, SELECTOR_HEAL_PERSIST_DEBOUNCE_MS);
+}
+
+function writeSelectorHeal(stepKey: string, selector: string, pageHash: string): void {
+  if (typeof window === 'undefined' || !stepKey || !selector) return;
+  const current = loadSelectorHealsMemory();
+  current[stepKey] = {
+    selector,
+    expiresAt: Date.now() + SELECTOR_HEAL_TTL_MS,
+    pageHash,
+  };
+  schedulePersistSelectorHeals();
+}
+
+function removeSelectorHeal(stepKey: string): void {
+  if (typeof window === 'undefined' || !stepKey) return;
+  const current = loadSelectorHealsMemory();
+  if (!current[stepKey]) return;
+  delete current[stepKey];
+  schedulePersistSelectorHeals();
+}
+
+type RuntimeResolutionCacheEntry = {
+  domSignature: string;
+  resolvedSelector: string;
+  resolvedPath: RuntimeResolvePath;
+  matchScore: number | null;
+};
+
+const runtimeResolutionCache = new Map<string, RuntimeResolutionCacheEntry>();
+const runtimeSemanticMatchCache = new WeakMap<HTMLElement, Map<string, { accepted: boolean; score: number }>>();
+
+function getLightDomSignature(): string {
+  if (typeof document === 'undefined') return 'ssr';
+  const root = document.querySelector('main') ?? document.body;
+  const childCount = root?.childElementCount ?? 0;
+  return `${getPageUrlHash()}:${childCount}`;
+}
+
+function rememberRuntimeResolution(
+  stepKey: string,
+  entry: RuntimeResolutionCacheEntry,
+): void {
+  if (runtimeResolutionCache.size >= RUNTIME_RESOLUTION_CACHE_MAX) {
+    const oldest = runtimeResolutionCache.keys().next().value;
+    if (oldest) runtimeResolutionCache.delete(oldest);
+  }
+  runtimeResolutionCache.set(stepKey, entry);
+}
+
+function resolveRuntimeFallbackScopeRoot(): ParentNode {
+  if (typeof document === 'undefined') return document;
+  const main = document.querySelector('main');
+  if (main instanceof HTMLElement && main.isConnected) return main;
+  return document.body ?? document;
 }
 
 export interface TourViewerProps {
@@ -291,7 +440,219 @@ function normalizeRoutePath(value?: string): string {
 
 function getStepSearchText(step?: Step | null): string {
   if (!step) return '';
-  return [step.title, step.content, step.targetSelector].filter(Boolean).join(' ');
+  const fingerprint = step.targetFingerprint;
+  return [
+    fingerprint?.textSample,
+    fingerprint?.ariaLabel,
+    fingerprint?.placeholder,
+    fingerprint?.name,
+    step.title,
+    step.content,
+    step.targetSelector,
+  ]
+    .filter(Boolean)
+    .join(' ');
+}
+
+/** Match score for stable selectors: compare DOM to fingerprint, not French editorial copy. */
+function getStepRuntimeMatchText(step?: Step | null, selector?: string): string {
+  if (!step) return '';
+  const fingerprint = step.targetFingerprint;
+  if (fingerprint && selectorRuntimeQualityScore(selector) >= 60) {
+    return [fingerprint.textSample, fingerprint.ariaLabel, fingerprint.placeholder, fingerprint.name]
+      .filter(Boolean)
+      .join(' ');
+  }
+  return getStepSearchText(step);
+}
+
+function normalizeSearchText(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function getElementRuntimeSearchText(element: HTMLElement): string {
+  return normalizeSearchText(
+    [
+      element.getAttribute('aria-label'),
+      element.getAttribute('title'),
+      element.getAttribute('placeholder'),
+      element.getAttribute('name'),
+      element.getAttribute('value'),
+      element.getAttribute('id'),
+      element.getAttribute('aria-controls'),
+      element.textContent,
+    ]
+      .filter(Boolean)
+      .join(' '),
+  );
+}
+
+function selectorRuntimeQualityScore(selector?: string): number {
+  if (!selector) return 0;
+  if (selector.includes('[data-tour-id=')) return 96;
+  if (selector.includes('[data-testid=')) return 90;
+  if (selector.includes('[data-cy=') || selector.includes('[data-qa=')) return 86;
+  if (selector.startsWith('#')) return 78;
+  if (selector.includes('[aria-label=')) return 68;
+  if (selector.includes('[role=')) return 62;
+  if (selector.includes(':nth-of-type(') || selector.includes(':nth-child(')) return 22;
+  return 45;
+}
+
+function isRecoverSelectorTrusted(selector?: string): boolean {
+  if (!selector) return false;
+  return selectorRuntimeQualityScore(selector) >= 60;
+}
+
+function scoreElementForRuntimeFallback(
+  element: HTMLElement,
+  step: Step | null | undefined,
+  preferredText: string,
+): number {
+  const elementText = getElementRuntimeSearchText(element);
+  if (!elementText) return 0;
+  const preferred = normalizeSearchText(preferredText);
+  const fp = step?.targetFingerprint;
+  let score = 0;
+
+  if (preferred) {
+    const tokens = preferred.split(' ').filter((token) => token.length >= 3);
+    for (const token of tokens) {
+      if (elementText.includes(token)) score += token.length >= 6 ? 8 : 4;
+    }
+  }
+
+  if (fp) {
+    if (fp.tagName && element.tagName.toLowerCase() === fp.tagName.toLowerCase()) score += 16;
+    const role = (element.getAttribute('role') || '').toLowerCase();
+    if (fp.role && role === fp.role.toLowerCase()) score += 14;
+    const aria = normalizeSearchText(element.getAttribute('aria-label') || '');
+    if (fp.ariaLabel && aria && aria.includes(normalizeSearchText(fp.ariaLabel))) score += 14;
+    const sample = normalizeSearchText(fp.textSample || '');
+    if (sample) {
+      if (elementText.includes(sample)) score += 42;
+      else if (elementText.includes(sample.slice(0, Math.min(sample.length, 24)))) score += 28;
+    }
+    const placeholder = normalizeSearchText(fp.placeholder || '');
+    if (placeholder && elementText.includes(placeholder)) score += 32;
+    const name = normalizeSearchText(fp.name || '');
+    if (name && elementText.includes(name)) score += 24;
+  }
+
+  if (element.getAttribute('aria-selected') === 'true') score += 8;
+  if (element.getAttribute('data-state') === 'active') score += 8;
+  return score;
+}
+
+function evaluateRuntimeSemanticMatch(
+  element: HTMLElement,
+  step: Step | null | undefined,
+  preferredText: string,
+): { accepted: boolean; score: number } {
+  const cacheKey = [
+    preferredText,
+    step?.targetFingerprint?.tagName ?? '',
+    step?.targetFingerprint?.role ?? '',
+    step?.targetFingerprint?.ariaLabel ?? '',
+    step?.targetFingerprint?.textSample ?? '',
+  ].join('|');
+  const perElement = runtimeSemanticMatchCache.get(element);
+  if (perElement?.has(cacheKey)) {
+    return perElement.get(cacheKey)!;
+  }
+
+  const hasFingerprintSignals = Boolean(
+    step?.targetFingerprint?.tagName ||
+      step?.targetFingerprint?.role ||
+      step?.targetFingerprint?.ariaLabel ||
+      step?.targetFingerprint?.textSample,
+  );
+  const result = !hasFingerprintSignals
+    ? { accepted: true, score: scoreElementForRuntimeFallback(element, step, preferredText) }
+    : (() => {
+        const score = scoreElementForRuntimeFallback(element, step, preferredText);
+        return { accepted: score >= MIN_RUNTIME_FALLBACK_MATCH_SCORE, score };
+      })();
+
+  const bucket = perElement ?? new Map<string, { accepted: boolean; score: number }>();
+  bucket.set(cacheKey, result);
+  runtimeSemanticMatchCache.set(element, bucket);
+  return result;
+}
+
+function getRuntimeSelectorCandidates(step: Step | null | undefined, healedSelector?: string): string[] {
+  const selectors = [healedSelector, step?.targetSelector, ...(step?.selectorAlternatives ?? [])]
+    .filter((value): value is string => Boolean(value && value.trim()))
+    .map((value) => value.trim());
+  return Array.from(new Set(selectors));
+}
+
+function buildRecoverSelector(element: HTMLElement): string | null {
+  const tag = element.tagName.toLowerCase();
+  const stableAttrs = ['data-tour-id', 'data-testid', 'data-cy', 'data-qa', 'aria-label', 'name'] as const;
+  for (const attr of stableAttrs) {
+    const value = element.getAttribute(attr);
+    if (!value) continue;
+    return `${tag}[${attr}="${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"]`;
+  }
+  if (element.id && typeof CSS !== 'undefined' && CSS.escape) {
+    return `#${CSS.escape(element.id)}`;
+  }
+  const role = element.getAttribute('role');
+  if (role) return `${tag}[role="${role.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"]`;
+  return tag;
+}
+
+function findElementByStepFingerprint(step: Step | null | undefined, preferredText: string): HTMLElement | null {
+  if (!step?.targetFingerprint) return null;
+  const fp = step.targetFingerprint;
+  const selectors: string[] = [];
+  if (fp.tagName && fp.ariaLabel) selectors.push(`${fp.tagName}[aria-label="${fp.ariaLabel.replace(/"/g, '\\"')}"]`);
+  if (fp.tagName && fp.role) selectors.push(`${fp.tagName}[role="${fp.role.replace(/"/g, '\\"')}"]`);
+  if (fp.tagName) selectors.push(fp.tagName);
+
+  const expectedText = normalizeSearchText(fp.textSample || preferredText || '');
+  for (const selector of selectors) {
+    const element = findElement(selector, {
+      preferredText: expectedText,
+      preferActive: true,
+      requirePreferredMatch: Boolean(expectedText),
+    });
+    if (element) return element;
+  }
+  return null;
+}
+
+function findBestRuntimeFallbackElement(
+  step: Step | null | undefined,
+  preferredText: string,
+  scopeRoot?: ParentNode,
+): { element: HTMLElement; score: number } | null {
+  if (typeof document === 'undefined') return null;
+  const root = scopeRoot ?? resolveRuntimeFallbackScopeRoot();
+  const candidates = Array.from(root.querySelectorAll(RUNTIME_FALLBACK_SELECTORS)) as HTMLElement[];
+  let best: HTMLElement | null = null;
+  let bestScore = 0;
+  for (const element of candidates) {
+    if (!element.isConnected) continue;
+    const style = window.getComputedStyle(element);
+    if (style.display === 'none' || style.visibility === 'hidden') continue;
+    const rect = element.getBoundingClientRect();
+    if (rect.width <= 0 && rect.height <= 0) continue;
+    const score = scoreElementForRuntimeFallback(element, step, preferredText);
+    if (score > bestScore) {
+      best = element;
+      bestScore = score;
+    }
+  }
+  if (!best || bestScore < MIN_RUNTIME_FALLBACK_MATCH_SCORE) return null;
+  return { element: best, score: bestScore };
 }
 
 function wait(ms: number): Promise<void> {
@@ -391,6 +752,9 @@ export function TourViewer({
 
   const [targetRect, setTargetRect] = useState<TargetRect | null>(null);
   const [targetNotFound, setTargetNotFound] = useState(false);
+  const [resolvePath, setResolvePath] = useState<RuntimeResolvePath | null>(null);
+  const [resolveMatchScore, setResolveMatchScore] = useState<number | null>(null);
+  const [resolvedSelector, setResolvedSelector] = useState<string | null>(null);
   const [resolveAttempt, setResolveAttempt] = useState(0);
   const [currentPathname, setCurrentPathname] = useState(() =>
     typeof window !== 'undefined' ? window.location.pathname : '',
@@ -402,6 +766,8 @@ export function TourViewer({
   const targetClickAdvanceInFlightRef = useRef(false);
   const lastTargetAutoScrollKeyRef = useRef<string | null>(null);
   const lastUserScrollIntentAtRef = useRef(0);
+  const healedSelectorByStepRef = useRef<Map<string, string>>(new Map());
+  const selectorHealsBootstrappedRef = useRef(false);
   const runtimeFeedbackRecorderRef = useRef<
     (event: 'shown' | 'clicked' | 'completed' | 'skipped', selectorOverride?: string) => void
   >(() => undefined);
@@ -434,7 +800,17 @@ export function TourViewer({
     config,
     autoStart: effectiveAutoStart,
     debug,
+    activeFlowVersion: contextualSuggestions?.flowVersion,
   });
+
+  useEffect(() => {
+    if (selectorHealsBootstrappedRef.current) return;
+    selectorHealsBootstrappedRef.current = true;
+    const heals = loadSelectorHealsMemory();
+    for (const [key, value] of Object.entries(heals)) {
+      if (value?.selector) healedSelectorByStepRef.current.set(key, value.selector);
+    }
+  }, []);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -749,10 +1125,24 @@ export function TourViewer({
     const currentStep = onboarding.tour.currentStep;
     const currentSelector = currentStep?.targetSelector;
     const currentStepSearchText = getStepSearchText(currentStep);
-    if (!onboarding.tour.isOpen || routeMismatch || !currentSelector) {
+    const pageHash = getPageUrlHash();
+    const stepRuntimeKey = [
+      onboarding.activeTour?.id ?? 'unknown',
+      onboarding.tour.currentStepIndex,
+      currentSelector ?? '',
+      pageHash,
+    ].join('|');
+    const persistedHeals = loadSelectorHealsMemory();
+    const healedSelector =
+      healedSelectorByStepRef.current.get(stepRuntimeKey) || persistedHeals[stepRuntimeKey]?.selector || undefined;
+    const selectorCandidates = getRuntimeSelectorCandidates(currentStep, healedSelector);
+    if (!onboarding.tour.isOpen || routeMismatch || selectorCandidates.length === 0) {
       activeTargetRef.current = null;
       setTargetRect(null);
       setTargetNotFound(false);
+      setResolvePath(null);
+      setResolveMatchScore(null);
+      setResolvedSelector(null);
       return;
     }
 
@@ -760,125 +1150,303 @@ export function TourViewer({
     let raf1: number | null = null;
     let raf2: number | null = null;
     let syncRaf: number | null = null;
+    let syncTimer: ReturnType<typeof setTimeout> | null = null;
+    let lastTargetRectSyncAt = 0;
     let observer: MutationObserver | null = null;
     let resizeObserver: ResizeObserver | null = null;
     let targetClickCleanup: (() => void) | null = null;
+    let activeSelectorForSync = selectorCandidates[0];
+    const domSignature = getLightDomSignature();
 
     const scheduleTargetRectSync = () => {
-      if (syncRaf !== null) return;
-      syncRaf = window.requestAnimationFrame(() => {
-        syncRaf = null;
-        if (cancelled) return;
+      if (cancelled) return;
+      if (typeof document !== 'undefined' && document.hidden) return;
+      if (syncRaf !== null || syncTimer !== null) return;
 
-        const currentTarget = activeTargetRef.current;
-        const latestTarget = findElement(currentSelector, {
-          preferredText: currentStepSearchText,
-          preferActive: true,
+      const minInterval =
+        typeof document !== 'undefined' && document.hidden
+          ? TARGET_RECT_HIDDEN_INTERVAL_MS
+          : TARGET_RECT_MIN_INTERVAL_MS;
+      const elapsed = Date.now() - lastTargetRectSyncAt;
+      const delay = Math.max(0, minInterval - elapsed);
+
+      const runSync = () => {
+        syncRaf = window.requestAnimationFrame(() => {
+          syncRaf = null;
+          if (cancelled) return;
+          lastTargetRectSyncAt = Date.now();
+
+          const currentTarget = activeTargetRef.current;
+          const latestTarget = findElement(activeSelectorForSync, {
+            preferredText: currentStepSearchText,
+            preferActive: true,
+          });
+          if (!currentTarget?.isConnected || !latestTarget || latestTarget !== currentTarget) {
+            setResolveAttempt((prev) => prev + 1);
+            return;
+          }
+
+          syncTargetRect();
         });
-        if (!currentTarget?.isConnected || !latestTarget || latestTarget !== currentTarget) {
-          setResolveAttempt((prev) => prev + 1);
-          return;
-        }
+      };
 
-        syncTargetRect();
+      if (delay > 0) {
+        syncTimer = setTimeout(() => {
+          syncTimer = null;
+          runSync();
+        }, delay);
+      } else {
+        runSync();
+      }
+    };
+
+    const attachResolvedTarget = (
+      targetEl: HTMLElement,
+      resolvedSelector: string,
+      resolvedPath: RuntimeResolvePath,
+      resolvedMatchScore: number | null,
+    ) => {
+      activeSelectorForSync = resolvedSelector || activeSelectorForSync;
+      if (
+        resolvedSelector &&
+        resolvedSelector !== currentSelector &&
+        isRecoverSelectorTrusted(resolvedSelector)
+      ) {
+        healedSelectorByStepRef.current.set(stepRuntimeKey, resolvedSelector);
+        writeSelectorHeal(stepRuntimeKey, resolvedSelector, pageHash);
+      }
+      activeTargetRef.current = targetEl;
+      const domRect = targetEl.getBoundingClientRect();
+      const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+      const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+      const isOutOfViewport =
+        domRect.bottom < 0 ||
+        domRect.top > viewportHeight ||
+        domRect.right < 0 ||
+        domRect.left > viewportWidth;
+      const stepAutoScrollKey = [
+        onboarding.activeTour?.id ?? 'unknown',
+        onboarding.tour.currentStepIndex,
+        resolvedSelector,
+      ].join('|');
+      const userScrolledRecently = Date.now() - lastUserScrollIntentAtRef.current < 1500;
+      const canAutoScrollTarget =
+        isOutOfViewport &&
+        !userScrolledRecently &&
+        lastTargetAutoScrollKeyRef.current !== stepAutoScrollKey;
+
+      if (canAutoScrollTarget) {
+        lastTargetAutoScrollKeyRef.current = stepAutoScrollKey;
+        targetEl.scrollIntoView({
+          behavior: 'smooth',
+          block: 'center',
+          inline: 'center',
+        });
+        raf1 = window.requestAnimationFrame(() => {
+          raf2 = window.requestAnimationFrame(() => {
+            if (!cancelled) syncTargetRect();
+          });
+        });
+      } else {
+        const nextRect: TargetRect = {
+          top: domRect.top,
+          left: domRect.left,
+          width: domRect.width,
+          height: domRect.height,
+        };
+        setTargetRect((prev) => (areRectsClose(prev, nextRect) ? prev : nextRect));
+      }
+
+      window.addEventListener('scroll', scheduleTargetRectSync, { capture: true, passive: true });
+      document.addEventListener('scroll', scheduleTargetRectSync, { capture: true, passive: true });
+      window.addEventListener('resize', scheduleTargetRectSync);
+      if (typeof ResizeObserver !== 'undefined') {
+        resizeObserver = new ResizeObserver(scheduleTargetRectSync);
+        resizeObserver.observe(targetEl);
+      }
+      observer = new MutationObserver(() => {
+        scheduleTargetRectSync();
+      });
+      observer.observe(targetEl, {
+        childList: true,
+        attributes: true,
+        attributeFilter: ['class', 'style', 'hidden', 'aria-hidden'],
+      });
+      let layoutParent = targetEl.parentElement;
+      let layoutDepth = 0;
+      while (layoutParent && layoutDepth < 3) {
+        observer.observe(layoutParent, {
+          childList: true,
+          attributes: true,
+          attributeFilter: ['class', 'style'],
+        });
+        layoutParent = layoutParent.parentElement;
+        layoutDepth += 1;
+      }
+
+      if (currentStep?.action === 'CLICK') {
+        const handleTargetClick = () => {
+          advanceAfterTargetActivation(targetEl);
+        };
+        targetEl.addEventListener('click', handleTargetClick);
+        targetClickCleanup = () => {
+          targetEl.removeEventListener('click', handleTargetClick);
+        };
+      }
+
+      rememberRuntimeResolution(stepRuntimeKey, {
+        domSignature,
+        resolvedSelector: resolvedSelector || selectorCandidates[0],
+        resolvedPath,
+        matchScore: resolvedMatchScore,
+      });
+
+      setTargetNotFound(false);
+      setResolvePath(resolvedPath);
+      setResolveMatchScore(resolvedMatchScore);
+      setResolvedSelector(resolvedSelector);
+      onboarding.debug.info('Runtime fallback resolution', {
+        resolvePath: resolvedPath,
+        matchScore: resolvedMatchScore,
+        lowConfidenceMatch:
+          typeof resolvedMatchScore === 'number' && resolvedMatchScore < LOW_CONFIDENCE_RUNTIME_MATCH_SCORE,
+        selector: resolvedSelector,
+        stepRuntimeKey,
+        cacheHit: false,
       });
     };
 
     const resolveSelector = async () => {
       try {
-        const activatedInPageNavigation = activateInPageNavigationForStep(currentStep);
-        if (activatedInPageNavigation) {
-          await wait(180);
-          if (cancelled) return;
+        let targetEl: HTMLElement | null = null;
+        let resolvedSelector = selectorCandidates[0];
+        let resolvedPath: RuntimeResolvePath = 'not-found';
+        let resolvedMatchScore: number | null = null;
+
+        const cachedResolution = runtimeResolutionCache.get(stepRuntimeKey);
+        if (
+          cachedResolution &&
+          cachedResolution.domSignature === domSignature &&
+          cachedResolution.resolvedPath !== 'not-found'
+        ) {
+          const cachedTarget = findElement(cachedResolution.resolvedSelector, {
+            preferredText: currentStepSearchText,
+            preferActive: true,
+          });
+          if (cachedTarget) {
+            const semanticMatch = evaluateRuntimeSemanticMatch(
+              cachedTarget,
+              currentStep,
+              getStepRuntimeMatchText(currentStep, cachedResolution.resolvedSelector),
+            );
+            if (semanticMatch.accepted) {
+              targetEl = cachedTarget;
+              resolvedSelector = cachedResolution.resolvedSelector;
+              resolvedPath = cachedResolution.resolvedPath;
+              resolvedMatchScore = cachedResolution.matchScore;
+            }
+          }
         }
 
-        const targetEl = await onboarding.resolver.resolveTarget(currentSelector, {
-          retries: 8,
-          intervalMs: 250,
-          preferredText: currentStepSearchText,
-          preferActive: true,
-        });
+        if (!targetEl) {
+          const activatedInPageNavigation = activateInPageNavigationForStep(currentStep);
+          if (activatedInPageNavigation) {
+            await wait(180);
+            if (cancelled) return;
+          }
+
+          const tryResolveSelector = async (
+          selector: string,
+          retries: number,
+          intervalMs: number,
+          ): Promise<HTMLElement | null> => {
+            return onboarding.resolver.resolveTarget(selector, {
+              retries,
+              intervalMs,
+              preferredText: currentStepSearchText,
+              preferActive: true,
+            });
+          };
+
+          for (let i = 0; i < selectorCandidates.length; i += 1) {
+            const selector = selectorCandidates[i];
+            const resolved = await tryResolveSelector(selector, i === 0 ? 8 : 3, i === 0 ? 250 : 180);
+            if (!resolved) continue;
+            const semanticMatch = evaluateRuntimeSemanticMatch(
+              resolved,
+              currentStep,
+              getStepRuntimeMatchText(currentStep, selector),
+            );
+            if (!semanticMatch.accepted) {
+              if (selector === healedSelector) {
+                healedSelectorByStepRef.current.delete(stepRuntimeKey);
+                removeSelectorHeal(stepRuntimeKey);
+              }
+              continue;
+            }
+            targetEl = resolved;
+            resolvedSelector = selector;
+            resolvedPath = i === 0 ? 'primary' : 'alternative';
+            resolvedMatchScore = semanticMatch.score;
+            break;
+          }
+
+          if (!targetEl) {
+            const fingerprintTarget = findElementByStepFingerprint(currentStep, currentStepSearchText);
+            if (fingerprintTarget) {
+              const semanticMatch = evaluateRuntimeSemanticMatch(
+                fingerprintTarget,
+                currentStep,
+                getStepRuntimeMatchText(currentStep, buildRecoverSelector(fingerprintTarget) ?? undefined),
+              );
+              if (semanticMatch.accepted) {
+                targetEl = fingerprintTarget;
+                resolvedSelector = buildRecoverSelector(fingerprintTarget) ?? selectorCandidates[0];
+                resolvedPath = 'fingerprint';
+                resolvedMatchScore = semanticMatch.score;
+              }
+            }
+          }
+
+          if (!targetEl && currentStepSearchText) {
+            const semanticFallback = findBestRuntimeFallbackElement(
+              currentStep,
+              currentStepSearchText,
+              resolveRuntimeFallbackScopeRoot(),
+            );
+            if (semanticFallback) {
+              targetEl = semanticFallback.element;
+              resolvedSelector = buildRecoverSelector(semanticFallback.element) ?? selectorCandidates[0];
+              resolvedPath = 'semantic-fallback';
+              resolvedMatchScore = semanticFallback.score;
+            }
+          }
+        }
 
         if (cancelled) return;
 
         if (targetEl) {
-          activeTargetRef.current = targetEl;
-          const domRect = targetEl.getBoundingClientRect();
-          const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
-          const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
-          const isOutOfViewport =
-            domRect.bottom < 0 ||
-            domRect.top > viewportHeight ||
-            domRect.right < 0 ||
-            domRect.left > viewportWidth;
-          const stepAutoScrollKey = [
-            onboarding.activeTour?.id ?? 'unknown',
-            onboarding.tour.currentStepIndex,
-            currentSelector,
-          ].join('|');
-          const userScrolledRecently = Date.now() - lastUserScrollIntentAtRef.current < 1500;
-          const canAutoScrollTarget =
-            isOutOfViewport &&
-            !userScrolledRecently &&
-            lastTargetAutoScrollKeyRef.current !== stepAutoScrollKey;
-
-          if (canAutoScrollTarget) {
-            lastTargetAutoScrollKeyRef.current = stepAutoScrollKey;
-            targetEl.scrollIntoView({
-              behavior: 'smooth',
-              block: 'center',
-              inline: 'center',
-            });
-            // Wait for smooth scroll/layout to settle, then read the final rect.
-            raf1 = window.requestAnimationFrame(() => {
-              raf2 = window.requestAnimationFrame(() => {
-                if (!cancelled) syncTargetRect();
-              });
-            });
-          } else {
-            const nextRect: TargetRect = {
-              // Tooltip/overlay are fixed-position layers, so keep viewport coordinates.
-              top: domRect.top,
-              left: domRect.left,
-              width: domRect.width,
-              height: domRect.height,
-            };
-            setTargetRect((prev) => (areRectsClose(prev, nextRect) ? prev : nextRect));
-          }
-
-          window.addEventListener('scroll', scheduleTargetRectSync, { capture: true, passive: true });
-          document.addEventListener('scroll', scheduleTargetRectSync, { capture: true, passive: true });
-          window.addEventListener('resize', scheduleTargetRectSync);
-          if (typeof ResizeObserver !== 'undefined') {
-            resizeObserver = new ResizeObserver(scheduleTargetRectSync);
-            resizeObserver.observe(targetEl);
-          }
-          observer = new MutationObserver(scheduleTargetRectSync);
-          if (document.body) {
-            observer.observe(document.body, { subtree: true, childList: true });
-          }
-
-          if (currentStep?.action === 'CLICK') {
-            const handleTargetClick = () => {
-              advanceAfterTargetActivation(targetEl);
-            };
-            targetEl.addEventListener('click', handleTargetClick);
-            targetClickCleanup = () => {
-              targetEl.removeEventListener('click', handleTargetClick);
-            };
-          }
-
-          setTargetNotFound(false);
+          attachResolvedTarget(targetEl, resolvedSelector, resolvedPath, resolvedMatchScore);
         } else {
           activeTargetRef.current = null;
           setTargetRect(null);
           setTargetNotFound(true);
+          setResolvePath('not-found');
+          setResolveMatchScore(null);
+          setResolvedSelector(null);
+          onboarding.debug.warn('Runtime fallback failed to resolve target', {
+            stepRuntimeKey,
+            selectorCandidates,
+          });
         }
       } catch (error) {
         onboarding.debug.error('Failed to resolve target', { error });
         activeTargetRef.current = null;
         setTargetRect(null);
         setTargetNotFound(true);
+        setResolvePath('not-found');
+        setResolveMatchScore(null);
+        setResolvedSelector(null);
       }
     };
 
@@ -890,6 +1458,7 @@ export function TourViewer({
       if (raf1 !== null) window.cancelAnimationFrame(raf1);
       if (raf2 !== null) window.cancelAnimationFrame(raf2);
       if (syncRaf !== null) window.cancelAnimationFrame(syncRaf);
+      if (syncTimer !== null) clearTimeout(syncTimer);
       if (observer) observer.disconnect();
       if (resizeObserver) resizeObserver.disconnect();
       if (targetClickCleanup) targetClickCleanup();
@@ -900,9 +1469,16 @@ export function TourViewer({
   }, [
     onboarding.tour.isOpen,
     onboarding.tour.currentStep?.targetSelector,
+    onboarding.tour.currentStep?.selectorAlternatives?.join('|'),
+    onboarding.tour.currentStep?.targetFingerprint?.textSample,
+    onboarding.tour.currentStep?.targetFingerprint?.tagName,
+    onboarding.tour.currentStep?.targetFingerprint?.role,
+    onboarding.tour.currentStep?.targetFingerprint?.ariaLabel,
     onboarding.tour.currentStep?.action,
     onboarding.tour.currentStep?.title,
     onboarding.tour.currentStep?.content,
+    onboarding.tour.currentStepIndex,
+    onboarding.activeTour?.id,
     onboarding.resolver,
     onboarding.debug,
     routeMismatch,
@@ -1072,6 +1648,9 @@ export function TourViewer({
         expectedRoute={expectedStepRoute}
         currentRoute={normalizedCurrentRoute}
         autoNavigating={isAutoNavigating}
+        resolvePath={debug ? resolvePath : null}
+        resolveMatchScore={debug ? resolveMatchScore : null}
+        resolvedSelector={debug ? resolvedSelector : null}
       />
       {resolvedContextualSuggestions ? (
         <ContextualSuggestionsPublisher

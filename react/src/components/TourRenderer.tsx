@@ -7,6 +7,14 @@ import { Tooltip } from './Tooltip';
 import { OnboardingTheme } from './theme';
 import { TourPortal } from './TourPortal';
 
+function isStableSelectorForRuntimeDisplay(selector?: string): boolean {
+  if (!selector) return false;
+  if (selector.includes('[data-tour-id=')) return true;
+  if (selector.startsWith('#')) return true;
+  if (selector.includes('[aria-label=')) return true;
+  return false;
+}
+
 export interface TourRendererProps {
   isOpen?: boolean;
   currentStep?: Step | null;
@@ -28,6 +36,10 @@ export interface TourRendererProps {
   expectedRoute?: string;
   currentRoute?: string;
   autoNavigating?: boolean;
+  resolvePath?: 'primary' | 'alternative' | 'fingerprint' | 'semantic-fallback' | 'not-found' | null;
+  resolveMatchScore?: number | null;
+  /** Selector that resolved successfully — used to suppress misleading low-confidence badge. */
+  resolvedSelector?: string | null;
 }
 
 /**
@@ -56,6 +68,9 @@ export function TourRenderer({
   expectedRoute,
   currentRoute,
   autoNavigating = false,
+  resolvePath = null,
+  resolveMatchScore = null,
+  resolvedSelector = null,
 }: TourRendererProps) {
   const [showFallback, setShowFallback] = useState(false);
   const [showRouteFallback, setShowRouteFallback] = useState(false);
@@ -216,6 +231,36 @@ export function TourRenderer({
           <div style={{ color: 'rgba(203, 213, 225, 0.72)', marginTop: 10 }}>
             Si la redirection automatique ne démarre pas, ouvrez cette route: le tour reprendra tout seul.
           </div>
+        </div>
+      ) : null}
+
+      {resolvePath ? (
+        <div
+          style={{
+            position: 'fixed',
+            left: 16,
+            bottom: 16,
+            zIndex: 2147483595,
+            borderRadius: 10,
+            border: '1px solid rgba(255,255,255,0.24)',
+            background: 'rgba(15,23,42,0.82)',
+            color: '#e2e8f0',
+            padding: '6px 10px',
+            fontSize: 11,
+            fontWeight: 600,
+            letterSpacing: '0.01em',
+            backdropFilter: 'blur(10px)',
+          }}
+        >
+          resolve: {resolvePath}
+          {typeof resolveMatchScore === 'number'
+            ? ` · match ${Math.round(resolveMatchScore)}${
+                resolveMatchScore < 50 &&
+                !(resolvePath === 'primary' && isStableSelectorForRuntimeDisplay(resolvedSelector || undefined))
+                  ? ' · low-confidence'
+                  : ''
+              }`
+            : ''}
         </div>
       ) : null}
 

@@ -33,10 +33,102 @@ import {
   mergeBackendHints,
   type BackendSemanticInferenceStatus,
 } from './semantic-backend-client';
+import {
+  MAX_TARGET_LABEL_LENGTH,
+  draftTargetSpecificityScore,
+  enforceSemanticStepCopy,
+  getCanonicalTargetKeyForStep,
+  getShortElementLabel,
+  isBloatedCopyText,
+  isOversizedStepTarget,
+  sanitizeStepCopy,
+} from './step-structural-guards';
+
+/** Checkout CTA — must outrank payment-method tiles (cash, card, QR). */
+const PLACE_ORDER_CTA_PATTERN = /place\s*order|confirm\s*order|commander/i;
+/** Payment instrument selectors — never treat as primary CTA. */
+const PAYMENT_METHOD_LABEL_PATTERN =
+  /\b(cash|credit\s*\/?\s*debit|debit\s*card|credit\s*card|qr\s*code|carte|encaisser|encaissement|checkout)\b/i;
+
+function isPlaceOrderCtaLabel(label: string): boolean {
+  return PLACE_ORDER_CTA_PATTERN.test(normalizeText(label));
+}
+
+function isPaymentMethodLabel(label: string): boolean {
+  const normalized = normalizeText(label);
+  if (isPlaceOrderCtaLabel(normalized)) return false;
+  return PAYMENT_METHOD_LABEL_PATTERN.test(normalized);
+}
+
+function applySinglePageTourProfile(options?: TourDraftGenerationOptions): TourDraftGenerationOptions | undefined {
+  if (!options?.singlePageTour) return options;
+  return {
+    ...options,
+    includeSupportDraft: false,
+    includeNavigationDraft: false,
+    includeFormDraft: false,
+    maxDrafts: 1,
+    maxSteps: options.maxSteps ?? 7,
+    sequenceMinConfidence: options.sequenceMinConfidence ?? 35,
+  };
+}
+
+function resolveSequenceMinConfidence(options: TourDraftGenerationOptions | undefined): number {
+  if (typeof options?.sequenceMinConfidence === 'number') return options.sequenceMinConfidence;
+  if (options?.singlePageTour) return 35;
+  return 45;
+}
+
+function candidateRankingShortId(candidate: DetectedElement): string {
+  const tourId = candidate.selector.match(/\[data-tour-id=["']([^"']+)["']\]/i)?.[1];
+  if (tourId) return tourId;
+  return (
+    normalizeText(candidate.label)
+      .slice(0, 28)
+      .replace(/\s+/g, '-')
+      .replace(/[^a-z0-9-]/gi, '') || 'element'
+  );
+}
+
+function buildCandidateRankingDebug(
+  candidates: DetectedElement[],
+  winners: Partial<Record<TourDraftIntent, DetectedElement | null>>,
+): NonNullable<ContextualGenerationDebugReport['candidateRankings']> {
+  const intents: TourDraftIntent[] = ['primary-action', 'support-navigation', 'form-flow', 'discovery'];
+
+  return intents.map((intent) => {
+    const pool = candidates.filter((candidate) => {
+      if (candidate.intent === intent) return true;
+      if (intent === 'primary-action' && isPlaceOrderCtaLabel(candidate.label)) return true;
+      return false;
+    });
+
+    const sorted = pool.slice().sort((a, b) => effectiveRank(b) - effectiveRank(a));
+    const top5 = sorted.slice(0, 5);
+    const winner = winners[intent] ?? null;
+    const winnerScore = winner ? Math.round(effectiveRank(winner)) : null;
+    const winnerId = winner ? candidateRankingShortId(winner) : null;
+
+    const lines = top5.map((candidate) => {
+      const id = candidateRankingShortId(candidate);
+      const score = Math.round(effectiveRank(candidate));
+      if (winner && candidate.selector === winner.selector) {
+        return `${id} · score ${score} · selected`;
+      }
+      if (winner && winnerId && winnerScore !== null && candidate.selector !== winner.selector) {
+        return `${id} · score ${score} · lost to: ${winnerId} (score ${winnerScore})`;
+      }
+      return `${id} · score ${score}`;
+    });
+
+    return { intent, lines };
+  });
+}
 
 export interface DetectedElement {
   element: HTMLElement;
   selector: string;
+  selectorCandidates: string[];
   label: string;
   score: number;
   /**
@@ -57,6 +149,7 @@ export interface DetectedElement {
   semanticScore: number;
   personaScore: number;
   sequenceScore: number;
+  selectorStabilityScore: number;
   selectorStabilityBonus: number;
   selectorFragilityPenalty: number;
   actionabilityPenalty: number;
@@ -110,6 +203,10 @@ interface RuntimeState {
   mutationBatchWindowMs: number;
   maxDirtyNodesPerBatch: number;
   observer?: MutationObserver;
+  /** Root currently observed by `observer` (for scoped teardown/rebind). */
+  observedRoot?: ParentNode;
+  /** Last scan scope (pathname + analysis root) — invalidates incremental cache on lab navigation. */
+  lastAnalysisScopeKey: string;
 }
 
 type Lexicon = Record<TourDraftIntent, string[]>;
@@ -143,6 +240,8 @@ interface ConflictEvent {
   winnerDraft: string;
   loserDraft: string;
   reason: string;
+  /** Canonical DOM target key when conflict is element-level (not only selector string). */
+  targetKey?: string;
 }
 
 interface FlowRegistryEntry {
@@ -166,7 +265,9 @@ const FEEDBACK_COUNTER_CAP = 10_000;
 const FEEDBACK_MAX_SELECTORS = 500;
 const FLOW_VERSION_REGISTRY_STORAGE_KEY = '__trustdev_contextual_flow_registry_v1';
 const MAX_TRACKED_ELEMENTS = 1200;
-const DEFAULT_MUTATION_BATCH_WINDOW_MS = 120;
+/** Minimum debounce between mutation batches — keeps snapshot work under ~3/s. */
+const MIN_MUTATION_BATCH_WINDOW_MS = 300;
+const DEFAULT_MUTATION_BATCH_WINDOW_MS = MIN_MUTATION_BATCH_WINDOW_MS;
 const DEFAULT_MAX_DIRTY_NODES_PER_BATCH = 280;
 const DEFAULT_NOISE_SELECTORS = [
   '[aria-busy="true"]',
@@ -191,7 +292,37 @@ const DEFAULT_NOISE_SELECTORS = [
   '[id*="tooltip"]',
   '[id*="toast"]',
   '[id*="loader"]',
+  // Trustdev contextual suggestions publisher (fixed bottom-right debug panel).
+  '.trustdev-contextual-debug-panel',
+  '[data-tour-id="contextual-debug-panel"]',
+  '[data-trustdev-contextual-panel]',
+  '[aria-label="Trustdev contextual suggestions panel"]',
 ];
+
+/** Host-facing debug panel — never a tour target (even with legacy data-tour-id). */
+const CONTEXTUAL_PANEL_SELECTOR_MARKERS = [
+  'contextual-debug-panel',
+  'trustdev-contextual-panel',
+  'trustdev-contextual-debug-panel',
+] as const;
+
+function isTrustdevContextualPanelElement(element: HTMLElement): boolean {
+  if (element.closest('[data-trustdev-contextual-panel]')) return true;
+  if (element.closest('.trustdev-contextual-debug-panel')) return true;
+  if (element.getAttribute('data-tour-id') === 'contextual-debug-panel') return true;
+  if (element.closest('[data-tour-id="contextual-debug-panel"]')) return true;
+  const aria = normalizeText(element.getAttribute('aria-label') || '');
+  if (aria === 'trustdev contextual suggestions panel') return true;
+  return false;
+}
+
+export function isTrustdevContextualPanelSelector(selector?: string): boolean {
+  if (!selector) return false;
+  const normalized = normalizeText(selector);
+  if (normalized.includes('trustdev contextual suggestions panel')) return true;
+  return CONTEXTUAL_PANEL_SELECTOR_MARKERS.some((marker) => selector.includes(marker));
+}
+
 const TRANSIENT_UI_KEYWORDS = ['tooltip', 'toast', 'snackbar', 'loader', 'loading', 'spinner', 'skeleton', 'coachmark', 'onboarding'];
 const INTERACTIVE_SELECTOR = [
   'button',
@@ -381,10 +512,29 @@ const runtime: RuntimeState = {
   selectorCache: new WeakMap<HTMLElement, string>(),
   mutationBatchWindowMs: DEFAULT_MUTATION_BATCH_WINDOW_MS,
   maxDirtyNodesPerBatch: DEFAULT_MAX_DIRTY_NODES_PER_BATCH,
+  lastAnalysisScopeKey: '',
 };
 
 let activeDiagnostics: GenerationDiagnostics | null = null;
 let lastGenerationDebugReport: ContextualGenerationDebugReport | null = null;
+
+type GenericSinglePageSlotId =
+  | 'primary-action'
+  | 'search'
+  | 'secondary-action'
+  | 'navigation'
+  | 'analytics-or-result'
+  | 'utility'
+  | 'settings-or-profile';
+
+type SinglePageSlotDecision = {
+  slot: number;
+  slotId: GenericSinglePageSlotId;
+  status: 'filled' | 'skipped';
+  line: string;
+};
+
+let lastSinglePageChainSlotDecisions: SinglePageSlotDecision[] = [];
 
 /**
  * Stability fix (instability source B): feedback store snapshot captured ONCE
@@ -876,74 +1026,116 @@ function resolveDraftConflicts(
 
   const strategy = resolveConflictStrategy(options);
   const conflicts: ConflictEvent[] = [];
-  const ownership = new Map<string, { draftName: string; priority: number }>();
 
-  const ranked = drafts
-    .map((draft, index) => ({ draft, index, priority: draftPriorityScore(draft, strategy) }))
-    .sort((a, b) => b.priority - a.priority);
+  interface TargetClaim {
+    draft: SuggestedTourDraft;
+    draftIndex: number;
+    draftPriority: number;
+    step: Step;
+    stepSpecificity: number;
+    targetKey: string;
+    selector: string;
+  }
 
-  const processed = ranked.map((entry) => {
-    const filteredSteps: Step[] = [];
-    const localSeen = new Set<string>();
-    const dedupedSteps = dedupeStepsBySelector(entry.draft.steps);
-    for (const [stepIndex, step] of dedupedSteps.entries()) {
+  const claimsByTarget = new Map<string, TargetClaim[]>();
+
+  drafts.forEach((draft, draftIndex) => {
+    const draftPriority = draftPriorityScore(draft, strategy);
+    const localSeenSelectors = new Set<string>();
+    const localSeenTargets = new Set<string>();
+
+    for (const step of dedupeStepsBySelector(draft.steps)) {
       const selector = step.targetSelector || '';
-      if (!selector || localSeen.has(selector)) continue;
+      if (!selector || localSeenSelectors.has(selector)) continue;
+      localSeenSelectors.add(selector);
 
-      localSeen.add(selector);
-      const existingOwner = ownership.get(selector);
-      const protectPrimaryAnchor = entry.draft.intent === 'primary-action' && stepIndex === 0;
+      const targetKey = getCanonicalTargetKeyForStep(step);
+      if (localSeenTargets.has(targetKey)) continue;
+      localSeenTargets.add(targetKey);
 
-      if (protectPrimaryAnchor) {
-        // Keep the first step of a primary-action draft as an anchor even if another draft references the same selector.
-        ownership.set(selector, { draftName: entry.draft.name, priority: entry.priority });
-        filteredSteps.push(step);
-        continue;
-      }
-
-      if (!existingOwner) {
-        ownership.set(selector, { draftName: entry.draft.name, priority: entry.priority });
-        filteredSteps.push(step);
-        continue;
-      }
-
-      conflicts.push({
+      const claim: TargetClaim = {
+        draft,
+        draftIndex,
+        draftPriority,
+        step,
+        stepSpecificity: draftTargetSpecificityScore(draft, step),
+        targetKey,
         selector,
-        winnerDraft: existingOwner.draftName,
-        loserDraft: entry.draft.name,
-        reason: `selector conflict resolved by ${strategy}`,
-      });
+      };
+      const bucket = claimsByTarget.get(targetKey) || [];
+      bucket.push(claim);
+      claimsByTarget.set(targetKey, bucket);
     }
-
-    const draftExplainability = entry.draft.explainability
-      ? {
-          ...entry.draft.explainability,
-          conflictNotes: [
-            ...entry.draft.explainability.conflictNotes,
-            ...conflicts
-              .filter((conflict) => conflict.loserDraft === entry.draft.name || conflict.winnerDraft === entry.draft.name)
-              .map((conflict) => `${conflict.selector}: ${conflict.reason}`),
-          ],
-        }
-      : undefined;
-
-    return {
-      ...entry,
-      draft: {
-        ...entry.draft,
-        steps: filteredSteps,
-        detectedSelectors: filteredSteps.map((step) => step.targetSelector).filter(Boolean) as string[],
-        explainability: draftExplainability,
-      },
-    };
   });
 
-  const filtered = processed
+  const winningClaims: TargetClaim[] = [];
+
+  for (const [targetKey, claims] of claimsByTarget.entries()) {
+    claims.sort((a, b) => {
+      if (b.stepSpecificity !== a.stepSpecificity) return b.stepSpecificity - a.stepSpecificity;
+      if (b.draftPriority !== a.draftPriority) return b.draftPriority - a.draftPriority;
+      return a.draftIndex - b.draftIndex;
+    });
+
+    const winner = claims[0];
+    winningClaims.push(winner);
+
+    for (let i = 1; i < claims.length; i += 1) {
+      const loser = claims[i];
+      const conflict: ConflictEvent = {
+        selector: loser.selector,
+        winnerDraft: winner.draft.name,
+        loserDraft: loser.draft.name,
+        targetKey,
+        reason: `dom-target conflict (${targetKey}): kept more specific tour (${strategy})`,
+      };
+      conflicts.push(conflict);
+      if (typeof console !== 'undefined') {
+        console.warn('[TrustDev SDK] Tour target conflict — one DOM target, one tour', {
+          targetKey,
+          winnerTour: winner.draft.name,
+          loserTour: loser.draft.name,
+          winnerSelector: winner.selector,
+          loserSelector: loser.selector,
+        });
+      }
+    }
+  }
+
+  const stepsByDraftName = new Map<string, Step[]>();
+  for (const claim of winningClaims) {
+    const list = stepsByDraftName.get(claim.draft.name) || [];
+    list.push(claim.step);
+    stepsByDraftName.set(claim.draft.name, list);
+  }
+
+  const resolvedDrafts = drafts
+    .map((draft, index) => {
+      const keptSteps = recomputeStepOrderIndex(stepsByDraftName.get(draft.name) || []);
+      const conflictNotes = conflicts
+        .filter((conflict) => conflict.loserDraft === draft.name || conflict.winnerDraft === draft.name)
+        .map((conflict) => `${conflict.selector}: ${conflict.reason}`);
+
+      return {
+        index,
+        draft: {
+          ...draft,
+          steps: keptSteps,
+          detectedSelectors: keptSteps.map((step) => step.targetSelector).filter(Boolean) as string[],
+          explainability: draft.explainability
+            ? {
+                ...draft.explainability,
+                conflictNotes: [...draft.explainability.conflictNotes, ...conflictNotes],
+              }
+            : draft.explainability,
+        },
+      };
+    })
     .filter((entry) => entry.draft.steps.length > 0)
     .sort((a, b) => a.index - b.index)
     .map((entry) => entry.draft);
 
-  return { drafts: filtered, conflicts };
+  return { drafts: resolvedDrafts, conflicts };
 }
 
 export function getLastContextualGenerationDebugReport(): ContextualGenerationDebugReport | null {
@@ -958,6 +1150,57 @@ export function restoreLastContextualGenerationDebugReport(
 
 export function clearLastContextualGenerationDebugReport(): void {
   lastGenerationDebugReport = null;
+}
+
+function getAnalysisScopeKey(options?: TourDraftGenerationOptions): string {
+  const selector = normalizeText(options?.analysisRootSelector) || '__document__';
+  const pathname =
+    typeof window !== 'undefined' ? window.location.pathname + window.location.search : '__ssr__';
+  return `${pathname}::${selector}`;
+}
+
+function countConnectedTrackedInAnalysisRoot(options?: TourDraftGenerationOptions): number {
+  let count = 0;
+  for (const element of runtime.trackedElements) {
+    if (!element.isConnected) continue;
+    if (!isWithinAnalysisRoot(element, options)) continue;
+    count += 1;
+  }
+  return count;
+}
+
+/**
+ * Clears incremental candidate cache. Call before a manual lab analysis or when
+ * switching host surfaces so `trackedElements` from a previous page cannot yield 0 candidates.
+ */
+export function invalidateContextualCandidateScanState(): void {
+  runtime.fullRescanNeeded = true;
+  runtime.lastAnalysisScopeKey = '';
+  runtime.trackedElements.clear();
+  runtime.dirtyNodes.clear();
+  runtime.batchedDirtyNodes.clear();
+  runtime.domVersion += 1;
+}
+
+function prepareCandidateScan(options?: TourDraftGenerationOptions): void {
+  const scopeKey = getAnalysisScopeKey(options);
+  if (scopeKey !== runtime.lastAnalysisScopeKey) {
+    runtime.lastAnalysisScopeKey = scopeKey;
+    runtime.fullRescanNeeded = true;
+    runtime.trackedElements.clear();
+    runtime.dirtyNodes.clear();
+    runtime.batchedDirtyNodes.clear();
+    runtime.domVersion += 1;
+    return;
+  }
+
+  if (runtime.trackedElements.size > 0 && countConnectedTrackedInAnalysisRoot(options) === 0) {
+    runtime.fullRescanNeeded = true;
+    runtime.trackedElements.clear();
+    runtime.dirtyNodes.clear();
+    runtime.batchedDirtyNodes.clear();
+    runtime.domVersion += 1;
+  }
 }
 
 function getDefaultFeedbackStats(): FeedbackStats {
@@ -1206,6 +1449,8 @@ function combinedFeedbackWeight(args: {
   intent: TourDraftIntent;
   localStore: FeedbackStore;
 }): number {
+  if (isTrustdevContextualPanelSelector(args.selector)) return 0;
+
   const localSelector = args.localStore.selectors[args.selector];
   const localIntent = args.localStore.intents[args.intent];
   const localScore = feedbackWeight(localSelector) + feedbackWeight(localIntent) * 0.6;
@@ -1342,6 +1587,8 @@ function shouldIgnoreTransientContainer(element: HTMLElement): boolean {
 
 function isNoiseElement(element: HTMLElement, options?: TourDraftGenerationOptions): boolean {
   if (!isWithinAnalysisRoot(element, options)) return true;
+  // SDK debug panel: always noise (do not exempt data-tour-id on the panel root).
+  if (isTrustdevContextualPanelElement(element)) return true;
 
   const selectors = getNoiseSelectors(options);
   const noiseMatch = selectors.some((selector) => {
@@ -1377,17 +1624,7 @@ function isNoiseElement(element: HTMLElement, options?: TourDraftGenerationOptio
 }
 
 function getLabel(element: HTMLElement): string {
-  const candidates = [
-    element.getAttribute('data-tour-label'),
-    element.getAttribute('aria-label'),
-    element.getAttribute('title'),
-    element.getAttribute('placeholder'),
-    element.textContent,
-    element.getAttribute('data-testid'),
-    element.getAttribute('name'),
-  ];
-
-  return normalizeText(candidates.find((value) => normalizeText(value).length > 0) || '');
+  return getShortElementLabel(element);
 }
 
 function detectZone(element: HTMLElement): CandidateZone {
@@ -1513,7 +1750,32 @@ function tryUniqueSelector(selector: string): boolean {
 
 function isStableSelectorForPublish(selector?: string): boolean {
   if (!selector) return false;
-  return /data-tour-id|data-testid|data-cy|data-qa|#[A-Za-z][\w-]*\b|\[aria-label/i.test(selector);
+  return (
+    /data-tour-id|data-testid|data-cy|data-qa|#[A-Za-z][\w-]*\b|\[aria-label/i.test(selector) ||
+    /\[placeholder=["'][^"']+["']\]/i.test(selector) ||
+    /a\[href[\^*$|~]?=["']\/[^"']*["']\]/i.test(selector)
+  );
+}
+
+function pickPreferredSelector(element: HTMLElement, selectorCandidates: string[]): string {
+  const ranked = [...selectorCandidates].sort((a, b) => selectorStabilityScore(b) - selectorStabilityScore(a));
+  return ranked.find((selector) => isStableSelectorForPublish(selector)) || ranked[0] || buildUniqueSelector(element);
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function selectorStabilityScore(selector?: string): number {
+  if (!selector) return 0;
+  if (selector.includes('[data-tour-id=')) return 96;
+  if (selector.includes('[data-testid=')) return 90;
+  if (selector.includes('[data-cy=') || selector.includes('[data-qa=')) return 86;
+  if (selector.startsWith('#')) return 78;
+  if (selector.includes('[aria-label=')) return 68;
+  if (selector.includes('[role=')) return 60;
+  if (selector.includes(':nth-of-type(') || selector.includes(':nth-child(')) return 22;
+  return clamp(50 + selectorStabilityDelta(selector), 20, 82);
 }
 
 function buildSelectorPart(element: HTMLElement): string {
@@ -1556,54 +1818,84 @@ function buildSelectorPart(element: HTMLElement): string {
   return `${tagName}:nth-of-type(${Math.max(1, index)})`;
 }
 
-function buildUniqueSelector(element: HTMLElement): string {
-  const cached = runtime.selectorCache.get(element);
-  if (cached && tryUniqueSelector(cached)) return cached;
+function getUniqueSelectorOrNull(selector: string): string | null {
+  return tryUniqueSelector(selector) ? selector : null;
+}
 
+function buildSelectorCandidates(element: HTMLElement): string[] {
   const tagName = element.tagName.toLowerCase();
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  const push = (selector: string | null | undefined) => {
+    if (!selector) return;
+    if (seen.has(selector)) return;
+    seen.add(selector);
+    candidates.push(selector);
+  };
 
   for (const attributeName of STABLE_ATTRIBUTES) {
     const value = element.getAttribute(attributeName);
     if (!value) continue;
-
-    const selector = buildStableAttributeSelector(tagName, attributeName, value);
-    if (tryUniqueSelector(selector)) {
-      runtime.selectorCache.set(element, selector);
-      return selector;
-    }
+    push(getUniqueSelectorOrNull(buildStableAttributeSelector(tagName, attributeName, value)));
   }
 
   if (element.id) {
-    const selector = `#${CSS.escape(element.id)}`;
-    if (tryUniqueSelector(selector)) {
-      runtime.selectorCache.set(element, selector);
-      return selector;
-    }
+    push(getUniqueSelectorOrNull(`#${CSS.escape(element.id)}`));
+    push(getUniqueSelectorOrNull(`${tagName}#${CSS.escape(element.id)}`));
+  }
+
+  const role = element.getAttribute('role');
+  if (role) {
+    push(getUniqueSelectorOrNull(`${tagName}[role="${escapeAttributeValue(role)}"]`));
+  }
+
+  const ariaLabel = element.getAttribute('aria-label');
+  if (ariaLabel) {
+    push(getUniqueSelectorOrNull(`${tagName}[aria-label="${escapeAttributeValue(ariaLabel)}"]`));
+  }
+
+  const placeholder = element.getAttribute('placeholder');
+  if (placeholder && (tagName === 'input' || tagName === 'textarea')) {
+    push(getUniqueSelectorOrNull(`${tagName}[placeholder="${escapeAttributeValue(placeholder)}"]`));
+  }
+
+  const href = element.getAttribute('href');
+  if (href && tagName === 'a') {
+    push(getUniqueSelectorOrNull(`a[href="${escapeAttributeValue(href)}"]`));
   }
 
   const path: string[] = [];
   let current: HTMLElement | null = element;
   let depth = 0;
-
   while (current && current !== document.body && depth < 7) {
     path.unshift(buildSelectorPart(current));
-    const selector = path.join(' > ');
-    if (tryUniqueSelector(selector)) {
-      runtime.selectorCache.set(element, selector);
-      return selector;
-    }
-
-    if (STABLE_ATTRIBUTES.some((attributeName) => current?.hasAttribute(attributeName))) {
-      break;
-    }
-
+    push(getUniqueSelectorOrNull(path.join(' > ')));
+    if (STABLE_ATTRIBUTES.some((attributeName) => current?.hasAttribute(attributeName))) break;
     current = current.parentElement;
     depth += 1;
   }
 
   const fallback = path.join(' > ') || tagName;
-  runtime.selectorCache.set(element, fallback);
-  return fallback;
+  push(fallback);
+  return candidates;
+}
+
+function buildUniqueSelector(element: HTMLElement): string {
+  const cached = runtime.selectorCache.get(element);
+  if (cached && tryUniqueSelector(cached)) return cached;
+  const candidates = buildSelectorCandidates(element);
+  const selected = candidates[0] || element.tagName.toLowerCase();
+  runtime.selectorCache.set(element, selected);
+  return selected;
+}
+
+/** Avoid false positives such as discovery term `tour` matching token `projet`. */
+function lexiconTermMatchesToken(token: string, term: string): boolean {
+  if (!token || !term) return false;
+  if (token === term) return true;
+  // Short stems (e.g. `tour`, `cre`) only match whole tokens, not substrings of other words.
+  if (term.length < 4) return false;
+  return token.includes(term);
 }
 
 function computeSemanticMatches(label: string, lexicon: Lexicon): SemanticMatchResult {
@@ -1622,7 +1914,7 @@ function computeSemanticMatches(label: string, lexicon: Lexicon): SemanticMatchR
       const normalizedTerm = stemToken(normalizeText(term));
       if (!normalizedTerm) continue;
 
-      if (tokenSet.has(normalizedTerm) || Array.from(tokenSet).some((token) => token.includes(normalizedTerm))) {
+      if (tokenSet.has(normalizedTerm) || Array.from(tokenSet).some((token) => lexiconTermMatchesToken(token, normalizedTerm))) {
         tokenHits[intent] += 1;
       }
     }
@@ -1633,10 +1925,11 @@ function computeSemanticMatches(label: string, lexicon: Lexicon): SemanticMatchR
 }
 
 function getIntentFromSemanticHits(result: SemanticMatchResult, zone: CandidateZone): TourDraftIntent {
+  const intentPriority: TourDraftIntent[] = ['primary-action', 'form-flow', 'support-navigation', 'discovery'];
   let bestIntent: TourDraftIntent = 'discovery';
-  let bestScore = result.tokenHits.discovery;
+  let bestScore = -1;
 
-  for (const intent of ['primary-action', 'support-navigation', 'form-flow'] as TourDraftIntent[]) {
+  for (const intent of intentPriority) {
     const value = result.tokenHits[intent];
     if (value > bestScore) {
       bestIntent = intent;
@@ -1696,6 +1989,12 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
     return null;
   }
 
+  if (isOversizedStepTarget(element)) {
+    if (activeDiagnostics) activeDiagnostics.rejectedNoise += 1;
+    runtime.scoreCache.set(element, { domVersion: runtime.domVersion, detected: null });
+    return null;
+  }
+
   const label = getLabel(element);
   if (!label) {
     if (activeDiagnostics) activeDiagnostics.rejectedNoLabel += 1;
@@ -1707,7 +2006,8 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
   const semantic = computeSemanticMatches(label, lexicon);
   const semanticScore = buildSemanticAffinity(label, options);
 
-  const selector = buildUniqueSelector(element);
+  const selectorCandidates = buildSelectorCandidates(element);
+  const selector = pickPreferredSelector(element, selectorCandidates);
   if (!selector) {
     if (activeDiagnostics) activeDiagnostics.rejectedNoSelector += 1;
     runtime.scoreCache.set(element, { domVersion: runtime.domVersion, detected: null });
@@ -1717,10 +2017,23 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
   const zone = detectZone(element);
   const features = getScoreFeatures(element);
   const tagName = element.tagName.toLowerCase();
+  const inputType = (element.getAttribute('type') || '').toLowerCase();
   let intent = getIntentFromSemanticHits(semantic, zone);
   const sessionContext = getSessionContext(options);
   const isActionable = isActionableElement(element);
   const isFormControl = isFormControlElement(element);
+  const normalizedLabel = normalizeText(label);
+  const isPlaceOrderCta =
+    isPlaceOrderCtaLabel(normalizedLabel) &&
+    (tagName === 'button' ||
+      (tagName === 'input' && (inputType === 'submit' || inputType === 'button' || inputType === '')));
+  const isPaymentMethod = isPaymentMethodLabel(normalizedLabel) && tagName === 'button';
+
+  if (isPlaceOrderCta) {
+    intent = 'primary-action';
+  } else if (isPaymentMethod && intent === 'primary-action') {
+    intent = 'discovery';
+  }
 
   if (intent === 'primary-action' && !isActionable) {
     intent = zone === 'navigation' || zone === 'sidebar' || zone === 'header' ? 'support-navigation' : 'discovery';
@@ -1762,6 +2075,7 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
   score += features.viewportWeight;
 
   const stabilityDelta = selectorStabilityDelta(selector);
+  const stabilityScore = selectorStabilityScore(selector);
   const selectorStabilityBonus = Math.max(0, stabilityDelta);
   const selectorFragilityPenalty = Math.min(0, stabilityDelta);
   let actionabilityPenalty = 0;
@@ -1780,13 +2094,21 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
   }
 
   if (intent === 'primary-action') {
-    const normalizedLabel = normalizeText(label);
     if (zone === 'form' || zone === 'main') {
       score += 14;
       reasons.push('primary-action boost: form/main zone');
     }
 
-    const inputType = (element.getAttribute('type') || '').toLowerCase();
+    if (isPlaceOrderCta) {
+      score += 55;
+      reasons.push('cta-primary boost: place order control');
+    }
+
+    if (isPaymentMethod) {
+      score -= 45;
+      reasons.push('utility penalty: payment method misclassified as primary');
+    }
+
     if (tagName === 'button' || (tagName === 'input' && (inputType === 'submit' || inputType === 'button'))) {
       score += 14;
       reasons.push('primary-action boost: actionable control');
@@ -1846,7 +2168,11 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
   // applied inside `.sort()` comparators (see `pickBest*` / `pickAny*`) to
   // nudge which candidate becomes primary/support, without ever silently
   // promoting or demoting a draft below a filter threshold.
-  const rankingBoost = feedbackBonus;
+  const placeOrderRankingBoost = isPlaceOrderCta ? 80 : isPaymentMethod ? -60 : 0;
+  const rankingBoost = feedbackBonus + placeOrderRankingBoost;
+  if (placeOrderRankingBoost !== 0) {
+    reasons.push(`place-order ranking bias: ${placeOrderRankingBoost > 0 ? '+' : ''}${placeOrderRankingBoost}`);
+  }
   if (feedbackBonus !== 0) {
     reasons.push(`feedback ranking bias (not filter): ${feedbackBonus > 0 ? '+' : ''}${feedbackBonus.toFixed(1)}`);
   }
@@ -1887,6 +2213,7 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
   const detected: DetectedElement = {
     element,
     selector,
+    selectorCandidates,
     label,
     score: normalizedScore,
     rankingBoost,
@@ -1898,6 +2225,7 @@ function scoreElement(element: HTMLElement, options?: TourDraftGenerationOptions
     semanticScore,
     personaScore,
     sequenceScore,
+    selectorStabilityScore: stabilityScore,
     selectorStabilityBonus,
     selectorFragilityPenalty,
     actionabilityPenalty,
@@ -1918,8 +2246,38 @@ function configureBatching(options?: TourDraftGenerationOptions): void {
   const requestedWindow = options?.mutationBatchWindowMs ?? DEFAULT_MUTATION_BATCH_WINDOW_MS;
   const requestedLimit = options?.maxDirtyNodesPerBatch ?? DEFAULT_MAX_DIRTY_NODES_PER_BATCH;
 
-  runtime.mutationBatchWindowMs = Math.max(20, Math.min(1500, requestedWindow));
+  runtime.mutationBatchWindowMs = Math.max(MIN_MUTATION_BATCH_WINDOW_MS, Math.min(1500, requestedWindow));
   runtime.maxDirtyNodesPerBatch = Math.max(50, Math.min(5000, requestedLimit));
+}
+
+function isMeaningfulCandidateMutation(mutation: MutationRecord): boolean {
+  if (mutation.type === 'childList') {
+    return mutation.addedNodes.length > 0 || mutation.removedNodes.length > 0;
+  }
+  return false;
+}
+
+/**
+ * Disconnect the incremental candidate observer so it does not keep watching
+ * `document.body` (or a large subtree) after a generation pass completes.
+ */
+export function releaseCandidateMutationObserver(): void {
+  if (runtime.mutationFlushTimer) {
+    clearTimeout(runtime.mutationFlushTimer);
+    runtime.mutationFlushTimer = undefined;
+  }
+  if (runtime.observer) {
+    try {
+      runtime.observer.disconnect();
+    } catch {
+      /* noop */
+    }
+    runtime.observer = undefined;
+    runtime.observedRoot = undefined;
+  }
+  runtime.batchedDirtyNodes.clear();
+  runtime.trackedElements.clear();
+  runtime.fullRescanNeeded = true;
 }
 
 function flushBatchedMutations(forceFullRescan = false): void {
@@ -1963,18 +2321,33 @@ function scheduleMutationFlush(): void {
   }, runtime.mutationBatchWindowMs);
 }
 
+function resolveMutationObserverRoot(options?: TourDraftGenerationOptions): ParentNode {
+  const analysisRoot = resolveAnalysisRoot(options);
+  if (analysisRoot instanceof HTMLElement && analysisRoot.isConnected) {
+    return analysisRoot;
+  }
+  if (typeof document !== 'undefined') {
+    const main = document.querySelector('main');
+    if (main instanceof HTMLElement && main.isConnected) return main;
+    if (document.body) return document.body;
+  }
+  return document;
+}
+
 function ensureMutationObserver(options?: TourDraftGenerationOptions): void {
   if (typeof document === 'undefined') return;
   configureBatching(options);
-  if (runtime.observer) return;
+
+  const observeRoot = resolveMutationObserverRoot(options);
+  if (runtime.observer && runtime.observedRoot === observeRoot) return;
+
+  releaseCandidateMutationObserver();
 
   runtime.observer = new MutationObserver((mutations) => {
-    if (mutations.length > runtime.maxDirtyNodesPerBatch * 2) {
-      flushBatchedMutations(true);
-      return;
-    }
-
+    let structuralCount = 0;
     for (const mutation of mutations) {
+      if (!isMeaningfulCandidateMutation(mutation)) continue;
+      structuralCount += 1;
       if (mutation.target instanceof HTMLElement) {
         runtime.batchedDirtyNodes.add(mutation.target);
       }
@@ -1988,15 +2361,25 @@ function ensureMutationObserver(options?: TourDraftGenerationOptions): void {
       }
     }
 
+    if (structuralCount === 0) return;
+
+    if (mutations.length > runtime.maxDirtyNodesPerBatch * 2) {
+      flushBatchedMutations(true);
+      return;
+    }
+
     scheduleMutationFlush();
   });
 
-  runtime.observer.observe(document.body, {
+  const observeTarget =
+    observeRoot instanceof Document ? observeRoot.documentElement || observeRoot.body : observeRoot;
+  if (!observeTarget) return;
+
+  runtime.observer.observe(observeTarget, {
     subtree: true,
     childList: true,
-    attributes: true,
-    attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'aria-label', 'title', 'placeholder', 'disabled', 'aria-disabled'],
   });
+  runtime.observedRoot = observeRoot;
 }
 
 function harvestInteractiveNodesFromRoot(root: ParentNode): HTMLElement[] {
@@ -2004,7 +2387,11 @@ function harvestInteractiveNodesFromRoot(root: ParentNode): HTMLElement[] {
   return Array.from(root.querySelectorAll(INTERACTIVE_SELECTOR)) as HTMLElement[];
 }
 
-function collectCandidates(options?: TourDraftGenerationOptions): DetectedElement[] {
+function collectCandidates(
+  options?: TourDraftGenerationOptions,
+  rescanAttempt = 0,
+): DetectedElement[] {
+  prepareCandidateScan(options);
   ensureMutationObserver(options);
   flushBatchedMutations();
 
@@ -2012,7 +2399,13 @@ function collectCandidates(options?: TourDraftGenerationOptions): DetectedElemen
   const useIncremental = options?.enableIncremental !== false;
   const nodesToEvaluate: Set<HTMLElement> = new Set<HTMLElement>();
 
-  if (!useIncremental || runtime.fullRescanNeeded || runtime.trackedElements.size === 0) {
+  const needsFullRescan =
+    !useIncremental ||
+    runtime.fullRescanNeeded ||
+    runtime.trackedElements.size === 0 ||
+    countConnectedTrackedInAnalysisRoot(options) === 0;
+
+  if (needsFullRescan) {
     runtime.fullRescanNeeded = false;
     runtime.batchedDirtyNodes.clear();
     runtime.dirtyNodes.clear();
@@ -2064,6 +2457,20 @@ function collectCandidates(options?: TourDraftGenerationOptions): DetectedElemen
   }
 
   const deduped = dedupeCandidates(detected, options);
+
+  if (deduped.length === 0 && needsFullRescan && rescanAttempt === 0) {
+    const scanRoot = resolveAnalysisRoot(options);
+    if (scanRoot instanceof HTMLElement && scanRoot.isConnected) {
+      const probeCount = harvestInteractiveNodesFromRoot(scanRoot).length;
+      if (probeCount > 0) {
+        runtime.fullRescanNeeded = true;
+        runtime.trackedElements.clear();
+        runtime.domVersion += 1;
+        return collectCandidates({ ...(options ?? {}), enableIncremental: false }, 1);
+      }
+    }
+  }
+
   return deduped
     .sort((a, b) => effectiveRank(b) - effectiveRank(a))
     .slice(0, maxCandidates);
@@ -2097,6 +2504,10 @@ function dedupeCandidates(candidates: DetectedElement[], options?: TourDraftGene
 }
 
 function primaryActionTieBreakerRank(candidate: DetectedElement): number {
+  const label = normalizeText(candidate.label);
+  if (isPlaceOrderCtaLabel(label)) return 200;
+  if (isPaymentMethodLabel(label)) return -80;
+
   const tag = candidate.element.tagName.toLowerCase();
   const inputType = (candidate.element.getAttribute('type') || '').toLowerCase();
 
@@ -2113,11 +2524,152 @@ function primaryActionTieBreakerRank(candidate: DetectedElement): number {
     ? 3
     : candidate.zone === 'main'
       ? 2
-      : (candidate.zone === 'navigation' || candidate.zone === 'sidebar' || candidate.zone === 'header')
+      : candidate.zone === 'header'
+        ? 4
+      : (candidate.zone === 'navigation' || candidate.zone === 'sidebar')
         ? 0
         : 1;
 
   return controlRank * 10 + zoneRank;
+}
+
+/** Prefer top-of-page / header CTAs for generic singlePageTour slot 1 (e.g. + Add Project over Add Member). */
+function genericPrimarySlotRank(candidate: DetectedElement): number {
+  let rank = effectiveRank(candidate) + primaryActionTieBreakerRank(candidate) * 3;
+  const label = normalizeText(candidate.label);
+  const rect = candidate.element.getBoundingClientRect();
+
+  if (candidate.zone === 'header') rank += 45;
+  if (candidate.zone === 'main' && rect.top < 300) rank += 30;
+  if (rect.top < 200) rank += 20;
+  if (rect.top > 500) rank -= 28;
+  if (/^\+?\s*add project|^create project|^new project/i.test(label)) rank += 40;
+  if (/^import data|^import\b/i.test(label)) rank += 18;
+  if (/add project|new project|create project|import data|get started|commencer/i.test(label)) rank += 22;
+  if (/start meeting|join meeting|meeting with|reminder/i.test(label)) rank -= 50;
+  if (/^new$/i.test(label) && rect.top > 250) rank -= 25;
+  if (/add member|invite member|invite team/i.test(label) && rect.top > 380) rank -= 35;
+  if (candidate.zone === 'sidebar' && candidate.intent === 'primary-action') rank -= 30;
+
+  return rank;
+}
+
+function candidateConfidenceRatio(candidate: DetectedElement): number {
+  return Math.max(0, Math.min(1, candidate.confidence / 100));
+}
+
+function isSameDomTarget(a: DetectedElement, b: DetectedElement): boolean {
+  return a.selector === b.selector || a.element === b.element;
+}
+
+function isBlockedByChain(candidate: DetectedElement, chain: DetectedElement[]): boolean {
+  return chain.some((item) => isSameDomTarget(item, candidate));
+}
+
+function isStrictSearchSlotCandidate(candidate: DetectedElement): boolean {
+  const element = candidate.element;
+  const tag = element.tagName.toLowerCase();
+  if (element.getAttribute('role') === 'searchbox') return true;
+  if (tag !== 'input' && tag !== 'textarea') return false;
+
+  const type = (element.getAttribute('type') || '').toLowerCase();
+  if (type === 'search') return true;
+
+  const placeholder = normalizeText(element.getAttribute('placeholder'));
+  const ariaLabel = normalizeText(element.getAttribute('aria-label'));
+  return /search|recherch|filter|filtr|find|lookup|query/.test(`${placeholder} ${ariaLabel}`);
+}
+
+function isTabNavigationCandidate(candidate: DetectedElement): boolean {
+  if (!isInNavigationArea(candidate)) return false;
+  const role = (candidate.element.getAttribute('role') || '').toLowerCase();
+  if (role === 'tab') return true;
+  return Boolean(candidate.element.closest('[role="tablist"]'));
+}
+
+function isSidebarNavigationCandidate(candidate: DetectedElement): boolean {
+  return (
+    isInNavigationArea(candidate) &&
+    candidate.element.tagName.toLowerCase() === 'a' &&
+    !isTabNavigationCandidate(candidate)
+  );
+}
+
+function navigationSlotRank(candidate: DetectedElement): number {
+  let rank = effectiveRank(candidate);
+  if (isTabNavigationCandidate(candidate)) rank += 35;
+  const label = normalizeText(candidate.label);
+  if (/^(dashboard|home|overview|accueil)$/i.test(label)) rank += 42;
+  if (/^(tasks?|analytics|calendar|team|projects?|reports?)$/i.test(label)) rank += 30;
+  if (/^(help|support|documentation|logout|log out|sign out)$/i.test(label)) rank -= 48;
+  return rank;
+}
+
+function isExplicitSettingsOrProfileCandidate(candidate: DetectedElement): boolean {
+  const label = normalizeText(candidate.label);
+  const aria = normalizeText(candidate.element.getAttribute('aria-label'));
+  const combined = `${label} ${aria}`.trim();
+  if (!combined) return false;
+
+  if (/^(settings|setting|preferences|préférences|profile|profil|account|compte|my account|mon compte)$/i.test(combined)) {
+    return true;
+  }
+
+  return /user settings|account settings|profil utilisateur|mon profil/i.test(combined);
+}
+
+function isAnalyticsOrResultSlotCandidate(candidate: DetectedElement): boolean {
+  if (isExplicitSettingsOrProfileCandidate(candidate)) return false;
+
+  const label = normalizeText(candidate.label);
+  if (/add member|invite member|invite team|add user|member$/i.test(label)) return false;
+  if (candidate.intent === 'primary-action' || candidate.intent === 'support-navigation') return false;
+
+  if (candidate.intent === 'discovery') return true;
+  if (
+    /analytics|analytique|chart|graph|overview|insight|stat|kpi|revenue|progress|metric|report|activity|weekly|dashboard card/i.test(
+      label,
+    )
+  ) {
+    return true;
+  }
+
+  if (candidate.element.querySelector('canvas, svg')) return true;
+  return false;
+}
+
+function isUtilitySlotCandidate(candidate: DetectedElement): boolean {
+  if (isExplicitSettingsOrProfileCandidate(candidate)) return false;
+
+  const label = normalizeText(candidate.label);
+  if (/filter|sort|trier|date range|calendar|view toggle|picker|range|export|import data/i.test(label)) {
+    const tag = candidate.element.tagName.toLowerCase();
+    return tag === 'button' || tag === 'input' || tag === 'select';
+  }
+
+  if (SEQUENCE_UTILITY_LABEL.test(label) && !isFormControlElement(candidate.element)) {
+    return true;
+  }
+
+  return false;
+}
+
+function isSecondaryActionSlotCandidate(
+  candidate: DetectedElement,
+  primary: DetectedElement | null,
+): boolean {
+  if (primary && isSameDomTarget(candidate, primary)) return false;
+  if (isStrictSearchSlotCandidate(candidate)) return false;
+  if (isExplicitSettingsOrProfileCandidate(candidate)) return false;
+
+  if (candidate.intent === 'primary-action') return true;
+
+  const label = normalizeText(candidate.label);
+  if (/import|export|download|upload|invite|duplicate|share/i.test(label) && isActionableElement(candidate.element)) {
+    return true;
+  }
+
+  return candidate.element.tagName.toLowerCase() === 'button' && candidate.intent === 'support-navigation';
 }
 
 function pickBestCandidate(candidates: DetectedElement[], intent: TourDraftIntent, excludedSelectors: string[] = []): DetectedElement | null {
@@ -2154,7 +2706,13 @@ function pickBestActionableCandidate(candidates: DetectedElement[], excludedSele
 
 function pickBestPrimaryActionCandidate(candidates: DetectedElement[], excludedSelectors: string[] = []): DetectedElement | null {
   const blocked = new Set(excludedSelectors);
-  const actionable = candidates.filter((candidate) => candidate.intent === 'primary-action' && !blocked.has(candidate.selector));
+  const actionable = candidates.filter((candidate) => {
+    if (blocked.has(candidate.selector)) return false;
+    if (candidate.intent === 'primary-action') return true;
+    return (
+      isPlaceOrderCtaLabel(candidate.label) && candidate.element.tagName.toLowerCase() === 'button'
+    );
+  });
   const controls = actionable.filter((candidate) => {
     const tag = candidate.element.tagName.toLowerCase();
     const inputType = (candidate.element.getAttribute('type') || '').toLowerCase();
@@ -2192,50 +2750,127 @@ function pickAnyCandidate(
 }
 
 function buildSecondaryStepCopy(candidate: DetectedElement, draftIntent: TourDraftIntent): { title: string; content: string } {
-  const label = candidate.label || 'element courant';
-  const normalizedLabel = normalizeText(label);
+  const rawLabel = candidate.label || getShortElementLabel(candidate.element) || 'element courant';
+  const label = isBloatedCopyText(rawLabel) ? getShortElementLabel(candidate.element) || 'cet élément' : rawLabel;
+  const normalizedLabel = normalizeText(label).slice(0, MAX_TARGET_LABEL_LENGTH);
+  const paymentLike = PAYMENT_METHOD_LABEL_PATTERN.test(normalizedLabel);
+  const searchLike = /recherche|search|filtre|filter|sort|trier|chercher/i.test(normalizedLabel);
+  const summaryLike = /panier|cart|ticket|subtotal|total|commande|table \d+/i.test(normalizedLabel);
 
-  if (candidate.intent === 'form-flow' || /form|champ|saisie|validation|email|company|organisation|organisation|notes/i.test(normalizedLabel)) {
-    return {
+  let draft: { title: string; content: string };
+  if (paymentLike) {
+    draft = {
+      title: 'Paiement et encaissement',
+      content: `Finalisez la commande ou choisissez le moyen de paiement avec: ${normalizedLabel}.`,
+    };
+  } else if (searchLike) {
+    draft = {
+      title: 'Recherche et filtrage',
+      content: `Utilisez ce contrôle pour retrouver rapidement les éléments pertinents: ${normalizedLabel}.`,
+    };
+  } else if (summaryLike) {
+    draft = {
+      title: 'Suivi de la commande',
+      content: `Consultez cette zone pour suivre l'état de la commande en cours: ${normalizedLabel}.`,
+    };
+  } else if (
+    candidate.intent === 'form-flow' ||
+    /form|champ|saisie|validation|email|company|organisation|organisation|notes/i.test(normalizedLabel)
+  ) {
+    draft = {
       title: 'Acceder au formulaire',
-      content: `Poursuivez vers la zone de configuration pour renseigner ou verifier les informations metier: ${label}.`,
+      content: `Poursuivez vers la zone de configuration pour renseigner ou verifier les informations metier: ${normalizedLabel}.`,
     };
-  }
-
-  if (candidate.intent === 'support-navigation' || candidate.zone === 'navigation' || candidate.zone === 'sidebar') {
-    return {
+  } else if (candidate.intent === 'support-navigation' || candidate.zone === 'navigation' || candidate.zone === 'sidebar') {
+    draft = {
       title: 'Consulter la navigation metier',
-      content: `Utilisez cette zone pour rejoindre les sections utiles du parcours: ${label}.`,
+      content: `Utilisez cette zone pour rejoindre les sections utiles du parcours: ${normalizedLabel}.`,
     };
-  }
-
-  if (draftIntent === 'primary-action') {
-    return {
+  } else if (draftIntent === 'primary-action') {
+    draft = {
       title: 'Poursuivre le flux metier',
-      content: `Cet element complete le parcours principal et permet de continuer le flux: ${label}.`,
+      content: `Cet element complete le parcours principal et permet de continuer le flux: ${normalizedLabel}.`,
+    };
+  } else {
+    draft = {
+      title: 'Etape suivante',
+      content: `Poursuivez avec cet element du contexte: ${normalizedLabel}.`,
     };
   }
 
-  return {
-    title: 'Etape suivante',
-    content: `Poursuivez avec cet element du contexte: ${label}.`,
-  };
+  const enforced = enforceSemanticStepCopy(draft.title, draft.content, {
+    element: candidate.element,
+    fallbackLabel: normalizedLabel,
+    draftIntent,
+  });
+  return { title: enforced.title, content: enforced.content };
+}
+
+function scoreEntryHeadingCandidate(element: HTMLElement, options?: TourDraftGenerationOptions): number {
+  const text = normalizeText(element.textContent || element.getAttribute('aria-label') || '');
+  if (!text || text.length < 2) return Number.NEGATIVE_INFINITY;
+
+  const rect = element.getBoundingClientRect();
+  const viewportWidth = Math.max(1, window.innerWidth || 1);
+  const viewportHeight = Math.max(1, window.innerHeight || 1);
+  const widthRatio = rect.width / viewportWidth;
+  const topRatio = Math.max(0, Math.min(1, rect.top / viewportHeight));
+
+  let score = 0;
+
+  if (element.closest('main')) score += 30;
+  else if (element.closest('header')) score += 16;
+
+  if (element.closest('aside, nav, [role="navigation"], [role="complementary"], [role="dialog"]')) {
+    score -= 44;
+  }
+
+  if (/^table\s*\d+$/i.test(text) || /^\d+$/.test(text)) score -= 34;
+
+  if (widthRatio >= 0.45) score += 18;
+  else if (widthRatio >= 0.28) score += 10;
+  else if (widthRatio <= 0.18) score -= 12;
+
+  score += (1 - topRatio) * 16;
+  if (rect.left <= viewportWidth * 0.4) score += 8;
+
+  const selector = buildUniqueSelector(element);
+  if (selector && isStableSelectorForPublish(selector)) score += 8;
+
+  if (!isWithinAnalysisRoot(element, options) || !isVisible(element)) return Number.NEGATIVE_INFINITY;
+  return score;
 }
 
 function getPageHeading(options?: TourDraftGenerationOptions): HTMLElement | null {
-  const headingSelectors = ['h1', 'h2', '[role="heading"]', 'main h1', 'main h2'];
+  const headingSelectors = ['main h1', 'main h2', 'h1', 'h2', '[role="heading"]'];
   const scopes: ParentNode[] = [];
   const root = resolveAnalysisRoot(options);
   scopes.push(root);
   if (root !== document) scopes.push(document);
 
+  const candidates: HTMLElement[] = [];
+  const seen = new Set<HTMLElement>();
   for (const scope of scopes) {
     for (const selector of headingSelectors) {
-      const element = scope.querySelector(selector) as HTMLElement | null;
-      if (element && isVisible(element) && isWithinAnalysisRoot(element, options)) return element;
+      const matches = scope.querySelectorAll(selector);
+      for (const node of matches) {
+        if (!(node instanceof HTMLElement)) continue;
+        if (seen.has(node)) continue;
+        seen.add(node);
+        candidates.push(node);
+      }
     }
   }
-  return null;
+
+  if (candidates.length === 0) return null;
+
+  const ranked = candidates
+    .map((element) => ({ element, score: scoreEntryHeadingCandidate(element, options) }))
+    .filter((entry) => Number.isFinite(entry.score))
+    .sort((a, b) => b.score - a.score);
+
+  if (ranked.length === 0) return null;
+  return ranked[0].score >= 8 ? ranked[0].element : null;
 }
 
 type SnapshotSource = {
@@ -2412,8 +3047,14 @@ function inferStepType(
   return 'highlight';
 }
 
-function shouldHighlightElement(stepType: StepType): boolean {
-  return stepType === 'highlight' || stepType === 'form';
+/** Parcours autogénérés : surbrillance cible toujours active (runtime + publish). */
+function ensureContextualHighlightOnSteps(steps: Step[]): Step[] {
+  return steps.map((step) => (step.highlightElement === true ? step : { ...step, highlightElement: true }));
+}
+
+function ensureContextualHighlightOnDraft(draft: SuggestedTourDraft): SuggestedTourDraft {
+  if (!draft.steps?.length) return draft;
+  return { ...draft, steps: ensureContextualHighlightOnSteps(draft.steps) };
 }
 
 function buildStep(
@@ -2423,23 +3064,48 @@ function buildStep(
   position?: PositionType,
   action: Step['action'] = 'NEXT',
   context?: StepBuildContext,
-  options?: { isPrimary?: boolean; targetSelector?: string },
+  options?: {
+    isPrimary?: boolean;
+    targetSelector?: string;
+    selectorCandidates?: string[];
+    stabilityScore?: number;
+  },
 ): Step {
   const inferredPosition = inferStepPosition(element);
   const resolvedPosition = !position || position === 'BOTTOM' ? inferredPosition : position;
   const stepType = inferStepType(title, content, element, action, context);
 
   stepCounter += 1;
+  const primarySelector = options?.targetSelector ?? buildUniqueSelector(element);
+  const selectorCandidates = (options?.selectorCandidates ?? buildSelectorCandidates(element)).filter(Boolean);
+  const selectorAlternatives = selectorCandidates.filter((selector) => selector !== primarySelector).slice(0, 5);
+  const textSample = normalizeText(getLabel(element)).slice(0, MAX_TARGET_LABEL_LENGTH);
+  const sanitizedCopy = enforceSemanticStepCopy(title, content, {
+    element,
+    draftIntent: context?.intent,
+  });
+
   return {
     id: `${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Date.now()}-${stepCounter}`,
-    title,
-    content,
+    title: sanitizedCopy.title,
+    content: sanitizedCopy.content,
     stepType,
-    targetSelector: options?.targetSelector ?? buildUniqueSelector(element),
+    targetSelector: primarySelector,
+    ...(selectorAlternatives.length > 0 ? { selectorAlternatives } : {}),
+    targetFingerprint: {
+      tagName: element.tagName.toLowerCase(),
+      role: element.getAttribute('role') || undefined,
+      ariaLabel: element.getAttribute('aria-label') || undefined,
+      placeholder: element.getAttribute('placeholder') || undefined,
+      name: element.getAttribute('name') || undefined,
+      ...(textSample ? { textSample } : {}),
+    },
+    stabilityScore: options?.stabilityScore ?? selectorStabilityScore(primarySelector),
+    selfHealCount: 0,
     position: resolvedPosition,
     action,
     skipAllowed: true,
-    highlightElement: shouldHighlightElement(stepType),
+    highlightElement: true,
     isPrimary: options?.isPrimary,
   };
 }
@@ -2663,16 +3329,92 @@ function deriveBackendImplementationReport(
   }
   if (impl?.kind === 'rule-based-mirror') {
     return {
-      endpointLive: true,
+      endpointLive: context.backendStatus !== 'timeout',
       kind: 'rule-based-mirror',
       disclaimer: impl.note ?? BACKEND_IMPLEMENTATION_DISCLAIMER_RULES,
       ...(impl.fallbackReason ? { fallbackReason: impl.fallbackReason } : {}),
+    };
+  }
+  if (context.backendStatus === 'timeout') {
+    return {
+      endpointLive: false,
+      kind: 'rule-based-mirror',
+      disclaimer:
+        'SDK HTTP timeout before backend semantic-hints responded. Fusion uses the local rule engine only.',
+      fallbackReason: 'sdk_http_timeout',
     };
   }
   return {
     endpointLive: context.backendStatus !== 'unconfigured' && context.backendStatus !== 'disabled',
     kind: context.backendStatus === 'ok' ? 'unknown' : 'rule-based-mirror',
     disclaimer: BACKEND_IMPLEMENTATION_DISCLAIMER_RULES,
+    ...(context.backendStatus === 'error' ? { fallbackReason: 'sdk_http_error' as const } : {}),
+  };
+}
+
+/**
+ * Minimal semantic telemetry when no tour drafts were produced (e.g. zero
+ * candidates). Keeps the lab UI from showing "Couche sémantique (off)".
+ */
+function buildSemanticEnhancementDebugShell(
+  options: TourDraftGenerationOptions | undefined,
+  semanticContext: SemanticContext | null,
+): NonNullable<ContextualGenerationDebugReport['semanticEnhancement']> {
+  const mode = (options?.semanticEngineMode ?? 'hybrid') as 'local' | 'hybrid' | 'backend';
+  const domStability = semanticContext?.domStability ?? evaluateDomStability(options);
+  const snapshot: SemanticPageSnapshot =
+    semanticContext?.snapshot ?? {
+      hasForm: false,
+      hasNavigation: false,
+      formFieldCount: 0,
+      navigationLinkCount: 0,
+      ctaCount: 0,
+      pageTitle: '',
+      pageHeading: '',
+      contextTokens: [],
+    };
+  const ctx: SemanticContext =
+    semanticContext ?? {
+      enabled: domStability.stable,
+      engineMode: mode,
+      snapshot,
+      rolesBySelector: new Map(),
+      backendSelectors: new Set(),
+      mergedSelectors: new Set(),
+      preferredOrder: null,
+      backendStatus: mode === 'local' ? 'disabled' : 'unconfigured',
+      backendImplementation: null,
+      domStability,
+      draftReports: [],
+    };
+
+  return {
+    enabled: ctx.enabled,
+    engineMode: ctx.engineMode,
+    backendUsed: ctx.backendStatus === 'ok',
+    backendStatus: ctx.backendStatus,
+    minRoleConfidence: MIN_SEMANTIC_ROLE_CONFIDENCE,
+    validationPhase: deriveValidationPhase(ctx),
+    backendImplementation: deriveBackendImplementationReport(ctx),
+    domStability: {
+      stable: domStability.stable,
+      domAgeMs:
+        domStability.domAgeMs === Number.POSITIVE_INFINITY
+          ? -1
+          : Math.round(domStability.domAgeMs),
+      requiredAgeMs: domStability.requiredAgeMs,
+      observerInstalled: domStability.observerInstalled,
+      ...(domStability.bypassReason ? { bypassReason: domStability.bypassReason } : {}),
+    },
+    calibrationNote: LOCAL_ENGINE_CALIBRATION_NOTE,
+    pageSummary: {
+      hasForm: snapshot.hasForm,
+      hasNavigation: snapshot.hasNavigation,
+      formFieldCount: snapshot.formFieldCount,
+      navigationLinkCount: snapshot.navigationLinkCount,
+      ctaCount: snapshot.ctaCount,
+    },
+    drafts: ctx.draftReports,
   };
 }
 
@@ -2692,6 +3434,13 @@ interface DomMutationTracker {
 }
 
 let domMutationTracker: DomMutationTracker | null = null;
+
+function resolveDomStabilityObserverRoot(): Node {
+  if (typeof document === 'undefined') return document;
+  const main = document.querySelector('main');
+  if (main instanceof HTMLElement && main.isConnected) return main;
+  return document.body || document.documentElement;
+}
 
 function ensureDomMutationTracker(): DomMutationTracker {
   if (domMutationTracker) return domMutationTracker;
@@ -2715,7 +3464,7 @@ function ensureDomMutationTracker(): DomMutationTracker {
     observerAvailable: true,
   };
   try {
-    const target = document.body || document.documentElement;
+    const target = resolveDomStabilityObserverRoot();
     if (target) {
       // We only care about *structural* mutations to detect a page still
       // streaming content. Tracking attribute changes (class, style,
@@ -2725,9 +3474,9 @@ function ensureDomMutationTracker(): DomMutationTracker {
       const observer = new MutationObserver((mutations) => {
         let structural = 0;
         for (const mutation of mutations) {
-          if (mutation.type === 'childList' && (mutation.addedNodes.length > 0 || mutation.removedNodes.length > 0)) {
-            structural += 1;
-          }
+          if (!isMeaningfulCandidateMutation(mutation)) continue;
+          structural += 1;
+          if (structural >= 24) break;
         }
         if (structural === 0) return;
         tracker.mutationCount += structural;
@@ -2825,12 +3574,15 @@ function evaluateDomStability(options?: TourDraftGenerationOptions): DomStabilit
  */
 async function waitForDomToSettle(
   options?: TourDraftGenerationOptions,
-  maxWaitMs: number = 1500,
+  maxWaitMs?: number,
 ): Promise<DomStabilitySnapshot> {
+  const requiredAge = Math.max(0, options?.semanticSnapshotMinDomAgeMs ?? DEFAULT_SEMANTIC_DOM_SETTLE_MS);
+  const effectiveMaxWait =
+    maxWaitMs ?? Math.max(2500, requiredAge * 4 + 800);
   let snapshot = evaluateDomStability(options);
   if (snapshot.stable || snapshot.bypassReason === 'observer_unavailable') return snapshot;
   const start = Date.now();
-  while (!snapshot.stable && Date.now() - start < maxWaitMs) {
+  while (!snapshot.stable && Date.now() - start < effectiveMaxWait) {
     const wait = Math.max(20, snapshot.requiredAgeMs - snapshot.domAgeMs);
     await new Promise<void>((resolve) => setTimeout(resolve, wait));
     snapshot = evaluateDomStability(options);
@@ -2886,6 +3638,89 @@ function shouldRewriteCopyForRole(role: SemanticRole, confidence: number, step: 
   }
 }
 
+function resolveStepSemanticLabel(step: Step): string {
+  const fromFingerprint = normalizeText(
+    step.targetFingerprint?.ariaLabel || step.targetFingerprint?.textSample || step.targetFingerprint?.tagName || '',
+  );
+  if (fromFingerprint) return fromFingerprint;
+  return normalizeText(step.title || step.content || 'cet élément') || 'cet élément';
+}
+
+function hasCompleteFingerprintForSemanticCompensation(step: Step): boolean {
+  const fp = step.targetFingerprint;
+  const tagName = normalizeText(fp?.tagName || '');
+  const role = normalizeText(fp?.role || '');
+  const textSample = normalizeText(fp?.textSample || '');
+  return Boolean(tagName && role && textSample.length >= 3);
+}
+
+function isSemanticCompensationEligible(step: Step, options?: TourDraftGenerationOptions): boolean {
+  const scenario = options?.publishScenario ?? 'medium';
+  if (scenario === 'stress') return false;
+  const confidence = typeof step.semanticRoleConfidence === 'number' ? step.semanticRoleConfidence : 0;
+  const stabilityScore = typeof step.stabilityScore === 'number' ? step.stabilityScore : 0;
+  return confidence >= 0.75 && stabilityScore >= 40 && hasCompleteFingerprintForSemanticCompensation(step);
+}
+
+function recomputeStepOrderIndex(steps: Step[]): Step[] {
+  return steps.map((step, index) => ({ ...step, orderIndex: index }));
+}
+
+function dedupeDraftStepTitles(steps: Step[]): Step[] {
+  const counts = new Map<string, number>();
+  return steps.map((step) => {
+    const baseTitle = (step.title || '').trim() || 'Étape';
+    const key = normalizeText(baseTitle);
+    const next = (counts.get(key) || 0) + 1;
+    counts.set(key, next);
+    if (next === 1) return { ...step, title: baseTitle };
+    const suffixSource =
+      step.targetFingerprint?.ariaLabel ||
+      step.targetFingerprint?.textSample ||
+      step.targetFingerprint?.role ||
+      step.position ||
+      `${next}`;
+    const suffix = normalizeText(String(suffixSource)).replace(/\s+/g, '-').slice(0, 20) || `${next}`;
+    return { ...step, title: `${baseTitle} (${suffix || next})` };
+  });
+}
+
+function applyPreferredSemanticOrder(
+  steps: Step[],
+  preferredOrder: string[] | null,
+): { steps: Step[]; changed: boolean } {
+  if (!preferredOrder || preferredOrder.length === 0 || steps.length <= 1) {
+    return { steps, changed: false };
+  }
+  const bucketBySelector = new Map<string, Step[]>();
+  for (const step of steps) {
+    const selector = normalizeText(step.targetSelector);
+    if (!selector) continue;
+    const existing = bucketBySelector.get(selector) || [];
+    existing.push(step);
+    bucketBySelector.set(selector, existing);
+  }
+
+  const ordered: Step[] = [];
+  for (const selector of preferredOrder) {
+    const key = normalizeText(selector);
+    if (!key) continue;
+    const queue = bucketBySelector.get(key);
+    if (!queue || queue.length === 0) continue;
+    ordered.push(queue.shift() as Step);
+  }
+
+  for (const step of steps) {
+    if (ordered.includes(step)) continue;
+    ordered.push(step);
+  }
+
+  const originalSelectors = steps.map((step) => step.targetSelector || '__none__');
+  const orderedSelectors = ordered.map((step) => step.targetSelector || '__none__');
+  const changed = orderedSelectors.some((selector, index) => selector !== originalSelectors[index]);
+  return changed ? { steps: ordered, changed: true } : { steps, changed: false };
+}
+
 function applySemanticFusionToDraft(
   draft: SuggestedTourDraft,
   context: SemanticContext | null,
@@ -2900,9 +3735,14 @@ function applySemanticFusionToDraft(
   let effectiveTotalDelta = 0;
   let copyRewriteCount = 0;
   let suppressedLowConfidence = 0;
+  let bestSemanticCompensationConfidence = 0;
   const originalOrder = draft.steps
     .map((step) => step.targetSelector)
     .filter((value): value is string => Boolean(value));
+  let semanticOrderApplied = false;
+
+  /** Same DOM node must not be fused or reported twice (blueprints can emit duplicate steps). */
+  const semanticFusionSeenSelectors = new Set<string>();
 
   for (let i = 0; i < draft.steps.length; i += 1) {
     const step = draft.steps[i];
@@ -2910,6 +3750,13 @@ function applySemanticFusionToDraft(
     if (!selector) continue;
     const role = context.rolesBySelector.get(selector);
     if (!role) continue;
+    const stepWithRoleConfidence: Step = { ...step, semanticRoleConfidence: role.confidence };
+    draft.steps[i] = stepWithRoleConfidence;
+
+    const duplicateSemanticStep = semanticFusionSeenSelectors.has(selector);
+    if (!duplicateSemanticStep) {
+      semanticFusionSeenSelectors.add(selector);
+    }
 
     const fusion = computeSemanticScoreDelta({
       heuristicIntent: draft.intent,
@@ -2920,17 +3767,24 @@ function applySemanticFusionToDraft(
 
     const lowConfidence = role.confidence < MIN_SEMANTIC_ROLE_CONFIDENCE;
     const effectiveDelta = lowConfidence ? 0 : fusion.delta;
-    effectiveTotalDelta += effectiveDelta;
-    if (lowConfidence) suppressedLowConfidence += 1;
+    if (!duplicateSemanticStep) {
+      effectiveTotalDelta += effectiveDelta;
+      if (lowConfidence) suppressedLowConfidence += 1;
+    }
 
     let suppressedReason: 'low_confidence' | 'neutral' | undefined;
     if (lowConfidence) suppressedReason = 'low_confidence';
     else if (fusion.delta === 0) suppressedReason = 'neutral';
 
-    if (!lowConfidence && shouldRewriteCopyForRole(role.role, role.confidence, step)) {
-      const copy = buildSemanticStepCopy(role.role, step.title);
+    if (
+      !duplicateSemanticStep &&
+      !lowConfidence &&
+      shouldRewriteCopyForRole(role.role, role.confidence, stepWithRoleConfidence)
+    ) {
+      const semanticLabel = resolveStepSemanticLabel(stepWithRoleConfidence);
+      const copy = buildSemanticStepCopy(role.role, semanticLabel);
       const rewrittenStep: Step = {
-        ...step,
+        ...stepWithRoleConfidence,
         title: copy.title,
         content: copy.content,
       };
@@ -2944,22 +3798,66 @@ function applySemanticFusionToDraft(
         ? 'merged'
         : 'local';
 
-    stepReports.push({
-      selector,
-      heuristicRole: draft.intent,
-      semanticRole: role.role,
-      roleConfidence: Number(role.confidence.toFixed(3)),
-      rationale: role.rationale.slice(0, 3),
-      localRoleSource: 'rules',
-      decisionSource,
-      lowConfidence,
-      fusion: {
-        heuristicScore: draft.score,
-        semanticDelta: Number(fusion.delta.toFixed(2)),
-        appliedDelta: 0,
-        ...(suppressedReason ? { suppressedReason } : {}),
-      },
+    if (!duplicateSemanticStep) {
+      stepReports.push({
+        selector,
+        heuristicRole: draft.intent,
+        semanticRole: role.role,
+        roleConfidence: Number(role.confidence.toFixed(3)),
+        rationale: role.rationale.slice(0, 3),
+        localRoleSource: 'rules',
+        decisionSource,
+        lowConfidence,
+        fusion: {
+          heuristicScore: draft.score,
+          semanticDelta: Number(fusion.delta.toFixed(2)),
+          appliedDelta: 0,
+          ...(suppressedReason ? { suppressedReason } : {}),
+        },
+      });
+    }
+  }
+
+  draft.steps = draft.steps.map((step) => {
+    const role = step.targetSelector ? context.rolesBySelector.get(step.targetSelector) : undefined;
+    return sanitizeStepCopy(step, {
+      draftIntent: draft.intent,
+      semanticRole: role?.role,
     });
+  });
+
+  const preserveDiscoveryEntryOrder =
+    draft.intent === 'discovery' && hasDiscoveryEntryStep(draft.steps);
+  if (
+    !options?.singlePageTour &&
+    !preserveDiscoveryEntryOrder &&
+    context.preferredOrder &&
+    context.preferredOrder.length > 0
+  ) {
+    const reordered = applyPreferredSemanticOrder(draft.steps, context.preferredOrder);
+    if (reordered.changed) {
+      draft.steps = reordered.steps;
+      semanticOrderApplied = true;
+    }
+  }
+  draft.steps = dedupeDraftStepTitles(recomputeStepOrderIndex(draft.steps));
+  if (options?.singlePageTour) {
+    draft.steps = pinSinglePageTourStepOrder(draft.steps);
+  } else if (preserveDiscoveryEntryOrder) {
+    draft.steps = pinDiscoveryEntryFirstStepOrder(draft.steps);
+  }
+  for (const step of draft.steps) {
+    if (!isSemanticCompensationEligible(step, options)) continue;
+    bestSemanticCompensationConfidence = Math.max(
+      bestSemanticCompensationConfidence,
+      step.semanticRoleConfidence || 0,
+    );
+  }
+  if (bestSemanticCompensationConfidence >= 0.75) {
+    const reason = `published via semantic compensation (confidence: ${bestSemanticCompensationConfidence.toFixed(2)})`;
+    if (!draft.reasons.includes(reason)) {
+      draft.reasons = [...draft.reasons, reason];
+    }
   }
 
   const cappedDelta = Math.max(
@@ -3003,18 +3901,110 @@ function applySemanticFusionToDraft(
     }
   }
 
-  const stillMatchesOrder =
-    context.preferredOrder === null ||
-    originalOrder.every((selector, idx) => selector === context.preferredOrder?.[idx]);
+  const finalOrder = draft.steps
+    .map((step) => step.targetSelector)
+    .filter((value): value is string => Boolean(value));
+  const stillMatchesOrder = originalOrder.every((selector, idx) => selector === finalOrder[idx]);
 
   context.draftReports.push({
     draftName: draft.name,
     intent: draft.intent,
     steps: stepReports,
-    orderChanged: !stillMatchesOrder,
+    orderChanged: semanticOrderApplied || !stillMatchesOrder,
     copyRewriteCount,
     suppressedLowConfidence,
   });
+}
+
+function resolveStepTargetElement(step: Step): HTMLElement | null {
+  const selector = normalizeText(step.targetSelector);
+  if (!selector || typeof document === 'undefined') return null;
+  try {
+    const node = document.querySelector(selector);
+    return node instanceof HTMLElement ? node : null;
+  } catch {
+    return null;
+  }
+}
+
+function stepSpatialRank(step: Step): { top: number; left: number; fallback: number } {
+  const element = resolveStepTargetElement(step);
+  if (!element) return { top: Number.POSITIVE_INFINITY, left: Number.POSITIVE_INFINITY, fallback: 1 };
+  const rect = element.getBoundingClientRect();
+  return { top: rect.top, left: rect.left, fallback: 0 };
+}
+
+/** Discovery drafts: entry heading before follow-up steps titled "Découverte et aide". */
+function resolveDiscoveryDraftAnchorIndex(steps: Step[]): number {
+  const entryPoint = steps.findIndex((step) =>
+    /point d['']entr[ée]e/i.test(normalizeText(step.title)),
+  );
+  if (entryPoint >= 0) return entryPoint;
+
+  return steps.findIndex((step) => /d[ée]couvrir|entry/i.test(normalizeText(step.title)));
+}
+
+function resolveDiscoveryEntryStepIndex(steps: Step[]): number {
+  const byTitle = steps.findIndex((step) =>
+    /point d['']entr[ée]e/i.test(normalizeText(step.title)),
+  );
+  if (byTitle >= 0) return byTitle;
+  return steps.findIndex((step) =>
+    /le parcours commence ici|commence ici avec le contexte visible/i.test(normalizeText(step.content)),
+  );
+}
+
+function hasDiscoveryEntryStep(steps: Step[]): boolean {
+  return resolveDiscoveryEntryStepIndex(steps) >= 0;
+}
+
+/** Keep "Point d'entrée" first after semantic preferredOrder or spatial sort. */
+function pinDiscoveryEntryFirstStepOrder(steps: Step[]): Step[] {
+  const entryIdx = resolveDiscoveryEntryStepIndex(steps);
+  if (entryIdx <= 0) return steps;
+  const entry = steps[entryIdx];
+  const rest = steps.filter((_, index) => index !== entryIdx);
+  return recomputeStepOrderIndex([entry, ...rest]);
+}
+
+function normalizeDraftStepOrder(steps: Step[], intent: TourDraftIntent): Step[] {
+  if (!steps || steps.length <= 1) return steps;
+
+  const sortable = steps
+    .map((step, index) => ({ step, index, rank: stepSpatialRank(step) }))
+    .sort((a, b) => {
+      if (a.rank.fallback !== b.rank.fallback) return a.rank.fallback - b.rank.fallback;
+      const topDiff = a.rank.top - b.rank.top;
+      if (Math.abs(topDiff) > 12) return topDiff;
+      const leftDiff = a.rank.left - b.rank.left;
+      if (Math.abs(leftDiff) > 12) return leftDiff;
+      return a.index - b.index;
+    });
+
+  const restFromAnchor = (anchor: Step) =>
+    sortable.map((entry) => entry.step).filter((step) => step !== anchor);
+
+  // Discovery + "Point d'entrée": entry before follow-up CLICK steps marked isPrimary (e.g. guide link).
+  if (intent === 'discovery') {
+    const discoveryEntryIndex = resolveDiscoveryDraftAnchorIndex(steps);
+    if (discoveryEntryIndex >= 0) {
+      const anchor = steps[discoveryEntryIndex];
+      return [anchor, ...restFromAnchor(anchor)];
+    }
+  }
+
+  const primaryIndex = steps.findIndex((step) => step.isPrimary);
+  if (primaryIndex >= 0) {
+    const anchor = steps[primaryIndex];
+    return [anchor, ...restFromAnchor(anchor)];
+  }
+
+  const anchorIndex =
+    intent === 'primary-action' ? steps.findIndex((step) => step.isPrimary) : -1;
+
+  if (anchorIndex < 0) return sortable.map((entry) => entry.step);
+  const anchor = steps[anchorIndex];
+  return [anchor, ...restFromAnchor(anchor)];
 }
 
 function createDraft(
@@ -3028,7 +4018,10 @@ function createDraft(
   options?: TourDraftGenerationOptions,
 ): SuggestedTourDraft {
   const reasonsWithAdjustments = reasons.slice();
-  const metrics = computeHeuristicDraftScores(intent, steps, sourceCandidates, reasons, options);
+  const orderedSteps = normalizeDraftStepOrder(steps, intent);
+  const sanitizedSteps = orderedSteps.map((step) => sanitizeStepCopy(step, { draftIntent: intent }));
+  const normalizedSteps = dedupeDraftStepTitles(recomputeStepOrderIndex(sanitizedSteps));
+  const metrics = computeHeuristicDraftScores(intent, normalizedSteps, sourceCandidates, reasons, options);
   reasonsWithAdjustments.push(...metrics.adjustments);
   const score = metrics.score;
   const confidence = metrics.confidence;
@@ -3044,6 +4037,7 @@ function createDraft(
       intent: candidate.intent,
     })),
   );
+  const instrumentationSuggestions = buildInstrumentationSuggestions(sourceCandidates);
 
   const draftBase: SuggestedTourDraft = {
     generatedBy: 'contextual-tour-generator',
@@ -3070,17 +4064,19 @@ function createDraft(
           conflictNotes: [],
         }
       : undefined,
-    metadata: previewContext
-      ? {
-          previewContext,
-        }
-      : undefined,
+    metadata:
+      previewContext || instrumentationSuggestions.length > 0
+        ? {
+            ...(previewContext ? { previewContext } : {}),
+            ...(instrumentationSuggestions.length > 0 ? { instrumentationSuggestions } : {}),
+          }
+        : undefined,
     name,
     description,
     targetUrl,
     isActive: false,
     priority: 0,
-    steps,
+    steps: normalizedSteps,
     sessionContextSnapshot: {
       stage,
       progress,
@@ -3096,6 +4092,35 @@ function createDraft(
   };
 }
 
+function toSuggestedTourId(label: string): string {
+  const normalized = normalizeText(label)
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return normalized ? `tour-${normalized.slice(0, 40)}` : 'tour-action';
+}
+
+function buildInstrumentationSuggestions(
+  sourceCandidates: DetectedElement[],
+): Array<{ selector: string; suggestedTourId: string; stabilityScore: number; label: string }> {
+  const out: Array<{ selector: string; suggestedTourId: string; stabilityScore: number; label: string }> = [];
+  const seen = new Set<string>();
+  for (const candidate of sourceCandidates) {
+    const selector = candidate.selector;
+    if (!selector || seen.has(selector)) continue;
+    seen.add(selector);
+    if (candidate.selectorStabilityScore >= 70) continue;
+    if (!isActionableElement(candidate.element)) continue;
+    out.push({
+      selector,
+      suggestedTourId: toSuggestedTourId(candidate.label),
+      stabilityScore: candidate.selectorStabilityScore,
+      label: candidate.label,
+    });
+    if (out.length >= 5) break;
+  }
+  return out;
+}
+
 function chainMemberToDetected(
   candidate: DetectedElement & { rankingBoost?: number },
 ): DetectedElement {
@@ -3107,10 +4132,22 @@ function isSequenceCandidate(candidate: DetectedElement): boolean {
   return candidate.semanticScore > 0.08 || candidate.sequenceScore > 0.08 || candidate.tokenHits > 0;
 }
 
+function isHeaderEligibleForSinglePageChain(candidate: DetectedElement): boolean {
+  if (isStrictSearchSlotCandidate(candidate)) return true;
+  if (candidate.intent === 'primary-action' && isActionableElement(candidate.element)) return true;
+  const label = normalizeText(candidate.label);
+  return (
+    isActionableElement(candidate.element) &&
+    /add |create |new project|import |export |save |submit /i.test(`${label} `)
+  );
+}
+
 function isCoreSequenceCandidate(candidate: DetectedElement, options?: TourDraftGenerationOptions): boolean {
   // Chrome navigation (dashboard shell) is already excluded by `analysisRootSelector`.
   // In-app menus (`aside` > `nav` > `a`) are tagged `navigation` but must stay in sequence chains.
-  return candidate.zone !== 'header' && isWithinAnalysisRoot(candidate.element, options);
+  if (!isWithinAnalysisRoot(candidate.element, options)) return false;
+  if (candidate.zone !== 'header') return true;
+  return Boolean(options?.singlePageTour && isHeaderEligibleForSinglePageChain(candidate));
 }
 
 function hasScopedAnalysis(options?: TourDraftGenerationOptions): boolean {
@@ -3131,6 +4168,9 @@ const SEQUENCE_SECONDARY_LABEL =
 const SEQUENCE_SUBMIT_LABEL =
   /confirm|validate|submit|valider|confirmer|soumettre|enregistrer|publier|sauvegarder|save|prévisualiser|preview|appliquer|apply/i;
 const SEQUENCE_RESULT_LABEL = /result|status|done|complete|success|résultat|terminé|termine|fini/i;
+const SEQUENCE_PAYMENT_LABEL = PAYMENT_METHOD_LABEL_PATTERN;
+const SEQUENCE_SEARCH_LABEL = /recherche|search|filtre|filter|sort|trier|chercher/i;
+const SEQUENCE_SUMMARY_LABEL = /panier|cart|ticket|subtotal|total|commande|table \d+/i;
 
 type SequenceFollowUpRole = 'form-field' | 'form-submit' | 'utility' | 'secondary' | 'navigation' | 'generic-click';
 
@@ -3168,6 +4208,16 @@ function hasNavigationContextInCandidates(candidates: DetectedElement[]): boolea
   return candidates.some((candidate) => isInNavigationArea(candidate) && isActionableElement(candidate.element));
 }
 
+function isSearchLikeCandidate(candidate: DetectedElement): boolean {
+  const label = normalizeText(candidate.label);
+  if (/search|recherch|filter|filtr|lookup|find|query/.test(label)) return true;
+  const el = candidate.element;
+  const type = normalizeText(el.getAttribute('type'));
+  const placeholder = normalizeText(el.getAttribute('placeholder'));
+  const ariaLabel = normalizeText(el.getAttribute('aria-label'));
+  return type === 'search' || /search|recherch|filter|filtr/.test(`${placeholder} ${ariaLabel}`);
+}
+
 function pickSequenceNavigationStep(
   pools: DetectedElement[][],
   options: TourDraftGenerationOptions | undefined,
@@ -3195,6 +4245,10 @@ function pickSequenceNavigationStep(
 function classifySequenceFollowUpRole(candidate: DetectedElement): SequenceFollowUpRole {
   const label = normalizeText(candidate.label) || '';
   const element = candidate.element;
+
+  if (isPaymentMethodLabel(label) && !isPlaceOrderCtaLabel(label)) {
+    return 'utility';
+  }
 
   if (isFormControlElement(element) && !isSubmitLikeControl(element)) {
     return 'form-field';
@@ -3247,6 +4301,27 @@ function buildSequenceFollowUpStepCopy(
         action: 'CLICK',
       };
     case 'utility':
+      if (SEQUENCE_PAYMENT_LABEL.test(label)) {
+        return {
+          title: 'Paiement et encaissement',
+          content: `Ce contrôle concerne la finalisation de commande ou le moyen de paiement: ${label}.`,
+          action: 'CLICK',
+        };
+      }
+      if (SEQUENCE_SEARCH_LABEL.test(label)) {
+        return {
+          title: 'Recherche et filtrage',
+          content: `Utilisez ce contrôle pour retrouver rapidement les éléments pertinents: ${label}.`,
+          action: 'CLICK',
+        };
+      }
+      if (SEQUENCE_SUMMARY_LABEL.test(label)) {
+        return {
+          title: 'Suivi de la commande',
+          content: `Cette zone synthétise l'état de la commande en cours: ${label}.`,
+          action: 'CLICK',
+        };
+      }
       return {
         title: 'Réglages et options',
         content: `Ce contrôle ouvre les préférences ou réglages associés au parcours: ${label}.`,
@@ -3274,7 +4349,8 @@ function buildSequenceFollowUpStepCopy(
 }
 
 function buildSyntheticSequenceCandidate(element: HTMLElement): DetectedElement {
-  const selector = buildUniqueSelector(element);
+  const selectorCandidates = buildSelectorCandidates(element);
+  const selector = pickPreferredSelector(element, selectorCandidates);
   const label = normalizeText(getLabel(element)) || selector;
   const zone = detectZone(element);
   let intent: TourDraftIntent = 'discovery';
@@ -3291,6 +4367,7 @@ function buildSyntheticSequenceCandidate(element: HTMLElement): DetectedElement 
   return {
     element,
     selector,
+    selectorCandidates,
     label,
     score: 48,
     rankingBoost: 0,
@@ -3302,6 +4379,7 @@ function buildSyntheticSequenceCandidate(element: HTMLElement): DetectedElement 
     semanticScore: 0.12,
     personaScore: 0.08,
     sequenceScore: 0.14,
+    selectorStabilityScore: selectorStabilityScore(selector),
     selectorStabilityBonus: Math.max(0, selectorStabilityDelta(selector)),
     selectorFragilityPenalty: Math.min(0, selectorStabilityDelta(selector)),
     actionabilityPenalty: 0,
@@ -3410,6 +4488,233 @@ function pickBestFormFieldFollowUp(
   return matches[0];
 }
 
+function formatSlotCandidateLabel(candidate: DetectedElement): string {
+  const shortId = candidateRankingShortId(candidate);
+  const label = normalizeText(candidate.label);
+  return label ? `${label} · ${shortId}` : shortId;
+}
+
+/**
+ * Domain-agnostic singlePageTour chain (7 optional slots, primary mandatory).
+ * Blueprints handle vertical-specific flows — this path stays generic.
+ */
+function buildGenericSinglePageSequenceChain(
+  candidates: DetectedElement[],
+  primaryHint: DetectedElement | null,
+  options?: TourDraftGenerationOptions,
+): { chain: DetectedElement[]; decisions: SinglePageSlotDecision[] } {
+  const maxSteps = options?.maxSteps ?? 7;
+  const chain: DetectedElement[] = [];
+  const decisions: SinglePageSlotDecision[] = [];
+  const pool = candidates.filter((candidate) => isCoreSequenceCandidate(candidate, options));
+
+  const tryFill = (
+    slot: number,
+    slotId: GenericSinglePageSlotId,
+    candidate: DetectedElement | null | undefined,
+    skipLine: string,
+  ) => {
+    if (!candidate) {
+      decisions.push({ slot, slotId, status: 'skipped', line: skipLine });
+      return;
+    }
+    if (!isCoreSequenceCandidate(candidate, options)) {
+      decisions.push({ slot, slotId, status: 'skipped', line: `Slot ${slot}: skipped (not a core candidate)` });
+      return;
+    }
+    if (isBlockedByChain(candidate, chain)) {
+      decisions.push({
+        slot,
+        slotId,
+        status: 'skipped',
+        line: `Slot ${slot}: skipped (duplicate DOM target vs earlier slot)`,
+      });
+      return;
+    }
+    if (chain.length >= maxSteps) {
+      decisions.push({ slot, slotId, status: 'skipped', line: `Slot ${slot}: skipped (maxSteps ${maxSteps} reached)` });
+      return;
+    }
+    chain.push(candidate);
+    decisions.push({
+      slot,
+      slotId,
+      status: 'filled',
+      line: `Slot ${slot}: filled (${formatSlotCandidateLabel(candidate)}, score ${Math.round(
+        slot === 1 ? genericPrimarySlotRank(candidate) : effectiveRank(candidate),
+      )})`,
+    });
+  };
+
+  const primaryPool = pool.filter(
+    (candidate) =>
+      candidate.intent === 'primary-action' ||
+      (isActionableElement(candidate.element) && candidate.intent !== 'form-flow'),
+  );
+  const slot1Candidate =
+    primaryHint && isCoreSequenceCandidate(primaryHint, options)
+      ? primaryHint
+      : primaryPool.sort((a, b) => genericPrimarySlotRank(b) - genericPrimarySlotRank(a))[0] || null;
+
+  if (!slot1Candidate) {
+    decisions.push({
+      slot: 1,
+      slotId: 'primary-action',
+      status: 'skipped',
+      line: 'Slot 1: skipped (no primary-action candidate — chain aborted)',
+    });
+    lastSinglePageChainSlotDecisions = decisions;
+    return { chain: [], decisions };
+  }
+
+  tryFill(1, 'primary-action', slot1Candidate, '');
+  const primary = slot1Candidate;
+
+  const searchPool = pool
+    .filter((candidate) => isStrictSearchSlotCandidate(candidate))
+    .sort((a, b) => effectiveRank(b) - effectiveRank(a));
+  const searchPick = searchPool[0];
+  if (searchPick && candidateConfidenceRatio(searchPick) > 0.5) {
+    tryFill(2, 'search', searchPick, '');
+  } else {
+    tryFill(
+      2,
+      'search',
+      null,
+      searchPick
+        ? `Slot 2: skipped (${formatSlotCandidateLabel(searchPick)}, confidence ${Math.round(searchPick.confidence)} < 50)`
+        : 'Slot 2: skipped (no search input above threshold)',
+    );
+  }
+
+  const secondPrimaryPick = pool
+    .filter(
+      (candidate) =>
+        candidate.intent === 'primary-action' &&
+        isActionableElement(candidate.element) &&
+        !isSameDomTarget(candidate, primary) &&
+        !isStrictSearchSlotCandidate(candidate) &&
+        !isExplicitSettingsOrProfileCandidate(candidate),
+    )
+    .sort((a, b) => genericPrimarySlotRank(b) - genericPrimarySlotRank(a))[0];
+  const secondaryNavPick = pool
+    .filter((candidate) => isSecondaryActionSlotCandidate(candidate, primary) && candidate.intent !== 'primary-action')
+    .sort((a, b) => effectiveRank(b) - effectiveRank(a))[0];
+  const secondaryCandidates = [secondPrimaryPick, secondaryNavPick].filter(Boolean) as DetectedElement[];
+  const secondaryPick =
+    secondaryCandidates.length > 0
+      ? secondaryCandidates.sort((a, b) => genericPrimarySlotRank(b) - genericPrimarySlotRank(a))[0]
+      : null;
+  if (secondaryPick && candidateConfidenceRatio(secondaryPick) >= 0.45) {
+    tryFill(3, 'secondary-action', secondaryPick, '');
+  } else {
+    tryFill(
+      3,
+      'secondary-action',
+      null,
+      secondaryPick
+        ? `Slot 3: skipped (${formatSlotCandidateLabel(secondaryPick)}, confidence ${Math.round(secondaryPick.confidence)} < 45)`
+        : 'Slot 3: skipped (no secondary action above threshold)',
+    );
+  }
+
+  const tabNav = pool
+    .filter((candidate) => isTabNavigationCandidate(candidate))
+    .sort((a, b) => navigationSlotRank(b) - navigationSlotRank(a));
+  const sidebarNav = pool
+    .filter(
+      (candidate) =>
+        isSidebarNavigationCandidate(candidate) && !isExplicitSettingsOrProfileCandidate(candidate),
+    )
+    .sort((a, b) => navigationSlotRank(b) - navigationSlotRank(a));
+  const navigationPick = tabNav[0] || sidebarNav[0];
+  if (navigationPick) {
+    tryFill(4, 'navigation', navigationPick, '');
+  } else {
+    tryFill(4, 'navigation', null, 'Slot 4: skipped (no navigation/tab candidate)');
+  }
+
+  const analyticsPool = pool
+    .filter((candidate) => isAnalyticsOrResultSlotCandidate(candidate))
+    .sort((a, b) => effectiveRank(b) - effectiveRank(a));
+  const analyticsPick = analyticsPool[0];
+  if (analyticsPick && candidateConfidenceRatio(analyticsPick) >= 0.45) {
+    tryFill(5, 'analytics-or-result', analyticsPick, '');
+  } else {
+    tryFill(
+      5,
+      'analytics-or-result',
+      null,
+      analyticsPick
+        ? `Slot 5: skipped (${formatSlotCandidateLabel(analyticsPick)}, confidence ${Math.round(analyticsPick.confidence)} < 45)`
+        : 'Slot 5: skipped (no analytics/result candidate)',
+    );
+  }
+
+  const utilityPool = pool
+    .filter((candidate) => isUtilitySlotCandidate(candidate))
+    .sort((a, b) => effectiveRank(b) - effectiveRank(a));
+  const utilityPick = utilityPool[0];
+  if (utilityPick && candidateConfidenceRatio(utilityPick) >= 0.45) {
+    tryFill(6, 'utility', utilityPick, '');
+  } else {
+    tryFill(
+      6,
+      'utility',
+      null,
+      utilityPick
+        ? `Slot 6: skipped (${formatSlotCandidateLabel(utilityPick)}, confidence ${Math.round(utilityPick.confidence)} < 45)`
+        : 'Slot 6: skipped (no utility candidate)',
+    );
+  }
+
+  const settingsPool = pool
+    .filter((candidate) => isExplicitSettingsOrProfileCandidate(candidate))
+    .sort((a, b) => effectiveRank(b) - effectiveRank(a));
+  const settingsPick = settingsPool[0];
+  const nonSettingsStepsBeforeSettings = chain.filter((c) => !isExplicitSettingsOrProfileCandidate(c)).length;
+  const settingsAllowed = chain.length >= 3 && nonSettingsStepsBeforeSettings >= 3;
+
+  if (settingsPick && settingsAllowed) {
+    tryFill(7, 'settings-or-profile', settingsPick, '');
+  } else if (settingsPick && !settingsAllowed) {
+    tryFill(
+      7,
+      'settings-or-profile',
+      null,
+      `Slot 7: skipped (${formatSlotCandidateLabel(settingsPick)} — requires ≥3 prior non-settings steps)`,
+    );
+  } else {
+    tryFill(7, 'settings-or-profile', null, 'Slot 7: skipped (no explicit settings/profile control)');
+  }
+
+  lastSinglePageChainSlotDecisions = decisions;
+  return { chain, decisions };
+}
+
+function buildSinglePageSequenceChain(
+  candidates: DetectedElement[],
+  primary: DetectedElement | null,
+  options?: TourDraftGenerationOptions,
+): DetectedElement[] {
+  return buildGenericSinglePageSequenceChain(candidates, primary, options).chain;
+}
+
+/** Primary-action is always step 1; other steps keep 7-slot chain order (no re-rank). */
+function pinSinglePageTourStepOrder(steps: Step[]): Step[] {
+  if (steps.length <= 1) return steps;
+
+  const primaryIndex = steps.findIndex((step) => step.isPrimary);
+  const primary =
+    primaryIndex >= 0
+      ? { ...steps[primaryIndex], isPrimary: true }
+      : { ...steps[0], isPrimary: true };
+  const primaryIdx = primaryIndex >= 0 ? primaryIndex : 0;
+  const rest = steps.filter((_, index) => index !== primaryIdx);
+
+  return recomputeStepOrderIndex([primary, ...rest]);
+}
+
 function resolveSequenceFollowUpCandidate(
   orderedCandidates: DetectedElement[],
   allCandidates: DetectedElement[],
@@ -3495,8 +4800,10 @@ function buildSequenceDraft(
       ? {
           element: heading,
           selector: buildUniqueSelector(heading),
+          selectorCandidates: buildSelectorCandidates(heading),
           label: normalizeText(heading.textContent),
           score: 72,
+          rankingBoost: 0,
           confidence: 68,
           intent: 'discovery' as const,
           reasons: ['entry heading'],
@@ -3505,6 +4812,7 @@ function buildSequenceDraft(
           semanticScore: 0.35,
           personaScore: 0.1,
           sequenceScore: 0.6,
+          selectorStabilityScore: selectorStabilityScore(buildUniqueSelector(heading)),
           selectorStabilityBonus: 0,
           selectorFragilityPenalty: 0,
           actionabilityPenalty: 0,
@@ -3520,7 +4828,7 @@ function buildSequenceDraft(
       return b.score - a.score;
     });
 
-  const dedicatedPrimaryDraftExists = Boolean(primary);
+  const dedicatedPrimaryDraftExists = Boolean(primary) && !options?.singlePageTour;
   const action = dedicatedPrimaryDraftExists
     ? null
     : primary || orderedCandidates.find((candidate) => candidate.intent === 'primary-action') || orderedCandidates[0] || null;
@@ -3540,8 +4848,10 @@ function buildSequenceDraft(
     DetectedElement | {
       element: HTMLElement;
       selector: string;
+      selectorCandidates: string[];
       label: string;
       score: number;
+      rankingBoost: number;
       confidence: number;
       intent: TourDraftIntent;
       reasons: string[];
@@ -3550,6 +4860,7 @@ function buildSequenceDraft(
       semanticScore: number;
       personaScore: number;
       sequenceScore: number;
+      selectorStabilityScore: number;
       selectorStabilityBonus: number;
       selectorFragilityPenalty: number;
       actionabilityPenalty: number;
@@ -3560,14 +4871,64 @@ function buildSequenceDraft(
     chain = chain.filter((candidate) => candidate.selector !== primary.selector);
   }
 
-  const uniqueChain = chain.filter((candidate, index) => chain.findIndex((item) => item.selector === candidate.selector) === index);
+  let uniqueChain = chain.filter((candidate, index) => chain.findIndex((item) => item.selector === candidate.selector) === index);
 
-  if (uniqueChain.length < 2) return null;
+  if (options?.singlePageTour) {
+    uniqueChain = buildSinglePageSequenceChain(candidates, null, options);
+  }
+
+  const minChainLength = options?.singlePageTour ? 1 : 2;
+  if (uniqueChain.length < minChainLength) return null;
 
   const hasActionableStep = uniqueChain.some((candidate) => isActionableElement(candidate.element));
   if (!hasActionableStep) return null;
 
-  const steps: Step[] = uniqueChain.map((candidate, index) => {
+  const primarySelector = options?.singlePageTour
+    ? uniqueChain[0]?.selector
+    : (action || primary)?.selector;
+  const useSinglePageStepBuilder = Boolean(options?.singlePageTour);
+
+  const rawSteps: Step[] = uniqueChain.map((candidate, index) => {
+    if (useSinglePageStepBuilder) {
+      const detected = chainMemberToDetected(candidate as DetectedElement);
+      const isPrimaryStep = Boolean(primarySelector && candidate.selector === primarySelector);
+      if (isPrimaryStep) {
+        const posPrimary =
+          isPlaceOrderCtaLabel(candidate.label) || /place-order/i.test(candidate.selector);
+        return buildStep(
+          posPrimary ? 'Finaliser la commande' : 'Action principale',
+          posPrimary
+            ? `Validez la commande en cours avec: ${candidate.label}.`
+            : `Commencez par l'action clé: ${candidate.label}.`,
+          candidate.element,
+          'TOP',
+          'CLICK',
+          { intent: 'primary-action', stepIndex: index, totalSteps: uniqueChain.length },
+          {
+            isPrimary: true,
+            targetSelector: candidate.selector,
+            selectorCandidates: candidate.selectorCandidates,
+            stabilityScore: candidate.selectorStabilityScore,
+          },
+        );
+      }
+      const followUpRole = classifySequenceFollowUpRole(detected);
+      const followUpCopy = buildSequenceFollowUpStepCopy(detected, followUpRole);
+      return buildStep(
+        followUpCopy.title,
+        followUpCopy.content,
+        candidate.element,
+        followUpRole === 'form-field' ? 'RIGHT' : 'BOTTOM',
+        followUpCopy.action,
+        { intent: detected.intent, stepIndex: index, totalSteps: uniqueChain.length },
+        {
+          targetSelector: candidate.selector,
+          selectorCandidates: candidate.selectorCandidates,
+          stabilityScore: candidate.selectorStabilityScore,
+        },
+      );
+    }
+
     const isEntry = candidate === entry;
     const isActionStep = candidate === action;
     const isNavStep = candidate === navStep;
@@ -3628,27 +4989,47 @@ function buildSequenceDraft(
         isPrimary:
           isActionStep || (dedicatedPrimaryDraftExists && isFollowUp && followUpRole === 'form-submit' && stepAction === 'CLICK'),
         targetSelector: selector,
+        selectorCandidates: candidate.selectorCandidates,
+        stabilityScore: candidate.selectorStabilityScore,
       },
     );
   });
-  if (!steps.some((step) => step.isPrimary)) {
-    const firstClick = steps.findIndex((step) => step.action === 'CLICK');
+  const hasEntryStep = rawSteps.some((step) =>
+    /point d['']entr[ée]e/i.test(normalizeText(step.title)),
+  );
+  if (!rawSteps.some((step) => step.isPrimary) && !hasEntryStep) {
+    const firstClick = rawSteps.findIndex((step) => step.action === 'CLICK');
     if (firstClick >= 0) {
-      steps[firstClick] = { ...steps[firstClick], isPrimary: true };
+      rawSteps[firstClick] = { ...rawSteps[firstClick], isPrimary: true };
     }
+  }
+  // singlePageTour: keep 7-slot chain order — spatial sort would swap e.g. sidebar Dashboard vs header Import.
+  const orderedSteps = options?.singlePageTour
+    ? rawSteps
+    : normalizeDraftStepOrder(rawSteps, 'discovery');
+  let steps = dedupeDraftStepTitles(recomputeStepOrderIndex(orderedSteps));
+  if (options?.singlePageTour) {
+    steps = pinSinglePageTourStepOrder(steps);
+  } else if (entry) {
+    steps = pinDiscoveryEntryFirstStepOrder(steps);
   }
 
   const chainDetected = uniqueChain.map((candidate) => chainMemberToDetected(candidate as DetectedElement));
   const sequenceReasons = [
     'sequence detection enabled',
-    ...(entry ? ['entry detected'] : []),
-    ...(action ? action.reasons.slice(0, 2) : []),
-      ...(navStep ? ['navigation step detected'] : []),
-      ...(followUp ? ['follow-up step detected'] : []),
-    ...(result ? ['result detected'] : []),
+    ...(options?.singlePageTour
+      ? ['generic singlePageTour 7-slot chain', ...lastSinglePageChainSlotDecisions.map((row) => row.line)]
+      : [
+          ...(entry ? ['entry detected'] : []),
+          ...(action ? action.reasons.slice(0, 2) : []),
+          ...(navStep ? ['navigation step detected'] : []),
+          ...(followUp ? ['follow-up step detected'] : []),
+          ...(result ? ['result detected'] : []),
+        ]),
   ];
   const metrics = computeHeuristicDraftScores('discovery', steps, chainDetected, sequenceReasons, options);
-  if (metrics.confidence < 45) return null;
+  const sequenceMinConfidence = resolveSequenceMinConfidence(options);
+  if (metrics.confidence < sequenceMinConfidence) return null;
 
   const previewContext = buildPreviewContextSnapshot(
     uniqueChain.map((candidate) => ({
@@ -3658,6 +5039,7 @@ function buildSequenceDraft(
       intent: candidate.intent,
     })),
   );
+  const instrumentationSuggestions = buildInstrumentationSuggestions(chainDetected);
 
   const draftBase: SuggestedTourDraft = {
     generatedBy: 'contextual-tour-generator',
@@ -3684,11 +5066,13 @@ function buildSequenceDraft(
           conflictNotes: [],
         }
       : undefined,
-    metadata: previewContext
-      ? {
-          previewContext,
-        }
-      : undefined,
+    metadata:
+      previewContext || instrumentationSuggestions.length > 0
+        ? {
+            ...(previewContext ? { previewContext } : {}),
+            ...(instrumentationSuggestions.length > 0 ? { instrumentationSuggestions } : {}),
+          }
+        : undefined,
     name: `Parcours séquentiel - ${document.title || action?.label || 'page courante'}`,
     description: 'Parcours multi-etapes reconstruit à partir du contexte visible, du sens métier et du flux probable.',
     targetUrl,
@@ -3856,7 +5240,12 @@ export async function generateContextualTourDraftsAsync(
       status: 'error' as const,
       hints: [],
       preferredOrder: null,
-      implementation: null,
+      implementation: {
+        kind: 'rule-based-mirror' as const,
+        phase: 'phase-1-local' as const,
+        fallbackReason: 'sdk_http_error' as const,
+        note: 'SDK failed to reach backend semantic-hints.',
+      },
     };
   }
 
@@ -3871,8 +5260,11 @@ export async function generateContextualTourDraftsAsync(
 export function generateContextualTourDrafts(options?: TourDraftGenerationOptions): SuggestedTourDraft[] {
   if (typeof document === 'undefined') return [];
 
+  const resolvedOptions = applySinglePageTourProfile(options);
+  prepareCandidateScan(resolvedOptions);
   const startedAt = Date.now();
   activeDiagnostics = createDiagnostics();
+  lastSinglePageChainSlotDecisions = [];
   // Stability fix B: capture a single feedback snapshot for the whole scan.
   // All `scoreCandidate` invocations below resolve the local feedback store
   // from this constant value, so a tour event mid-scan (e.g. user clicks
@@ -3880,15 +5272,20 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
   // candidates of the same scan see different feedback states.
   currentFeedbackSnapshot = getFeedbackStore();
 
-  const generationProfile = resolveGenerationProfile(options);
+  const generationProfile = resolveGenerationProfile(resolvedOptions);
   const maxDrafts = generationProfile.maxDrafts;
-  const maxSteps = options?.maxSteps ?? 3;
+  const maxSteps = resolvedOptions?.maxSteps ?? 3;
   const minScore = generationProfile.minScore;
   const minConfidence = generationProfile.minConfidence;
-  const targetUrl = options?.targetUrl ?? window.location.pathname;
+  const sequenceMinConfidence = resolveSequenceMinConfidence(resolvedOptions);
+  const targetUrl = resolvedOptions?.targetUrl ?? window.location.pathname;
 
-  const candidates = collectCandidates(options);
+  const candidates = collectCandidates(resolvedOptions);
   if (candidates.length === 0) {
+    const emptySemanticShell =
+      options?.semanticEnhancementEnabled === true
+        ? buildSemanticEnhancementDebugShell(options, null)
+        : undefined;
     lastGenerationDebugReport = {
       generatedAt: new Date().toISOString(),
       elapsedMs: Date.now() - startedAt,
@@ -3925,19 +5322,28 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
         rejectedAsTrivial: 0,
         rejectedReasons: [],
       },
+      ...(emptySemanticShell ? { semanticEnhancement: emptySemanticShell } : {}),
     };
     activeDiagnostics = null;
     currentFeedbackSnapshot = null;
+    releaseCandidateMutationObserver();
     return [];
   }
 
-  const heading = getPageHeading(options);
+  const heading = getPageHeading(resolvedOptions);
   const headingSelector = heading ? buildUniqueSelector(heading) : '';
+  const primaryExcludedSelectors = headingSelector ? [headingSelector] : [];
+  const primaryFallbackPool = candidates.filter(
+    (candidate) => !isFormControlElement(candidate.element) && !isSearchLikeCandidate(candidate),
+  );
   const primary =
-    pickBestPrimaryActionCandidate(candidates, headingSelector ? [headingSelector] : []) ||
-    pickBestCandidate(candidates, 'primary-action') ||
-    pickBestActionableCandidate(candidates, headingSelector ? [headingSelector] : []) ||
-    pickAnyCandidate(candidates, headingSelector ? [headingSelector] : []);
+    pickBestPrimaryActionCandidate(primaryFallbackPool, primaryExcludedSelectors) ||
+    pickBestCandidate(primaryFallbackPool, 'primary-action', primaryExcludedSelectors) ||
+    pickBestActionableCandidate(primaryFallbackPool, primaryExcludedSelectors) ||
+    pickBestPrimaryActionCandidate(candidates, primaryExcludedSelectors) ||
+    pickBestCandidate(candidates, 'primary-action', primaryExcludedSelectors) ||
+    pickBestActionableCandidate(candidates, primaryExcludedSelectors) ||
+    pickAnyCandidate(candidates, primaryExcludedSelectors);
 
   // Phase 4: hybrid semantic enhancement layer. The legacy heuristic
   // pipeline above is the source of truth; the semantic layer is opt-in
@@ -4023,14 +5429,22 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
   const support = generationProfile.includeSupportDraft ? pickBestCandidate(candidates, 'support-navigation') : null;
   const navigation = generationProfile.includeNavigationDraft ? pickAnyCandidate(candidates, [primary?.selector || ''], ['navigation', 'sidebar', 'main']) : null;
   const form = generationProfile.includeFormDraft ? pickBestCandidate(candidates, 'form-flow') : null;
+  const discoveryPick = pickBestCandidate(candidates, 'discovery');
+  const candidateRankings = buildCandidateRankingDebug(candidates, {
+    'primary-action': primary,
+    'support-navigation': support,
+    'form-flow': form,
+    discovery: discoveryPick,
+  });
 
   const drafts: SuggestedTourDraft[] = [];
 
   // Analyse limitée à un conteneur : le séquentiel couvre déjà l'entrée — éviter un 3e draft découverte redondant.
-  const skipHeadingDiscoveryDraft = hasScopedAnalysis(options);
+  const skipHeadingDiscoveryDraft = hasScopedAnalysis(resolvedOptions);
 
-  if (heading && primary && !skipHeadingDiscoveryDraft) {
+  if (!resolvedOptions?.singlePageTour && heading && primary && !skipHeadingDiscoveryDraft) {
     const usedSelectors = new Set<string>([primary.selector, ...(headingSelector ? [headingSelector] : [])]);
+    const headingSelectorCandidates = heading ? buildSelectorCandidates(heading) : [];
     const steps: Step[] = [
       buildStep(
         'Decouvrir la page',
@@ -4043,6 +5457,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
           stepIndex: 0,
           totalSteps: maxSteps,
         },
+        {
+          targetSelector: headingSelector || undefined,
+          selectorCandidates: headingSelectorCandidates,
+          stabilityScore: headingSelector ? selectorStabilityScore(headingSelector) : undefined,
+        },
       ),
       buildStep(
         'Action principale',
@@ -4054,6 +5473,12 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
           intent: primary.intent,
           stepIndex: 1,
           totalSteps: maxSteps,
+        },
+        {
+          isPrimary: true,
+          targetSelector: primary.selector,
+          selectorCandidates: primary.selectorCandidates,
+          stabilityScore: primary.selectorStabilityScore,
         },
       ),
     ];
@@ -4074,6 +5499,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
             stepIndex: steps.length,
             totalSteps: maxSteps,
           },
+          {
+            targetSelector: nextCandidate.selector,
+            selectorCandidates: nextCandidate.selectorCandidates,
+            stabilityScore: nextCandidate.selectorStabilityScore,
+          },
         ),
       );
     }
@@ -4093,9 +5523,9 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
     if (steps.length >= 2 && draft.score >= minScore) drafts.push(draft);
   }
 
-  if (primary) {
-    const scopedAnalysis = hasScopedAnalysis(options);
-    const sequenceCompanionDraft = scopedAnalysis && options?.enableSequenceDetection !== false;
+  if (!resolvedOptions?.singlePageTour && primary) {
+    const scopedAnalysis = hasScopedAnalysis(resolvedOptions);
+    const sequenceCompanionDraft = scopedAnalysis && resolvedOptions?.enableSequenceDetection !== false;
     const excludedAfterPrimary = [primary.selector];
     const secondary = sequenceCompanionDraft
       ? null
@@ -4121,6 +5551,8 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
         {
           isPrimary: true,
           targetSelector: primary.selector,
+          selectorCandidates: primary.selectorCandidates,
+          stabilityScore: primary.selectorStabilityScore,
         },
       ),
     ];
@@ -4182,10 +5614,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
   }
 
   if (generationProfile.includeSupportDraft && support) {
+    const supportCopy = buildSecondaryStepCopy(support, 'support-navigation');
     const steps: Step[] = [
       buildStep(
-        "Acceder a l'aide",
-        `Le SDK a identifie un element d'assistance: ${support.label}.`,
+        supportCopy.title,
+        supportCopy.content,
         support.element,
         'BOTTOM_RIGHT',
         'CLICK',
@@ -4261,11 +5694,19 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
     if (draft.score >= minScore) drafts.push(draft);
   }
 
-  if (options?.enableSequenceDetection !== false) {
-    const sequenceDraft = buildSequenceDraft(candidates, heading, primary, support, form, targetUrl, options);
+  if (resolvedOptions?.enableSequenceDetection !== false) {
+    const sequenceDraft = buildSequenceDraft(
+      candidates,
+      heading,
+      primary,
+      resolvedOptions?.singlePageTour ? null : support,
+      resolvedOptions?.singlePageTour ? null : form,
+      targetUrl,
+      resolvedOptions,
+    );
     if (sequenceDraft) {
-      applySemanticFusionToDraft(sequenceDraft, semanticContext, options);
-      if (sequenceDraft.score >= minScore && sequenceDraft.confidence >= minConfidence) {
+      applySemanticFusionToDraft(sequenceDraft, semanticContext, resolvedOptions);
+      if (sequenceDraft.score >= minScore && sequenceDraft.confidence >= sequenceMinConfidence) {
         drafts.push(sequenceDraft);
       }
     }
@@ -4278,8 +5719,10 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
   // same dedupe pipeline as heuristic drafts; they carry `origin.kind =
   // 'blueprint'` so the quality filter and debug panel can distinguish them.
   // ============================================================================
-  const activeBlueprints = selectActiveBlueprints(options?.journeyVerticals, options?.journeyBlueprints);
-  const blueprintOutcome = resolveBlueprintsToDrafts(activeBlueprints, candidates, options);
+  const activeBlueprints = resolvedOptions?.singlePageTour
+    ? []
+    : selectActiveBlueprints(resolvedOptions?.journeyVerticals, resolvedOptions?.journeyBlueprints);
+  const blueprintOutcome = resolveBlueprintsToDrafts(activeBlueprints, candidates, resolvedOptions);
   // Tag heuristic drafts with `origin.kind = 'heuristic'` so downstream
   // filters/UIs can branch on origin reliably.
   for (const draft of drafts) {
@@ -4344,7 +5787,37 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
 
   const draftsBeforeConflict = diversifyDrafts(qualityFiltered);
   const confidenceFiltered = draftsBeforeConflict.filter((draft) => draft.confidence >= minConfidence);
-  const resolvedConflicts = resolveDraftConflicts(confidenceFiltered, options);
+  const coverageFallbackEnabled = (options?.maxDrafts ?? maxDrafts) > 1 && options?.blueprintsExclusive !== true;
+  let confidenceReady = confidenceFiltered.slice();
+  if (coverageFallbackEnabled && confidenceReady.length < 2 && draftsBeforeConflict.length > confidenceReady.length) {
+    const fallbackMinConfidence = Math.max(30, minConfidence - 15);
+    const selectedNames = new Set(confidenceReady.map((draft) => draft.name));
+    const rescueCandidates = draftsBeforeConflict
+      .filter((draft) => !selectedNames.has(draft.name))
+      .filter((draft) => draft.confidence >= fallbackMinConfidence)
+      .map((draft) => {
+        const stableSteps = draft.steps.filter((step) => {
+          if (isStableSelectorForPublish(step.targetSelector)) return true;
+          if ((step.selectorAlternatives || []).some((selector) => isStableSelectorForPublish(selector))) return true;
+          if (typeof step.stabilityScore === 'number' && step.stabilityScore >= 58) return true;
+          return Boolean(step.targetFingerprint?.ariaLabel || step.targetFingerprint?.role || step.targetFingerprint?.textSample);
+        }).length;
+        return { draft, stableSteps };
+      })
+      .sort((a, b) => {
+        if (b.stableSteps !== a.stableSteps) return b.stableSteps - a.stableSteps;
+        if (b.draft.confidence !== a.draft.confidence) return b.draft.confidence - a.draft.confidence;
+        return b.draft.score - a.draft.score;
+      });
+    for (const candidate of rescueCandidates) {
+      if (confidenceReady.length >= 2) break;
+      confidenceReady.push({
+        ...candidate.draft,
+        reasons: [...candidate.draft.reasons, 'confidence coverage fallback'],
+      });
+    }
+  }
+  const resolvedConflicts = resolveDraftConflicts(confidenceReady, options);
   // Blueprint drafts get priority in the final cap.
   const blueprintFirst = [...resolvedConflicts.drafts].sort((a, b) => {
     const aIsBlueprint = a.origin?.kind === 'blueprint' ? 1 : 0;
@@ -4382,7 +5855,7 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
     draftMetrics: {
       beforeConflict: draftsBeforeConflict.length,
       afterConflict: resolvedConflicts.drafts.length,
-      afterConfidenceFilter: confidenceFiltered.length,
+      afterConfidenceFilter: confidenceReady.length,
       afterMaxDrafts: limited.length,
     },
     conflicts: resolvedConflicts.conflicts,
@@ -4402,6 +5875,16 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
       rejectedAsTrivial: qualityRejected.length,
       rejectedReasons: qualityFilterCounts,
     },
+    candidateRankings,
+    singlePageChainSlots:
+      lastSinglePageChainSlotDecisions.length > 0
+        ? lastSinglePageChainSlotDecisions.map((row) => ({
+            slot: row.slot,
+            slotId: row.slotId,
+            status: row.status,
+            line: row.line,
+          }))
+        : undefined,
     semanticEnhancement: semanticContext
       ? {
           enabled: semanticContext.enabled,
@@ -4438,8 +5921,21 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
 
   activeDiagnostics = null;
   currentFeedbackSnapshot = null;
+  releaseCandidateMutationObserver();
   if (options?.flowVersioningEnabled !== false) {
     persistFlowVersioningMetadata(limited);
   }
-  return limited;
+  return limited.map(ensureContextualHighlightOnDraft);
+}
+
+/**
+ * Test-only helper: applies semantic preferred order then the same
+ * post-processing used by runtime (title dedupe + orderIndex sync).
+ */
+export function __applyPreferredSemanticOrderForTests(
+  steps: Step[],
+  preferredOrder: string[] | null,
+): Step[] {
+  const reordered = applyPreferredSemanticOrder(steps, preferredOrder).steps;
+  return dedupeDraftStepTitles(recomputeStepOrderIndex(reordered));
 }

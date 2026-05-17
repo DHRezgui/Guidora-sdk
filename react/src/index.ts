@@ -28,8 +28,16 @@ export {
 } from './utils/semantic-backend-client';
 export {
   generateContextualTourDraftsAsync,
+  invalidateContextualCandidateScanState,
+  __applyPreferredSemanticOrderForTests,
   __resetSemanticDomMutationTrackerForTests,
 } from './utils/tour-suggestion-generator';
+export {
+  enforceSemanticStepCopy,
+  isBloatedCopyText,
+  isOversizedStepTarget,
+  getCanonicalTargetKeyForStep,
+} from './utils/step-structural-guards';
 export type {
   BackendSemanticHint,
   BackendSemanticInferenceRequest,

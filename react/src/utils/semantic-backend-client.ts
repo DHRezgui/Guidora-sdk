@@ -34,8 +34,23 @@ export interface BackendSemanticImplementation {
   phase: 'phase-1-local' | 'phase-2-embeddings';
   note?: string;
   model?: string;
-  fallbackReason?: 'embeddings_disabled' | 'embeddings_timeout' | 'embeddings_error';
+  fallbackReason?:
+    | 'embeddings_disabled'
+    | 'embeddings_timeout'
+    | 'embeddings_error'
+    | 'embeddings_worker_unavailable'
+    | 'sdk_http_timeout'
+    | 'sdk_http_error';
 }
+
+/** Telemetry block when the SDK HTTP client times out before the backend responds. */
+export const SDK_SEMANTIC_HTTP_TIMEOUT_IMPLEMENTATION: BackendSemanticImplementation = {
+  kind: 'rule-based-mirror',
+  phase: 'phase-1-local',
+  fallbackReason: 'sdk_http_timeout',
+  note:
+    'SDK HTTP timeout before backend semantic-hints responded. Fusion uses the local rule engine only.',
+};
 
 export interface BackendSemanticInferenceResponse {
   roles: BackendSemanticHint[];
@@ -103,7 +118,9 @@ export async function fetchBackendSemanticHints(
       'Content-Type': 'application/json',
       Accept: 'application/json',
     };
-    const token = resolveAuthToken(options?.semanticBackendAccessToken);
+    const token =
+      resolveAuthToken(options?.semanticBackendAccessToken) ??
+      resolveAuthToken(options?.publishConfig?.getAccessToken);
     if (token) headers.Authorization = `Bearer ${token}`;
 
     const response = await fetch(url, {
@@ -113,7 +130,17 @@ export async function fetchBackendSemanticHints(
       signal: controller?.signal,
     });
     if (!response.ok) {
-      return { status: 'error', hints: [], preferredOrder: null, implementation: null };
+      return {
+        status: 'error',
+        hints: [],
+        preferredOrder: null,
+        implementation: {
+          kind: 'rule-based-mirror',
+          phase: 'phase-1-local',
+          fallbackReason: 'sdk_http_error',
+          note: `Backend semantic-hints returned HTTP ${response.status}.`,
+        },
+      };
     }
     const data = (await response.json()) as BackendSemanticInferenceResponse;
     const hints = Array.isArray(data.roles)
@@ -135,11 +162,24 @@ export async function fetchBackendSemanticHints(
       error !== null &&
       'name' in error &&
       (error as { name?: string }).name === 'AbortError';
+    if (isAbort) {
+      return {
+        status: 'timeout',
+        hints: [],
+        preferredOrder: null,
+        implementation: SDK_SEMANTIC_HTTP_TIMEOUT_IMPLEMENTATION,
+      };
+    }
     return {
-      status: isAbort ? 'timeout' : 'error',
+      status: 'error',
       hints: [],
       preferredOrder: null,
-      implementation: null,
+      implementation: {
+        kind: 'rule-based-mirror',
+        phase: 'phase-1-local',
+        fallbackReason: 'sdk_http_error',
+        note: error instanceof Error ? error.message : 'SDK semantic-hints fetch failed',
+      },
     };
   } finally {
     if (timer) clearTimeout(timer);
@@ -157,7 +197,17 @@ function sanitiseImplementation(
     phase,
     ...(typeof raw.note === 'string' ? { note: raw.note } : {}),
     ...(typeof raw.model === 'string' ? { model: raw.model } : {}),
-    ...(raw.fallbackReason ? { fallbackReason: raw.fallbackReason } : {}),
+    ...(raw.fallbackReason &&
+    [
+      'embeddings_disabled',
+      'embeddings_timeout',
+      'embeddings_error',
+      'embeddings_worker_unavailable',
+      'sdk_http_timeout',
+      'sdk_http_error',
+    ].includes(raw.fallbackReason)
+      ? { fallbackReason: raw.fallbackReason }
+      : {}),
   };
 }
 

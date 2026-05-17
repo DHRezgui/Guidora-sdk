@@ -61,7 +61,10 @@ export interface UseContextualTourSuggestionsResult {
   error: string | null;
   publishError: string | null;
   lastPublishReport: PublishContextualDraftsResponse['report'] | null;
-  refresh: () => SuggestedTourDraft[];
+  /** Runs synchronously for local-only mode; returns a Promise in hybrid/backend semantic mode. */
+  refresh: () => SuggestedTourDraft[] | Promise<SuggestedTourDraft[]>;
+  /** Bumps after each generation completes so consumers can re-read `getDebugReport()`. */
+  debugReportTick: number;
   publishDrafts: (draftsToPublish?: SuggestedTourDraft[]) => Promise<PublishContextualDraftsResponse['report'] | null>;
   getDebugReport: () => ContextualGenerationDebugReport | null;
   getFlowRegistry: () => Array<{ version: string; signature: string; generatedAt: string; targetUrl: string }>;
@@ -90,11 +93,17 @@ function toPublishStep(step: Step): PublishContextualDraftStep {
     title: step.title,
     content: step.content,
     targetSelector: step.targetSelector,
+    selectorAlternatives: Array.isArray(step.selectorAlternatives) ? step.selectorAlternatives : undefined,
+    targetFingerprint: step.targetFingerprint,
+    stabilityScore: typeof step.stabilityScore === 'number' ? step.stabilityScore : undefined,
+    selfHealCount: typeof step.selfHealCount === 'number' ? step.selfHealCount : undefined,
+    semanticRoleConfidence:
+      typeof step.semanticRoleConfidence === 'number' ? step.semanticRoleConfidence : undefined,
     stepTargetUrl: step.stepTargetUrl,
     position: step.position,
     action: step.action,
     skipAllowed: step.skipAllowed,
-    highlightElement: step.highlightElement,
+    highlightElement: true,
     stepType: step.stepType,
     isPrimary: typeof rawStep.isPrimary === 'boolean' ? rawStep.isPrimary : undefined,
     intent: typeof rawStep.intent === 'string' ? rawStep.intent : undefined,
@@ -362,10 +371,16 @@ export function useContextualTourSuggestions(
     [publishDrafts, selectAutoPublishCandidates],
   );
 
-  const refresh = useCallback((): SuggestedTourDraft[] => {
+  const [debugReportTick, setDebugReportTick] = useState(0);
+  const bumpDebugReport = useCallback(() => {
+    setDebugReportTick((tick) => tick + 1);
+  }, []);
+
+  const refresh = useCallback(async (): Promise<SuggestedTourDraft[]> => {
     const currentOptions = optionsRef.current;
     if (!enabled || typeof document === 'undefined') {
       setDrafts([]);
+      bumpDebugReport();
       return [];
     }
 
@@ -375,54 +390,47 @@ export function useContextualTourSuggestions(
     setLastPublishReport(null);
 
     try {
-      let next = generateContextualTourDrafts(currentOptions);
+      const semanticMode = currentOptions?.semanticEngineMode ?? 'hybrid';
+      const useHybridAsync =
+        currentOptions?.semanticEnhancementEnabled === true &&
+        (semanticMode === 'hybrid' || semanticMode === 'backend') &&
+        Boolean(currentOptions?.semanticBackendUrl);
+
+      // Hybrid/backend: one async pass (DOM settle wait + backend hints + generation).
+      // Avoid sync-first, which left the lab on a debug report without semanticEnhancement
+      // until a second "Analyser" click.
+      let next = useHybridAsync
+        ? await generateContextualTourDraftsAsync(currentOptions)
+        : generateContextualTourDrafts(currentOptions);
 
       if (next.length === 0 && fallbackPolicy.enabled && fallbackPolicy.maxAttempts > 1) {
         const fallbackDraftOptions = buildFallbackGenerationOptions(currentOptions, fallbackPolicy);
-        const fallbackDrafts = generateContextualTourDrafts(fallbackDraftOptions);
+        const fallbackDrafts = useHybridAsync
+          ? await generateContextualTourDraftsAsync(fallbackDraftOptions)
+          : generateContextualTourDrafts(fallbackDraftOptions);
         if (fallbackDrafts.length > 0) {
           next = fallbackDrafts;
         }
       }
 
       setDrafts(next);
+      bumpDebugReport();
       if (autoPublish && next.length > 0) {
         void runAutoPublish(next);
       } else {
         setLastPublishReport(null);
-      }
-
-      // Hybrid / backend semantic modes: run an additional async pass so
-      // backend hints can fuse with the heuristic result. The sync path
-      // above already produced a fully-usable local-only output, so this
-      // is purely additive and any failure leaves the local result in place.
-      const semanticMode = currentOptions?.semanticEngineMode;
-      if (
-        currentOptions?.semanticEnhancementEnabled === true &&
-        (semanticMode === 'hybrid' || semanticMode === 'backend') &&
-        currentOptions?.semanticBackendUrl
-      ) {
-        generateContextualTourDraftsAsync(currentOptions)
-          .then((asyncDrafts) => {
-            if (Array.isArray(asyncDrafts) && asyncDrafts.length > 0) {
-              setDrafts(asyncDrafts);
-              if (autoPublish) void runAutoPublish(asyncDrafts);
-            }
-          })
-          .catch(() => {
-            // backend semantic fetch failed → keep local-only result.
-          });
       }
       return next;
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to generate contextual tour suggestions.';
       setError(message);
       setDrafts([]);
+      bumpDebugReport();
       return [];
     } finally {
       setIsGenerating(false);
     }
-  }, [autoPublish, enabled, fallbackPolicy, runAutoPublish]);
+  }, [autoPublish, bumpDebugReport, enabled, fallbackPolicy, runAutoPublish]);
 
   const [feedbackVersion, setFeedbackVersion] = useState(0);
 
@@ -464,7 +472,7 @@ export function useContextualTourSuggestions(
 
   const getDebugReport = useCallback((): ContextualGenerationDebugReport | null => {
     return getLastContextualGenerationDebugReport();
-  }, []);
+  }, [debugReportTick]);
 
   const getFlowRegistry = useCallback((): Array<{ version: string; signature: string; generatedAt: string; targetUrl: string }> => {
     return getContextualFlowRegistry();
@@ -486,7 +494,7 @@ export function useContextualTourSuggestions(
     // directly, untouched by this gate.
     if (options?.feedbackEnabled === true && !remoteFeedbackReady) return;
     autoGenerateHasRunRef.current = true;
-    refresh();
+    void refresh();
   }, [autoGenerate, refresh, options?.feedbackEnabled, remoteFeedbackReady]);
 
   // Backend feedback sync (Phase 2): only when feedback explicitly opted-in.
@@ -550,6 +558,7 @@ export function useContextualTourSuggestions(
     refresh,
     publishDrafts,
     getDebugReport,
+    debugReportTick,
     getFlowRegistry,
     recordFeedback,
     resetFeedback,

@@ -67,6 +67,34 @@ export interface Step {
   content: string;
   stepType?: StepType;
   targetSelector?: string;
+  /**
+   * Runtime fallback selectors ordered by preference. Used when
+   * `targetSelector` no longer matches after a UI change.
+   */
+  selectorAlternatives?: string[];
+  /**
+   * Lightweight target fingerprint for runtime retargeting / self-heal.
+   */
+  targetFingerprint?: {
+    tagName?: string;
+    role?: string;
+    ariaLabel?: string;
+    textSample?: string;
+    placeholder?: string;
+    name?: string;
+  };
+  /**
+   * Selector stability score (0-100) used by publish/debug decisions.
+   */
+  stabilityScore?: number;
+  /**
+   * Number of runtime self-heal rewrites performed for this step.
+   */
+  selfHealCount?: number;
+  /**
+   * Confidence (0..1) of semantic role attribution used to rewrite copy/order.
+   */
+  semanticRoleConfidence?: number;
   stepTargetUrl?: string;
   position?: PositionType;
   action?: ActionType;
@@ -518,6 +546,24 @@ export interface ContextualGenerationDebugReport {
     rejectedReasons: Array<{ reason: string; count: number }>;
   };
   /**
+   * Top candidates per intent with effective rank and why the winner beat rivals.
+   * Format: `place-order · score 45 · lost to: credit-debit-card (score 62)`.
+   */
+  candidateRankings?: Array<{
+    intent: TourDraftIntent;
+    lines: string[];
+  }>;
+  /**
+   * Slot-by-slot decisions for `singlePageTour` generic chain (7 slots).
+   * Example: "Slot 1: filled (+ Add Project, score 113)".
+   */
+  singlePageChainSlots?: Array<{
+    slot: number;
+    slotId: string;
+    status: 'filled' | 'skipped';
+    line: string;
+  }>;
+  /**
    * Telemetry for the hybrid semantic enhancement layer. Present only when
    * `semanticEnhancementEnabled` was true at scan time. Always purely
    * informational — never alters publish behavior.
@@ -571,7 +617,13 @@ export interface ContextualGenerationDebugReport {
        * When the backend tried the embeddings path but had to fall back
        * to the rule mirror, this reports the reason transparently.
        */
-      fallbackReason?: 'embeddings_disabled' | 'embeddings_timeout' | 'embeddings_error';
+      fallbackReason?:
+        | 'embeddings_disabled'
+        | 'embeddings_timeout'
+        | 'embeddings_error'
+        | 'embeddings_worker_unavailable'
+        | 'sdk_http_timeout'
+        | 'sdk_http_error';
     };
     /**
      * Snapshot of the DOM-stability gate at run time.
@@ -708,6 +760,20 @@ export interface TourDraftGenerationOptions {
   maxDirtyNodesPerBatch?: number;
   enableSequenceDetection?: boolean;
   minConfidence?: number;
+  /**
+   * Dense single-page UIs (POS, dashboards): one sequence tour, no per-intent drafts.
+   * Sets `maxDrafts: 1`, `maxSteps: 7` (unless overridden), disables support/nav/form
+   * drafts, and lowers sequence confidence threshold to 35 unless `sequenceMinConfidence` is set.
+   */
+  singlePageTour?: boolean;
+  /**
+   * Minimum confidence for `buildSequenceDraft` acceptance. Defaults to 45, or 35 when `singlePageTour` is true.
+   */
+  sequenceMinConfidence?: number;
+  /**
+   * Publish scenario hint, used by local pre-publish filters.
+   */
+  publishScenario?: ContextualScenario;
   feedbackEnabled?: boolean;
   dedupeLabels?: boolean;
   conflictResolutionEnabled?: boolean;
@@ -828,6 +894,12 @@ export interface TourDraftGenerationOptions {
    * header.
    */
   semanticBackendAccessToken?: string | (() => string | null | undefined);
+  /**
+   * Optional publish/SDK config used only to resolve `Authorization` for
+   * semantic-hints when `semanticBackendAccessToken` is unset (e.g. lab
+   * passes `publishConfig` from `useContextualTourSuggestions`).
+   */
+  publishConfig?: Partial<SDKConfig>;
 }
 
 export interface GuidedTour {
@@ -887,6 +959,18 @@ export interface PublishContextualDraftStep {
   title: string;
   content: string;
   targetSelector?: string;
+  selectorAlternatives?: string[];
+  targetFingerprint?: {
+    tagName?: string;
+    role?: string;
+    ariaLabel?: string;
+    textSample?: string;
+    placeholder?: string;
+    name?: string;
+  };
+  stabilityScore?: number;
+  selfHealCount?: number;
+  semanticRoleConfidence?: number;
   stepTargetUrl?: string;
   position?: PositionType;
   action?: ActionType;
