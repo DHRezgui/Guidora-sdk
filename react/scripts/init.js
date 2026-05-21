@@ -26,6 +26,7 @@ const BLUEPRINT_PACKS = {
   social: { exportName: 'socialBlueprints', label: 'social' },
   elearning: { exportName: 'elearningBlueprints', label: 'elearning' },
   realestate: { exportName: 'realestateBlueprints', label: 'realestate' },
+  productivity: { exportName: 'productivityBlueprints', label: 'productivity' },
   'multi-vertical': { preset: 'multi-vertical-default', label: 'multi-vertical (preset)' },
 };
 

@@ -1016,6 +1016,31 @@ function dedupeStepsBySelector(steps: Step[]): Step[] {
   return output;
 }
 
+function isBlueprintDraft(draft: SuggestedTourDraft): boolean {
+  return draft.origin?.kind === 'blueprint';
+}
+
+/**
+ * Hybrid default: only targets present in a produced blueprint draft are reserved
+ * (see journey-resolver: unresolved declared steps never enter `draft.steps`).
+ * Heuristics may still target DOM elements the blueprint failed to resolve.
+ */
+function shouldReserveBlueprintTargets(
+  drafts: SuggestedTourDraft[],
+  options?: TourDraftGenerationOptions,
+): boolean {
+  if (options?.blueprintsExclusive === true) return false;
+  if (options?.blueprintStepReservation === false) return false;
+
+  const hasBlueprint = drafts.some(isBlueprintDraft);
+  if (!hasBlueprint) return false;
+
+  if (options?.blueprintStepReservation === true) return true;
+
+  const hasHeuristic = drafts.some((draft) => !isBlueprintDraft(draft));
+  return hasHeuristic;
+}
+
 function resolveDraftConflicts(
   drafts: SuggestedTourDraft[],
   options?: TourDraftGenerationOptions,
@@ -1025,6 +1050,7 @@ function resolveDraftConflicts(
   }
 
   const strategy = resolveConflictStrategy(options);
+  const reserveBlueprintTargets = shouldReserveBlueprintTargets(drafts, options);
   const conflicts: ConflictEvent[] = [];
 
   interface TargetClaim {
@@ -1072,6 +1098,13 @@ function resolveDraftConflicts(
 
   for (const [targetKey, claims] of claimsByTarget.entries()) {
     claims.sort((a, b) => {
+      // Reservation applies only to claims from blueprint draft steps (resolved
+      // at scan time). Unresolved blueprint slots are absent from draft.steps.
+      if (reserveBlueprintTargets) {
+        const aBlueprint = isBlueprintDraft(a.draft);
+        const bBlueprint = isBlueprintDraft(b.draft);
+        if (aBlueprint !== bBlueprint) return aBlueprint ? -1 : 1;
+      }
       if (b.stepSpecificity !== a.stepSpecificity) return b.stepSpecificity - a.stepSpecificity;
       if (b.draftPriority !== a.draftPriority) return b.draftPriority - a.draftPriority;
       return a.draftIndex - b.draftIndex;
@@ -1082,12 +1115,16 @@ function resolveDraftConflicts(
 
     for (let i = 1; i < claims.length; i += 1) {
       const loser = claims[i];
+      const blueprintReserved =
+        reserveBlueprintTargets && isBlueprintDraft(winner.draft) && !isBlueprintDraft(loser.draft);
       const conflict: ConflictEvent = {
         selector: loser.selector,
         winnerDraft: winner.draft.name,
         loserDraft: loser.draft.name,
         targetKey,
-        reason: `dom-target conflict (${targetKey}): kept more specific tour (${strategy})`,
+        reason: blueprintReserved
+          ? `blueprint-reserved target (${targetKey})`
+          : `dom-target conflict (${targetKey}): kept more specific tour (${strategy})`,
       };
       conflicts.push(conflict);
       if (typeof console !== 'undefined') {
@@ -5841,6 +5878,7 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
       minConfidence,
       conflictResolutionEnabled: options?.conflictResolutionEnabled !== false,
       conflictResolutionStrategy: resolveConflictStrategy(options),
+      blueprintStepReservation: shouldReserveBlueprintTargets(confidenceReady, options),
       explainabilityEnabled: explainabilityEnabled(options),
       sessionContextEnabled: Boolean(options?.sessionContext),
       flowVersioningEnabled: options?.flowVersioningEnabled !== false,
@@ -5938,4 +5976,12 @@ export function __applyPreferredSemanticOrderForTests(
 ): Step[] {
   const reordered = applyPreferredSemanticOrder(steps, preferredOrder).steps;
   return dedupeDraftStepTitles(recomputeStepOrderIndex(reordered));
+}
+
+/** Test-only: exposes draft conflict resolution (blueprint target reservation). */
+export function __resolveDraftConflictsForTests(
+  drafts: SuggestedTourDraft[],
+  options?: TourDraftGenerationOptions,
+): { drafts: SuggestedTourDraft[]; conflicts: ConflictEvent[] } {
+  return resolveDraftConflicts(drafts, options);
 }

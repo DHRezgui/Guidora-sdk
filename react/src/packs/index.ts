@@ -28,6 +28,7 @@
  *    industry, low risk of false positives.
  *  - **Mature** (P3): `realestateBlueprints`. Slightly more locale-specific
  *    but vocabulary is consistent. Validated against common UX conventions.
+ *  - **Stable** (PM): `productivityBlueprints` — project/task dashboards (Tasko-style).
  *  - **Preview** (P3/P4): `fintechBlueprints`, `healthtechBlueprints`. These
  *    cover the funnels we believe to be universal, BUT the regulated nature
  *    of these industries (PCI-DSS, HIPAA, locale-specific vocabulary like RIB
@@ -43,6 +44,7 @@ export { elearningBlueprints } from '../utils/blueprints/packs/elearning';
 export { realestateBlueprints } from '../utils/blueprints/packs/realestate';
 export { fintechBlueprints } from '../utils/blueprints/packs/fintech';
 export { healthtechBlueprints } from '../utils/blueprints/packs/healthtech';
+export { productivityBlueprints } from '../utils/blueprints/packs/productivity';
 
 /**
  * Aggregate of every opt-in pack, in order of recommended priority. Use this
@@ -60,6 +62,7 @@ import { elearningBlueprints } from '../utils/blueprints/packs/elearning';
 import { realestateBlueprints } from '../utils/blueprints/packs/realestate';
 import { fintechBlueprints } from '../utils/blueprints/packs/fintech';
 import { healthtechBlueprints } from '../utils/blueprints/packs/healthtech';
+import { productivityBlueprints } from '../utils/blueprints/packs/productivity';
 
 export const allBlueprintPacks = [
   ...techBlueprints,
@@ -69,4 +72,5 @@ export const allBlueprintPacks = [
   ...realestateBlueprints,
   ...fintechBlueprints,
   ...healthtechBlueprints,
+  ...productivityBlueprints,
 ];

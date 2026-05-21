@@ -145,7 +145,9 @@ export type JourneyVertical =
   | 'fintech'
   // Healthtech (PREVIEW — requires real-world validation): patient record,
   // appointment, follow-up. HIPAA-sensitive vocabulary; locale-specific.
-  | 'healthtech';
+  | 'healthtech'
+  // Productivity / PM (project & task dashboards, team collaboration).
+  | 'productivity';
 
 /**
  * Stable identifiers for "what the user should do at this step", independent
@@ -245,7 +247,22 @@ export type JourneyStepSemanticRole =
   | 'healthtech.facility-management'
   | 'healthtech.pharmacy-inventory'
   | 'healthtech.patient-analytics'
-  | 'healthtech.healthcare-reports';
+  | 'healthtech.healthcare-reports'
+  // Productivity / PM
+  | 'productivity.dashboard-overview'
+  | 'productivity.search-workspace'
+  | 'productivity.create-project'
+  | 'productivity.import-data'
+  | 'productivity.open-tasks'
+  | 'productivity.create-task'
+  | 'productivity.task-list'
+  | 'productivity.open-team'
+  | 'productivity.invite-member'
+  | 'productivity.open-analytics'
+  | 'productivity.kpi-overview'
+  | 'productivity.export-report'
+  | 'productivity.open-calendar'
+  | 'productivity.calendar-view';
 
 export interface JourneyStepBlueprint {
   /** Stable role identifier, used by debug telemetry and resolver. */
@@ -457,6 +474,7 @@ export interface ContextualGenerationDebugReport {
     minConfidence: number;
     conflictResolutionEnabled: boolean;
     conflictResolutionStrategy: ConflictResolutionStrategy;
+    blueprintStepReservation?: boolean;
     explainabilityEnabled: boolean;
     sessionContextEnabled: boolean;
     flowVersioningEnabled: boolean;
@@ -810,6 +828,17 @@ export interface TourDraftGenerationOptions {
    * are kept as additional suggestions, ranked below blueprint drafts.
    */
   blueprintsExclusive?: boolean;
+  /**
+   * In hybrid mode (blueprint + heuristic drafts), reserve DOM targets that
+   * appear in a produced blueprint **draft** (steps actually resolved on scan).
+   * Declared-but-unresolved blueprint steps are **not** in the draft and stay
+   * available to heuristics (e.g. 3/5 resolved → only those 3 targets reserved).
+   *
+   * - `true` — always reserve when both blueprint and heuristic drafts exist
+   * - `false` — legacy behavior (specificity/score may split blueprint steps)
+   * - omitted — auto: reserve when hybrid (default, recommended)
+   */
+  blueprintStepReservation?: boolean;
   /**
    * Hybrid semantic enhancement layer.
    *

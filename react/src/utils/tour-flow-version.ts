@@ -4,6 +4,7 @@ const ACTIVE_TOUR_SESSION_KEY_BASE = '__trustdev_active_tour_session_v1';
 
 type ContextualEngineMetadata = {
   flowVersion?: unknown;
+  source?: unknown;
 };
 
 function readContextualEngine(
@@ -13,6 +14,10 @@ function readContextualEngine(
   const contextual = raw?.contextualEngine;
   if (!contextual || typeof contextual !== 'object') return undefined;
   return contextual as ContextualEngineMetadata;
+}
+
+function isDashboardConcatTour(tour: GuidedTour): boolean {
+  return readContextualEngine(tour.triggerConditions)?.source === 'dashboard-concat';
 }
 
 export function getTourContextualFlowVersion(tour: GuidedTour): string | undefined {
@@ -30,7 +35,16 @@ export function filterActiveToursByFlowVersion(
   const matching = tours.filter((tour) => getTourContextualFlowVersion(tour) === scope);
   if (matching.length > 0) return matching;
 
-  // Avoid replaying tours from another local test app on the same org + URL.
+  // Dashboard concat tours inherit flowVersion when created; older rows may only
+  // carry source=dashboard-concat — still allow them on this URL.
+  const concatTours = tours.filter(isDashboardConcatTour);
+  if (concatTours.length > 0) return concatTours;
+
+  // Manual dashboard tours without contextualEngine: only when every active
+  // candidate lacks a flow scope (avoids mixing test apps on the same org + URL).
+  const unscoped = tours.filter((tour) => !getTourContextualFlowVersion(tour));
+  if (unscoped.length > 0 && unscoped.length === tours.length) return unscoped;
+
   return [];
 }
 
@@ -48,6 +62,8 @@ export function isActiveTourSnapshotCompatible(
   if (!scope) return true;
 
   const tourFlowVersion = getTourContextualFlowVersion(tour);
-  if (!tourFlowVersion) return false;
+  if (!tourFlowVersion) {
+    return isDashboardConcatTour(tour);
+  }
   return tourFlowVersion === scope;
 }
