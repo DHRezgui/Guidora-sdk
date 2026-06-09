@@ -16,7 +16,8 @@
  *     preset: 'saas-default',
  *     // Custom blueprints are merged with the preset's built-in catalog.
  *     // See `selectActiveBlueprints` in journey-blueprints.ts.
- *     journeyBlueprints: [...fintechBlueprints, ...healthtechBlueprints],
+ *     journeyVerticals: ['healthtech'],
+ *     journeyBlueprints: allBlueprintPacks, // filtered to healthtech only
  *   }}
  * />
  * ```

@@ -3,6 +3,37 @@ import type { PublishContextualDraftsResponse, SuggestedTourDraft } from '../typ
 export const AUTOPUBLISHED_SIGNATURES_STORAGE_KEY = '__trustdev_autopublished_signatures_v1';
 export const AUTOPUBLISHED_TOUR_ID_MAP_STORAGE_KEY = '__trustdev_autopublished_tour_map_v1';
 
+function getAutoPublishStorageScope(): string {
+  if (typeof window === 'undefined') return 'anonymous';
+  try {
+    const raw = window.localStorage.getItem('auth_user');
+    if (!raw) return 'anonymous';
+    const user = JSON.parse(raw) as { id?: string; email?: string };
+    if (typeof user.id === 'string' && user.id.trim()) return user.id.trim();
+    if (typeof user.email === 'string' && user.email.trim()) {
+      return user.email.trim().toLowerCase();
+    }
+  } catch {
+    // Ignore malformed auth_user payload.
+  }
+  return 'anonymous';
+}
+
+function scopedStorageKey(baseKey: string): string {
+  return `${baseKey}:${getAutoPublishStorageScope()}`;
+}
+
+/** Drop legacy unscoped keys so a prior session cannot block republication after tour delete. */
+function clearLegacyUnscopedAutoPublishStorage(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.sessionStorage.removeItem(AUTOPUBLISHED_SIGNATURES_STORAGE_KEY);
+    window.sessionStorage.removeItem(AUTOPUBLISHED_TOUR_ID_MAP_STORAGE_KEY);
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
 export interface AutoPublishDedupeTourShape {
   id?: string;
   targetUrl?: string;
@@ -53,8 +84,9 @@ export function computeAutoPublishDedupeSignatureFromTour(tour: AutoPublishDedup
 
 export function readAutoPublishedSignatures(): Set<string> {
   if (typeof window === 'undefined') return new Set();
+  clearLegacyUnscopedAutoPublishStorage();
   try {
-    const raw = window.sessionStorage.getItem(AUTOPUBLISHED_SIGNATURES_STORAGE_KEY);
+    const raw = window.sessionStorage.getItem(scopedStorageKey(AUTOPUBLISHED_SIGNATURES_STORAGE_KEY));
     if (!raw) return new Set();
     const parsed = JSON.parse(raw);
     return new Set(Array.isArray(parsed) ? parsed.filter((value) => typeof value === 'string') : []);
@@ -66,7 +98,7 @@ export function readAutoPublishedSignatures(): Set<string> {
 export function readAutoPublishedTourIdMap(): Record<string, string> {
   if (typeof window === 'undefined') return {};
   try {
-    const raw = window.sessionStorage.getItem(AUTOPUBLISHED_TOUR_ID_MAP_STORAGE_KEY);
+    const raw = window.sessionStorage.getItem(scopedStorageKey(AUTOPUBLISHED_TOUR_ID_MAP_STORAGE_KEY));
     if (!raw) return {};
     const parsed = JSON.parse(raw) as unknown;
     if (!parsed || typeof parsed !== 'object') return {};
@@ -84,9 +116,10 @@ export function readAutoPublishedTourIdMap(): Record<string, string> {
 
 export function persistAutoPublishedSignatures(signatures: Set<string>): void {
   if (typeof window === 'undefined') return;
+  clearLegacyUnscopedAutoPublishStorage();
   try {
     window.sessionStorage.setItem(
-      AUTOPUBLISHED_SIGNATURES_STORAGE_KEY,
+      scopedStorageKey(AUTOPUBLISHED_SIGNATURES_STORAGE_KEY),
       JSON.stringify(Array.from(signatures)),
     );
   } catch {
@@ -97,7 +130,10 @@ export function persistAutoPublishedSignatures(signatures: Set<string>): void {
 function persistAutoPublishedTourIdMap(map: Record<string, string>): void {
   if (typeof window === 'undefined') return;
   try {
-    window.sessionStorage.setItem(AUTOPUBLISHED_TOUR_ID_MAP_STORAGE_KEY, JSON.stringify(map));
+    window.sessionStorage.setItem(
+      scopedStorageKey(AUTOPUBLISHED_TOUR_ID_MAP_STORAGE_KEY),
+      JSON.stringify(map),
+    );
   } catch {
     // ignore
   }
@@ -150,6 +186,7 @@ export function recordAutoPublishedSignaturesFromReport(
 /** À appeler quand un parcours est supprimé du dashboard : libère la republication auto en session. */
 export function removeAutoPublishedSignaturesForTour(tour: AutoPublishDedupeTourShape): void {
   if (typeof window === 'undefined') return;
+  clearLegacyUnscopedAutoPublishStorage();
 
   const toRemove = new Set<string>();
   const tourMap = readAutoPublishedTourIdMap();
@@ -201,6 +238,7 @@ export function pruneAutoPublishedSessionAgainstExistingTourIds(existingTourIds:
  */
 export function reconcileAutoPublishedSessionWithTours(tours: AutoPublishDedupeTourShape[]): void {
   if (typeof window === 'undefined') return;
+  clearLegacyUnscopedAutoPublishStorage();
 
   pruneAutoPublishedSessionAgainstExistingTourIds(
     tours.map((tour) => tour.id).filter((id): id is string => Boolean(id)),

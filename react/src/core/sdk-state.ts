@@ -24,6 +24,7 @@ function normalizeConfig(config: SDKConfig): NormalizedSDKConfig {
     syncIntervalMs: config.syncIntervalMs ?? 15000,
     syncOnFocus: config.syncOnFocus ?? true,
     syncOnReconnect: config.syncOnReconnect ?? true,
+    tourAudience: config.tourAudience,
   };
 }
 

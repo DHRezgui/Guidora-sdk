@@ -321,6 +321,48 @@ export function ContextualSuggestionsPublisher({
 
               {debugReport ? (
                 <div style={{ borderRadius: 8, border: PHOENIX_SURFACE_BORDER, background: 'rgba(12,18,30,0.62)', padding: 8, fontSize: 12, lineHeight: 1.45, marginBottom: 8, color: '#f8fafc' }}>
+                  {debugReport.optionsSnapshot.generationPath ||
+                  debugReport.optionsSnapshot.mode ? (
+                    <div style={{ marginBottom: 6 }}>
+                      Mode:{' '}
+                      <strong>
+                        {debugReport.optionsSnapshot.generationPath ??
+                          debugReport.optionsSnapshot.mode ??
+                          'auto'}
+                      </strong>
+                      {debugReport.optionsSnapshot.mode === 'auto' &&
+                      debugReport.optionsSnapshot.generationPath ? (
+                        <span style={{ color: '#94a3b8', fontWeight: 400 }}> (config: auto)</span>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  {debugReport.autoDecision ? (
+                    <>
+                      <div style={{ marginBottom: 6, fontWeight: 700, color: '#fdba74' }}>Auto decision</div>
+                      <div style={{ marginTop: 4, color: '#cbd5e1' }}>{debugReport.autoDecision.reason}</div>
+                      {debugReport.autoDecision.shortCircuit ? (
+                        <div
+                          style={{
+                            marginTop: 4,
+                            color:
+                              debugReport.autoDecision.shortCircuit === 'resolution-partial' ||
+                              debugReport.autoDecision.shortCircuit === 'no-domain-vertical' ||
+                              debugReport.autoDecision.shortCircuit === 'auto-single-page-detected'
+                                ? '#fdba74'
+                                : undefined,
+                          }}
+                        >
+                          Short-circuit: <strong>{debugReport.autoDecision.shortCircuit}</strong>
+                        </div>
+                      ) : null}
+                      <div style={{ marginTop: 4 }}>
+                        Blueprint drafts: {debugReport.autoDecision.blueprintDraftsCount}
+                        {debugReport.autoDecision.resolvedStepsPerDraft.length > 0
+                          ? ` (resolved steps: ${debugReport.autoDecision.resolvedStepsPerDraft.join(', ')})`
+                          : ''}
+                      </div>
+                    </>
+                  ) : null}
                   <div style={{ marginBottom: 6, fontWeight: 700 }}>Candidate funnel</div>
                   <div>Considered: {debugReport.candidateMetrics.considered}</div>
                   <div>Accepted: {debugReport.candidateMetrics.accepted}</div>

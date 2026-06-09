@@ -1980,27 +1980,41 @@ const BUILTIN_BLUEPRINTS: Partial<Record<JourneyVertical, JourneyBlueprint[]>> =
 
 /**
  * Returns the union of built-in blueprints for the requested verticals plus
- * any custom blueprints supplied by the host application. Custom blueprints
- * are appended after the built-ins so that, in case of duplicate IDs, the
- * built-ins win and the host can still inspect what they overrode (we don't
- * silently dedupe — the resolver will treat IDs as opaque labels).
+ * any custom blueprints supplied by the host application.
+ *
+ * When `verticals` is non-empty, opt-in packs in `customBlueprints` are
+ * filtered to `blueprint.vertical ∈ verticals` (same rule as built-ins). This
+ * lets `mode: 'auto'` hosts pass `allBlueprintPacks` with
+ * `journeyVerticals: ['healthtech']` without scanning the full catalogue.
+ *
+ * Custom entries (local + remote from dashboard) are appended after built-ins.
+ * Duplicate IDs are not deduped — merge order is: built-ins → local → remote.
  */
 export function selectActiveBlueprints(
   verticals: JourneyVertical[] | undefined,
   customBlueprints: JourneyBlueprint[] | undefined,
 ): JourneyBlueprint[] {
   const result: JourneyBlueprint[] = [];
-  if (verticals && verticals.length > 0) {
-    for (const vertical of verticals) {
+  const activeVerticals =
+    verticals && verticals.length > 0 ? new Set<JourneyVertical>(verticals) : null;
+
+  if (activeVerticals) {
+    for (const vertical of activeVerticals) {
       const builtins = BUILTIN_BLUEPRINTS[vertical];
       if (builtins) {
         result.push(...builtins);
       }
     }
   }
+
   if (customBlueprints && customBlueprints.length > 0) {
-    result.push(...customBlueprints);
+    if (activeVerticals) {
+      result.push(...customBlueprints.filter((blueprint) => activeVerticals.has(blueprint.vertical)));
+    } else {
+      result.push(...customBlueprints);
+    }
   }
+
   return result;
 }
 

@@ -87,8 +87,12 @@ function parseArgs(argv) {
     }
   }
 
-  if (options.mode && !['heuristic', 'blueprints'].includes(options.mode)) {
-    throw new Error(`Invalid --mode=${options.mode}. Use heuristic or blueprints.`);
+  if (options.mode === 'blueprint') {
+    options.mode = 'blueprints';
+  }
+
+  if (options.mode && !['auto', 'heuristic', 'blueprints'].includes(options.mode)) {
+    throw new Error(`Invalid --mode=${options.mode}. Use auto, heuristic, or blueprints.`);
   }
 
   if (!BLUEPRINT_PACKS[options.pack] && options.mode === 'blueprints') {
@@ -107,17 +111,19 @@ TrustDev SDK init — usage
   node scripts/init.js [options]
 
 Options:
-  --mode=heuristic|blueprints   Generation profile (required for non-interactive)
-  --pack=fintech                Blueprint pack (blueprints mode only, default: fintech)
+  --mode=auto|heuristic|blueprints   Generation profile (default: auto)
+  --pack=fintech                     Blueprint pack (blueprints mode only, default: fintech)
   --single-page-tour            Heuristic: enable singlePageTour (max 1 sequence draft)
-  --project-domain="..."        Heuristic: projectDomain hint for the generator
-  --target-dir="C:/path/app"    Project root (overrides process.cwd())
+  --project-domain="..."        projectDomain + journeyVerticals inference (auto)
+  --target-dir="C:/path/app"    Project root (e2e hints: test_7 → healthtech, etc.)
   --yes, -y                     Non-interactive (no prompts, overwrite component)
   --help, -h                    Show this help
 
 Blueprint packs: ${Object.keys(BLUEPRINT_PACKS).join(', ')}
 
 Examples:
+  node scripts/init.js --yes
+  node scripts/init.js --mode=auto --yes
   node scripts/init.js --mode=blueprints --pack=fintech --yes
   node scripts/init.js --mode=heuristic --single-page-tour --yes
 `);
@@ -137,6 +143,78 @@ function inferProjectDomain(flowVersionName, explicit) {
   if (explicit && explicit.trim()) return explicit.trim();
   // e.g. folder test_11 → test-11 → "test-11 web application"
   return flowVersionName ? `${flowVersionName} web application` : 'web application onboarding';
+}
+
+/** Optional e2e folder → vertical hints (init auto mode). */
+const E2E_FOLDER_VERTICAL_HINTS = {
+  test_3: ['fintech'],
+  test_6: ['fintech'],
+  test_7: ['healthtech'],
+  test_11: ['productivity'],
+};
+
+const VERTICAL_DOMAIN_KEYWORDS = {
+  healthtech: [
+    'health',
+    'healthcare',
+    'hospital',
+    'clinic',
+    'pharma',
+    'pharmacy',
+    'patient',
+    'medical',
+    'sante',
+  ],
+  fintech: ['fintech', 'bank', 'banking', 'finance', 'payment', 'transaction', 'wallet'],
+  productivity: ['productivity', 'task', 'project management', 'workspace', 'tasko'],
+  tech: ['api explorer', 'developer', 'devtools', 'playground'],
+  hr: ['hr ', 'human resources', 'employee onboarding', 'leave management'],
+  social: ['social', 'community', 'feed', 'notification'],
+  elearning: ['elearning', 'e-learning', 'course', 'learner', 'lms'],
+  realestate: ['real estate', 'realestate', 'property', 'mortgage'],
+  ecommerce: ['ecommerce', 'e-commerce', 'shop', 'catalog', 'checkout', 'cart'],
+  saas: [
+    'saas',
+    'b2b',
+    'team invite',
+    'onboarding checklist',
+    'crm',
+    'sales crm',
+    'sales',
+    'deal',
+    'deals',
+    'pipeline',
+    'contact',
+    'contacts',
+    'lead',
+    'opportunity',
+  ],
+  marketing: ['marketing', 'lead capture', 'newsletter', 'landing'],
+  dashboard: ['analytics dashboard', 'bi ', 'kpi', 'data visualization'],
+  support: ['help center', 'support ticket', 'faq', 'in-app help'],
+};
+
+function inferJourneyVerticals(flowVersionName, projectDomain, targetDir) {
+  const folder = targetDir ? path.basename(targetDir) : '';
+  if (E2E_FOLDER_VERTICAL_HINTS[folder]) {
+    return E2E_FOLDER_VERTICAL_HINTS[folder];
+  }
+
+  const text = `${flowVersionName} ${projectDomain || ''}`.toLowerCase();
+  const matched = [];
+  for (const [vertical, keywords] of Object.entries(VERTICAL_DOMAIN_KEYWORDS)) {
+    if (keywords.some((keyword) => text.includes(keyword))) {
+      matched.push(vertical);
+    }
+  }
+  return matched;
+}
+
+function formatJourneyVerticalsLine(verticals) {
+  if (!verticals || verticals.length === 0) return '';
+  const serialized = JSON.stringify(verticals);
+  return `
+      journeyVerticals: ${serialized} as JourneyVertical[],`;
 }
 
 /** Domain-agnostic heuristic baseline — no vertical-specific terminology. */
@@ -229,6 +307,7 @@ export function TrustdevOnboarding() {
       contextualSuggestions={{
         uiMode: 'debug',
         title: '${flowVersionName} — blueprints (${pack.label})',
+        mode: 'blueprint',
         preset: '${pack.preset}',
         autoPublish: false,
         publishScenario: 'simple',
@@ -285,6 +364,7 @@ export function TrustdevOnboarding() {
       contextualSuggestions={{
         uiMode: 'debug',
         title: '${flowVersionName} — blueprints (${pack.label})',
+        mode: 'blueprint',
         journeyBlueprints: ${pack.exportName},
         autoPublish: false,
         publishScenario: 'simple',
@@ -297,6 +377,137 @@ export function TrustdevOnboarding() {
         baselineFlowVersion: '${flowVersionName}-v0',
         stableOnly: true,
       }}
+    />
+  )
+}
+`;
+}
+
+function buildAutoComponentTemplate(flowVersionName, options) {
+  const singlePage = options.singlePageTour;
+  const domain = inferProjectDomain(flowVersionName, options.projectDomain);
+  const journeyVerticals = inferJourneyVerticals(flowVersionName, domain, options.targetDir);
+  const journeyVerticalsLine = formatJourneyVerticalsLine(journeyVerticals);
+  const flowSuffix = singlePage ? '-single' : '';
+  const titleSuffix = singlePage ? ', singlePageTour' : '';
+  const singlePageBlock = singlePage
+    ? `
+      singlePageTour: true,
+      maxDrafts: 1,
+      maxSteps: 7,
+      sequenceMinConfidence: 35,`
+    : `
+      maxDrafts: 2,`;
+  const blueprintBlock = singlePage
+    ? ''
+    : `
+import { allBlueprintPacks } from '@trustdev/onboarding-sdk-react/packs'`;
+
+  const journeyBlueprintsLine = singlePage
+    ? ''
+    : `
+      journeyBlueprints: allBlueprintPacks,`;
+
+  return `'use client'
+
+import { useMemo } from 'react'
+import { TourViewer, type JourneyVertical } from '@trustdev/onboarding-sdk-react'${blueprintBlock}
+import '@trustdev/onboarding-sdk-react/styles.css'
+
+/**
+ * TrustDev — resolution-first auto mode (blueprint when DOM resolves, else heuristic).
+ * Initialized via: trustdev-init --mode=auto${singlePage ? ' --single-page-tour' : ''}
+ */
+const SEMANTIC_HINTS_PATH = '/tours/contextual/semantic-hints'
+
+const NOISE_SELECTORS = [
+  '.trustdev-contextual-debug-panel',
+  '[data-tour-id="contextual-debug-panel"]',
+  '[data-trustdev-contextual-panel]',
+  '[aria-label="Trustdev contextual suggestions panel"]',
+] as const
+
+function resolveSemanticBackendUrl(apiUrl: string): string | undefined {
+  const mode = (process.env.NEXT_PUBLIC_TRUSTDEV_SEMANTIC_ENGINE_MODE || 'hybrid').toLowerCase()
+  if (mode === 'local') return undefined
+  return \`\${apiUrl.replace(/\\/$/, '')}\${SEMANTIC_HINTS_PATH}\`
+}
+
+export function TrustdevOnboarding() {
+  const sdkToken = process.env.NEXT_PUBLIC_TRUSTDEV_SDK_TOKEN
+
+  const sdkConfig = useMemo(
+    () => ({
+      apiKey: process.env.NEXT_PUBLIC_TRUSTDEV_API_KEY || 'demo-local-key',
+      apiUrl: process.env.NEXT_PUBLIC_TRUSTDEV_API_URL || 'http://localhost:3020/api/v1',
+      sdkToken,
+      organizationId: process.env.NEXT_PUBLIC_TRUSTDEV_ORGANIZATION_ID || 'org_demo_1',
+      debug: true,
+      syncEnabled: true,
+      syncIntervalMs: 8000,
+      trackBatchSize: 20,
+      trackFlushIntervalMs: 5000,
+    }),
+    [sdkToken],
+  )
+
+  const apiUrl = sdkConfig.apiUrl as string
+
+  const contextualSuggestions = useMemo(() => {
+    const semanticEngineMode = (process.env.NEXT_PUBLIC_TRUSTDEV_SEMANTIC_ENGINE_MODE || 'hybrid') as
+      | 'local'
+      | 'hybrid'
+      | 'backend'
+    const semanticBackendUrl = resolveSemanticBackendUrl(apiUrl)
+
+    return {
+      uiMode: 'debug' as const,
+      title: '${flowVersionName} — contextual auto${titleSuffix}',
+      mode: 'auto' as const,
+      projectDomain: '${domain}',${journeyVerticalsLine}${HEURISTIC_CONTEXT_BLOCK}${journeyBlueprintsLine}
+      journeyBlueprintsRemoteEnabled: true,
+      journeyBlueprintsAccessToken: () => sdkToken ?? null,
+      publishConfig: sdkConfig,
+      // autoDetectSinglePageTour defaults true: tabbed UIs fall back to 7-slot chain
+      persona: 'admin' as const,
+      autoPublish: false,
+      publishScenario: 'simple' as const,
+      feedbackEnabled: true,
+      useSemanticRanking: true,
+      enableSequenceDetection: true,
+      explainabilityEnabled: true,
+      conflictResolutionEnabled: true,
+      conflictResolutionStrategy: 'hybrid' as const,
+      includeSupportDraft: false,
+      includeNavigationDraft: false,
+      includeFormDraft: false,${singlePageBlock}
+      minConfidence: 45,
+      noiseSelectors: [...NOISE_SELECTORS],
+      flowVersioningEnabled: true,
+      flowVersion: '${flowVersionName}${flowSuffix}-v1',
+      baselineFlowVersion: '${flowVersionName}${flowSuffix}-v0',
+      stableOnly: false,
+      semanticEnhancementEnabled: true,
+      semanticEngineMode,
+      semanticBackendUrl,
+      semanticBackendTimeoutMs: 12_000,
+      semanticSnapshotMinDomAgeMs: 300,
+      semanticBackendAccessToken: () => sdkToken ?? null,
+      semanticRoleWeights: { role: 0.6, order: 0.4, copy: 0.5 },
+    }
+  }, [apiUrl, sdkToken])
+
+  if (!sdkToken) return null
+
+  return (
+    <TourViewer
+      config={sdkConfig}
+      autoStart={true}
+      debug={true}
+      showHighlight={true}
+      showTooltip={true}
+      showBeacon={false}
+      contextualSuggestions={contextualSuggestions}
     />
   )
 }
@@ -374,6 +585,7 @@ export function TrustdevOnboarding() {
     return {
       uiMode: 'debug' as const,
       title: '${flowVersionName} — contextual (no blueprints${titleSuffix})',
+      mode: 'heuristic' as const,
       projectDomain: '${domain}',${HEURISTIC_CONTEXT_BLOCK}
       persona: 'admin' as const,
       autoPublish: false,
@@ -421,11 +633,14 @@ export function TrustdevOnboarding() {
 }
 
 function buildComponentTemplate(flowVersionName, initOptions) {
-  const mode = initOptions.mode || 'blueprints';
+  const mode = initOptions.mode || 'auto';
   if (mode === 'heuristic') {
     return buildHeuristicComponentTemplate(flowVersionName, initOptions);
   }
-  return buildBlueprintsComponentTemplate(flowVersionName, initOptions.pack);
+  if (mode === 'blueprints') {
+    return buildBlueprintsComponentTemplate(flowVersionName, initOptions.pack);
+  }
+  return buildAutoComponentTemplate(flowVersionName, initOptions);
 }
 
 function createPrompt() {
@@ -519,9 +734,18 @@ function appendEnvValue(envContent, key, value) {
 
 async function resolveInitOptions(prompt, initOptions) {
   let mode = initOptions.mode;
+  if (!mode && initOptions.yes) {
+    mode = 'auto';
+  }
   if (!mode) {
-    const answer = await prompt.question('Init mode [heuristic/blueprints] (default: blueprints): ');
-    mode = answer.toLowerCase() === 'heuristic' ? 'heuristic' : 'blueprints';
+    const answer = await prompt.question('Init mode [auto/heuristic/blueprints] (default: auto): ');
+    const normalized = answer.toLowerCase();
+    mode =
+      normalized === 'heuristic'
+        ? 'heuristic'
+        : normalized === 'blueprints' || normalized === 'blueprint'
+          ? 'blueprints'
+          : 'auto';
   }
 
   let pack = initOptions.pack;

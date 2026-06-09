@@ -16,7 +16,13 @@ import {
   TourPersona,
 } from '../types';
 import { selectActiveBlueprints } from './journey-blueprints';
-import { BlueprintResolutionReport, resolveBlueprintsToDrafts } from './journey-resolver';
+import { resolveTourDraftOptionsWithRemoteBlueprints } from './journey-blueprints-remote-client';
+import { BlueprintResolutionReport } from './journey-resolver';
+import {
+  planContextualGenerationMode,
+  resolveEffectiveContextualMode,
+  resolveGenerationPathFromPlan,
+} from './contextual-generation-mode';
 import {
   buildSemanticPageSnapshot,
   buildSemanticStepCopy,
@@ -5223,12 +5229,20 @@ export async function generateContextualTourDraftsAsync(
   options?: TourDraftGenerationOptions,
 ): Promise<SuggestedTourDraft[]> {
   if (typeof document === 'undefined') return [];
-  if (options?.semanticEnhancementEnabled !== true) {
-    return generateContextualTourDrafts(options);
+
+  let resolvedOptions = options;
+  try {
+    resolvedOptions = await resolveTourDraftOptionsWithRemoteBlueprints(options);
+  } catch {
+    resolvedOptions = options;
   }
-  const mode = options?.semanticEngineMode ?? 'hybrid';
+
+  if (options?.semanticEnhancementEnabled !== true) {
+    return generateContextualTourDrafts(resolvedOptions);
+  }
+  const mode = resolvedOptions?.semanticEngineMode ?? 'hybrid';
   if (mode === 'local') {
-    return generateContextualTourDrafts(options);
+    return generateContextualTourDrafts(resolvedOptions);
   }
 
   // Honour the DOM-settled gate before doing any work: in async mode we
@@ -5237,23 +5251,23 @@ export async function generateContextualTourDraftsAsync(
   // If the gate cannot prove stability after the max wait, we fall
   // through to the sync local-only path which will record the bypass
   // reason in the debug report.
-  const stability = await waitForDomToSettle(options);
+  const stability = await waitForDomToSettle(resolvedOptions);
   if (!stability.stable) {
-    return generateContextualTourDrafts(options);
+    return generateContextualTourDrafts(resolvedOptions);
   }
 
   let preCandidates: DetectedElement[] = [];
   try {
-    preCandidates = collectCandidates(options);
+    preCandidates = collectCandidates(resolvedOptions);
   } catch {
-    return generateContextualTourDrafts(options);
+    return generateContextualTourDrafts(resolvedOptions);
   }
   if (preCandidates.length === 0) {
-    return generateContextualTourDrafts(options);
+    return generateContextualTourDrafts(resolvedOptions);
   }
 
   const inputs = buildSemanticInputs(preCandidates);
-  const snapshot = buildSemanticPageSnapshot(inputs, options);
+  const snapshot = buildSemanticPageSnapshot(inputs, resolvedOptions);
   const request = {
     snapshot,
     candidates: inputs.map((candidate) => ({
@@ -5263,15 +5277,15 @@ export async function generateContextualTourDraftsAsync(
       intent: candidate.intent,
       zone: candidate.zone,
     })),
-    hints: options?.semanticHints,
-    objectives: options?.businessObjectives,
-    persona: typeof options?.persona === 'string' ? options?.persona : undefined,
+    hints: resolvedOptions?.semanticHints,
+    objectives: resolvedOptions?.businessObjectives,
+    persona: typeof resolvedOptions?.persona === 'string' ? resolvedOptions?.persona : undefined,
     pathname: typeof window !== 'undefined' ? window.location.pathname : undefined,
   };
 
   let inferenceResult;
   try {
-    inferenceResult = await fetchBackendSemanticHints(request, options);
+    inferenceResult = await fetchBackendSemanticHints(request, resolvedOptions);
   } catch {
     inferenceResult = {
       status: 'error' as const,
@@ -5288,7 +5302,7 @@ export async function generateContextualTourDraftsAsync(
 
   pendingBackendSemanticHints = inferenceResult;
   try {
-    return generateContextualTourDrafts(options);
+    return generateContextualTourDrafts(resolvedOptions);
   } finally {
     pendingBackendSemanticHints = null;
   }
@@ -5297,8 +5311,7 @@ export async function generateContextualTourDraftsAsync(
 export function generateContextualTourDrafts(options?: TourDraftGenerationOptions): SuggestedTourDraft[] {
   if (typeof document === 'undefined') return [];
 
-  const resolvedOptions = applySinglePageTourProfile(options);
-  prepareCandidateScan(resolvedOptions);
+  prepareCandidateScan(options);
   const startedAt = Date.now();
   activeDiagnostics = createDiagnostics();
   lastSinglePageChainSlotDecisions = [];
@@ -5309,6 +5322,14 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
   // candidates of the same scan see different feedback states.
   currentFeedbackSnapshot = getFeedbackStore();
 
+  const candidates = collectCandidates(options);
+  const generationModePlan = planContextualGenerationMode(options, candidates);
+  const resolvedOptions = applySinglePageTourProfile(
+    generationModePlan.applySinglePageTourForGeneration
+      ? { ...options, singlePageTour: true }
+      : options,
+  );
+
   const generationProfile = resolveGenerationProfile(resolvedOptions);
   const maxDrafts = generationProfile.maxDrafts;
   const maxSteps = resolvedOptions?.maxSteps ?? 3;
@@ -5316,8 +5337,6 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
   const minConfidence = generationProfile.minConfidence;
   const sequenceMinConfidence = resolveSequenceMinConfidence(resolvedOptions);
   const targetUrl = resolvedOptions?.targetUrl ?? window.location.pathname;
-
-  const candidates = collectCandidates(resolvedOptions);
   if (candidates.length === 0) {
     const emptySemanticShell =
       options?.semanticEnhancementEnabled === true
@@ -5329,6 +5348,8 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
       optionsSnapshot: {
         minScore,
         minConfidence,
+        mode: options?.mode ?? resolveEffectiveContextualMode(options),
+        generationPath: resolveGenerationPathFromPlan(generationModePlan, options),
         conflictResolutionEnabled: options?.conflictResolutionEnabled !== false,
         conflictResolutionStrategy: resolveConflictStrategy(options),
         explainabilityEnabled: explainabilityEnabled(options),
@@ -5336,6 +5357,9 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
         flowVersioningEnabled: options?.flowVersioningEnabled !== false,
         flowVersion: options?.flowVersion || 'v1',
       },
+      ...(generationModePlan.autoDecision
+        ? { autoDecision: generationModePlan.autoDecision }
+        : {}),
       candidateMetrics: activeDiagnostics || createDiagnostics(),
       scoringAdjustments: {
         selectorStabilityBonus: 0,
@@ -5759,7 +5783,7 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
   const activeBlueprints = resolvedOptions?.singlePageTour
     ? []
     : selectActiveBlueprints(resolvedOptions?.journeyVerticals, resolvedOptions?.journeyBlueprints);
-  const blueprintOutcome = resolveBlueprintsToDrafts(activeBlueprints, candidates, resolvedOptions);
+  const blueprintOutcome = generationModePlan.prefetchedBlueprintOutcome;
   // Tag heuristic drafts with `origin.kind = 'heuristic'` so downstream
   // filters/UIs can branch on origin reliably.
   for (const draft of drafts) {
@@ -5876,6 +5900,8 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
     optionsSnapshot: {
       minScore,
       minConfidence,
+      mode: options?.mode ?? resolveEffectiveContextualMode(options),
+      generationPath: resolveGenerationPathFromPlan(generationModePlan, options),
       conflictResolutionEnabled: options?.conflictResolutionEnabled !== false,
       conflictResolutionStrategy: resolveConflictStrategy(options),
       blueprintStepReservation: shouldReserveBlueprintTargets(confidenceReady, options),
@@ -5913,6 +5939,9 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
       rejectedAsTrivial: qualityRejected.length,
       rejectedReasons: qualityFilterCounts,
     },
+    ...(generationModePlan.autoDecision
+      ? { autoDecision: generationModePlan.autoDecision }
+      : {}),
     candidateRankings,
     singlePageChainSlots:
       lastSinglePageChainSlotDecisions.length > 0

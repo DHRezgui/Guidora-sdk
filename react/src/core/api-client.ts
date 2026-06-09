@@ -170,14 +170,24 @@ export const sdkApiClient = {
     sendKeepaliveBatch(config, events);
   },
 
-  dismissTourForCurrentUser(config: NormalizedSDKConfig, tourId: string): Promise<unknown> {
-    return request<unknown>(config, `/tours/${tourId}/dismiss`, {
+  dismissTourForCurrentUser(
+    config: NormalizedSDKConfig,
+    tourId: string,
+    audience?: 'sandbox' | 'production',
+  ): Promise<unknown> {
+    const qs = audience ? `?audience=${encodeURIComponent(audience)}` : '';
+    return request<unknown>(config, `/tours/${tourId}/dismiss${qs}`, {
       method: 'POST',
     });
   },
 
-  completeTourForCurrentUser(config: NormalizedSDKConfig, tourId: string): Promise<unknown> {
-    return request<unknown>(config, `/tours/${tourId}/complete`, {
+  completeTourForCurrentUser(
+    config: NormalizedSDKConfig,
+    tourId: string,
+    audience?: 'sandbox' | 'production',
+  ): Promise<unknown> {
+    const qs = audience ? `?audience=${encodeURIComponent(audience)}` : '';
+    return request<unknown>(config, `/tours/${tourId}/complete${qs}`, {
       method: 'POST',
     });
   },

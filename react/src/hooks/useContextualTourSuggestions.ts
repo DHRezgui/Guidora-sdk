@@ -12,6 +12,7 @@ import {
 } from '../types';
 import { sdkApiClient } from '../core/api-client';
 import { resolveSDKConfig } from '../core/sdk-state';
+import { resolveJourneyBlueprintsRemoteUrl } from '../utils/journey-blueprints-remote-client';
 import {
   clearRemoteContextualFeedback,
   getContextualFlowRegistry,
@@ -395,17 +396,18 @@ export function useContextualTourSuggestions(
         currentOptions?.semanticEnhancementEnabled === true &&
         (semanticMode === 'hybrid' || semanticMode === 'backend') &&
         Boolean(currentOptions?.semanticBackendUrl);
+      const useRemoteBlueprintsAsync = Boolean(resolveJourneyBlueprintsRemoteUrl(currentOptions));
 
-      // Hybrid/backend: one async pass (DOM settle wait + backend hints + generation).
-      // Avoid sync-first, which left the lab on a debug report without semanticEnhancement
-      // until a second "Analyser" click.
-      let next = useHybridAsync
+      // Async when hybrid semantic and/or remote dashboard blueprints are configured.
+      const useAsyncGeneration = useHybridAsync || useRemoteBlueprintsAsync;
+
+      let next = useAsyncGeneration
         ? await generateContextualTourDraftsAsync(currentOptions)
         : generateContextualTourDrafts(currentOptions);
 
       if (next.length === 0 && fallbackPolicy.enabled && fallbackPolicy.maxAttempts > 1) {
         const fallbackDraftOptions = buildFallbackGenerationOptions(currentOptions, fallbackPolicy);
-        const fallbackDrafts = useHybridAsync
+        const fallbackDrafts = useAsyncGeneration
           ? await generateContextualTourDraftsAsync(fallbackDraftOptions)
           : generateContextualTourDrafts(fallbackDraftOptions);
         if (fallbackDrafts.length > 0) {

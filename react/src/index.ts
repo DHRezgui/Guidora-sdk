@@ -27,6 +27,14 @@ export {
   mergeBackendHints,
 } from './utils/semantic-backend-client';
 export {
+  fetchRemoteJourneyBlueprints,
+  mergeLocalAndRemoteJourneyBlueprints,
+  resolveJourneyBlueprintsRemoteUrl,
+  resolveTourDraftOptionsWithRemoteBlueprints,
+  clearRemoteJourneyBlueprintsCache,
+} from './utils/journey-blueprints-remote-client';
+export type { RemoteBlueprintsFetchResult, RemoteBlueprintsFetchStatus } from './utils/journey-blueprints-remote-client';
+export {
   generateContextualTourDraftsAsync,
   invalidateContextualCandidateScanState,
   __applyPreferredSemanticOrderForTests,

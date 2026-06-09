@@ -19,6 +19,11 @@ import { useTour } from './useTour';
 import { useTourProgress } from './useTourProgress';
 import { useTourTargetResolver } from './useTourTargetResolver';
 import { useTourTriggerConditions } from './useTourTriggerConditions';
+import {
+  clearTourFinishedForAudience,
+  isTourFinishedLocally,
+  markTourFinishedForAudience,
+} from '../utils/tour-audience-finish';
 
 export interface UseOnboardingOptions {
   config?: Partial<SDKConfig>;
@@ -75,6 +80,26 @@ function sortStepsForFingerprint(steps: Step[]): Step[] {
 }
 
 /** Detects editor/API changes so we can hot-apply a new tour definition without reloading the page. */
+function resolveDismissCompleteAudience(
+  tour: GuidedTour,
+  configAudience?: 'sandbox' | 'production',
+): 'sandbox' | 'production' | undefined {
+  if (configAudience) {
+    return configAudience;
+  }
+  const environment = tour.environment?.toLowerCase();
+  if (environment === 'sandbox') {
+    return 'sandbox';
+  }
+  if (tour.isSandboxTestActive) {
+    return 'sandbox';
+  }
+  if (tour.isActive) {
+    return 'production';
+  }
+  return undefined;
+}
+
 function tourDefinitionFingerprint(tour: GuidedTour | null | undefined): string {
   if (!tour?.steps?.length) return '';
   const steps = sortStepsForFingerprint(tour.steps);
@@ -108,21 +133,27 @@ export function useOnboarding(options?: UseOnboardingOptions) {
   const deactivateTour = useCallback(
     async (tourToDeactivate: GuidedTour, reason: 'skip' | 'complete') => {
       if (!tourToDeactivate?.id) return;
+      const config = resolveSDKConfig(options?.config);
+      const audience = resolveDismissCompleteAudience(tourToDeactivate, config.tourAudience);
+      if (audience) {
+        markTourFinishedForAudience(tourToDeactivate.id, audience);
+      }
       try {
-        const config = resolveSDKConfig(options?.config);
         if (reason === 'complete') {
-          await sdkApiClient.completeTourForCurrentUser(config, tourToDeactivate.id);
+          await sdkApiClient.completeTourForCurrentUser(config, tourToDeactivate.id, audience);
         } else {
-          await sdkApiClient.dismissTourForCurrentUser(config, tourToDeactivate.id);
+          await sdkApiClient.dismissTourForCurrentUser(config, tourToDeactivate.id, audience);
         }
         debugInfo('Tour user-state updated after user action', {
           tourId: tourToDeactivate.id,
           reason,
+          audience,
         });
       } catch (error) {
         debugWarn('Failed to update tour user-state after user action', {
           tourId: tourToDeactivate?.id,
           reason,
+          audience,
           message: error instanceof Error ? error.message : String(error),
         });
       }
@@ -134,10 +165,10 @@ export function useOnboarding(options?: UseOnboardingOptions) {
   const activeFlowVersion = options?.activeFlowVersion?.trim() || undefined;
   const activeTourSessionKey = getActiveTourSessionStorageKey(activeFlowVersion);
   const activeTours = useActiveToursForUrl(options?.config, { autoFetch: true, url: pageUrl });
-  const toursForFlow = useMemo(
-    () => filterActiveToursByFlowVersion(activeTours.tours, activeFlowVersion),
-    [activeFlowVersion, activeTours.tours],
-  );
+  const toursForFlow = useMemo(() => {
+    const forFlow = filterActiveToursByFlowVersion(activeTours.tours, activeFlowVersion);
+    return forFlow.filter((item) => !isTourFinishedLocally(item));
+  }, [activeFlowVersion, activeTours.tours]);
   const tour = useTour({
     autoOpen: false,
     onComplete: (completedTour) => {
@@ -183,7 +214,9 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     if (!tours.length) return null;
     const eligible = tours.filter((tourItem) => {
       if (!tourItem?.id) return true;
-      return !dismissedTourIdsRef.current.has(tourItem.id);
+      if (dismissedTourIdsRef.current.has(tourItem.id)) return false;
+      if (isTourFinishedLocally(tourItem)) return false;
+      return true;
     });
     if (!eligible.length) return null;
     const sorted = [...eligible].sort((a, b) => (b.priority || 0) - (a.priority || 0));
@@ -258,10 +291,16 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     if (!options?.autoStart) return;
     if (tour.isOpen) return;
     if (isSuppressed()) return;
+    if (activeTours.loading) return;
     const snapshot = readActiveTourSnapshot(activeTourSessionKey);
     if (!snapshot) return;
     if (snapshot.tour?.id && dismissedTourIdsRef.current.has(snapshot.tour.id)) return;
     if (!isActiveTourSnapshotCompatible(snapshot.tour, activeFlowVersion)) {
+      writeActiveTourSnapshot(activeTourSessionKey, null);
+      return;
+    }
+    const stillActive = toursForFlow.some((item) => item.id === snapshot.tour.id);
+    if (!stillActive) {
       writeActiveTourSnapshot(activeTourSessionKey, null);
       return;
     }
@@ -272,7 +311,16 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       tourId: snapshot.tour.id,
       stepIndex: snapshot.stepIndex,
     });
-  }, [activeFlowVersion, activeTourSessionKey, debugInfo, options?.autoStart, tour.isOpen, tour.startTour]);
+  }, [
+    activeFlowVersion,
+    activeTourSessionKey,
+    activeTours.loading,
+    debugInfo,
+    options?.autoStart,
+    tour.isOpen,
+    tour.startTour,
+    toursForFlow,
+  ]);
 
   useEffect(() => {
     if (!options?.autoStart) return;
@@ -314,16 +362,23 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     debugInfo('Active tour definition refreshed from server', { tourId: fresh.id });
   }, [toursForFlow, activeTours.loading, tour.isOpen, activeTour, tour, debugInfo]);
 
-  const refresh = useCallback(async () => {
-    const tours = filterActiveToursByFlowVersion(await activeTours.refresh(pageUrl), activeFlowVersion);
-    const activeTourIds = new Set(tours.map((tourItem) => tourItem.id).filter(Boolean));
-    for (const dismissedId of dismissedTourIdsRef.current) {
-      if (!activeTourIds.has(dismissedId)) {
-        dismissedTourIdsRef.current.delete(dismissedId);
+  const syncLocalFinishMarks = useCallback((tours: GuidedTour[]) => {
+    for (const item of tours) {
+      if (!item.id) continue;
+      if (item.environment?.toLowerCase() === 'sandbox' || item.isSandboxTestActive) {
+        clearTourFinishedForAudience(item.id, 'sandbox');
+      }
+      if (item.isActive) {
+        clearTourFinishedForAudience(item.id, 'production');
       }
     }
+  }, []);
+
+  const refresh = useCallback(async () => {
+    const tours = filterActiveToursByFlowVersion(await activeTours.refresh(pageUrl), activeFlowVersion);
+    syncLocalFinishMarks(tours);
     return tours;
-  }, [activeFlowVersion, activeTours.refresh, pageUrl]);
+  }, [activeFlowVersion, activeTours.refresh, pageUrl, syncLocalFinishMarks]);
 
   useRealtimeToursSync({
     enabled: options?.config?.syncEnabled,

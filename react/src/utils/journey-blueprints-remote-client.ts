@@ -1,0 +1,231 @@
+/**
+ * Fetches organization-specific journey blueprints from TrustDev API.
+ * Failures are non-fatal: returns [] and leaves built-in / local blueprints intact.
+ */
+
+import type { JourneyBlueprint, TourDraftGenerationOptions } from '../types';
+import { resolveSDKConfig } from '../core/sdk-state';
+
+export type RemoteBlueprintsFetchStatus = 'ok' | 'timeout' | 'error' | 'disabled' | 'unconfigured';
+
+export interface RemoteBlueprintsFetchResult {
+  status: RemoteBlueprintsFetchStatus;
+  blueprints: JourneyBlueprint[];
+  note?: string;
+}
+
+const DEFAULT_TIMEOUT_MS = 4000;
+const DEFAULT_CACHE_TTL_MS = 5 * 60 * 1000;
+
+interface RemoteBlueprintCacheEntry {
+  key: string;
+  blueprints: JourneyBlueprint[];
+  fetchedAt: number;
+  status: RemoteBlueprintsFetchStatus;
+}
+
+let remoteBlueprintCache: RemoteBlueprintCacheEntry | null = null;
+
+export function clearRemoteJourneyBlueprintsCache(): void {
+  remoteBlueprintCache = null;
+}
+
+function resolveAuthToken(
+  token: TourDraftGenerationOptions['journeyBlueprintsAccessToken'],
+): string | null {
+  if (!token) return null;
+  if (typeof token === 'function') {
+    try {
+      const value = token();
+      return value ? String(value) : null;
+    } catch {
+      return null;
+    }
+  }
+  return String(token);
+}
+
+export function resolveJourneyBlueprintsRemoteUrl(
+  options?: TourDraftGenerationOptions,
+): string | null {
+  const explicit = options?.journeyBlueprintsRemoteUrl?.trim();
+  if (explicit) return explicit;
+
+  if (options?.journeyBlueprintsRemoteEnabled === false) {
+    return null;
+  }
+
+  if (options?.journeyBlueprintsRemoteEnabled !== true && !options?.publishConfig?.apiUrl) {
+    return null;
+  }
+
+  const apiUrl = options?.publishConfig?.apiUrl;
+  if (!apiUrl) return null;
+
+  const base = apiUrl.replace(/\/$/, '');
+  return `${base}/tours/contextual/blueprints`;
+}
+
+function buildCacheKey(url: string, token: string | null): string {
+  return `${url}::${token ?? ''}`;
+}
+
+function isValidBlueprintShape(value: unknown): value is JourneyBlueprint {
+  if (!value || typeof value !== 'object') return false;
+  const bp = value as JourneyBlueprint;
+  return (
+    typeof bp.id === 'string' &&
+    typeof bp.name === 'string' &&
+    typeof bp.description === 'string' &&
+    typeof bp.vertical === 'string' &&
+    typeof bp.intent === 'string' &&
+    Array.isArray(bp.steps) &&
+    bp.steps.length > 0
+  );
+}
+
+function parseBlueprintsResponse(body: unknown): JourneyBlueprint[] {
+  if (!body || typeof body !== 'object') return [];
+  const record = body as { blueprints?: unknown };
+  if (!Array.isArray(record.blueprints)) return [];
+  return record.blueprints.filter(isValidBlueprintShape);
+}
+
+/**
+ * Merge order: local `journeyBlueprints` first, then remote (append only).
+ * Built-ins are merged separately in `selectActiveBlueprints`.
+ */
+export function mergeLocalAndRemoteJourneyBlueprints(
+  local: JourneyBlueprint[] | undefined,
+  remote: JourneyBlueprint[],
+): JourneyBlueprint[] {
+  const result: JourneyBlueprint[] = [];
+  if (local?.length) {
+    result.push(...local);
+  }
+  if (remote.length) {
+    result.push(...remote);
+  }
+  return result;
+}
+
+export async function fetchRemoteJourneyBlueprints(
+  options?: TourDraftGenerationOptions,
+): Promise<RemoteBlueprintsFetchResult> {
+  const url = resolveJourneyBlueprintsRemoteUrl(options);
+  if (!url) {
+    return { status: 'unconfigured', blueprints: [] };
+  }
+
+  if (options?.journeyBlueprintsRemoteEnabled === false) {
+    return { status: 'disabled', blueprints: [] };
+  }
+
+  const timeoutMs = options?.journeyBlueprintsRemoteTimeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const cacheTtlMs = options?.journeyBlueprintsRemoteCacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
+
+  let token =
+    resolveAuthToken(options?.journeyBlueprintsAccessToken) ??
+    resolveAuthToken(() => {
+      try {
+        const config = resolveSDKConfig(options?.publishConfig);
+        return config.sdkToken ?? config.getAccessToken?.() ?? config.accessToken ?? null;
+      } catch {
+        return null;
+      }
+    });
+
+  const cacheKey = buildCacheKey(url, token);
+  const now = Date.now();
+  if (
+    remoteBlueprintCache &&
+    remoteBlueprintCache.key === cacheKey &&
+    now - remoteBlueprintCache.fetchedAt < cacheTtlMs
+  ) {
+    return {
+      status: remoteBlueprintCache.status,
+      blueprints: remoteBlueprintCache.blueprints,
+      note: 'served-from-cache',
+    };
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+
+    const response = await fetch(url, {
+      method: 'GET',
+      headers,
+      signal: controller.signal,
+      credentials: 'omit',
+    });
+
+    if (!response.ok) {
+      const result: RemoteBlueprintsFetchResult = {
+        status: 'error',
+        blueprints: [],
+        note: `HTTP ${response.status}`,
+      };
+      remoteBlueprintCache = { key: cacheKey, ...result, fetchedAt: now };
+      return result;
+    }
+
+    const body = await response.json();
+    const blueprints = parseBlueprintsResponse(body);
+    const result: RemoteBlueprintsFetchResult = {
+      status: 'ok',
+      blueprints,
+    };
+    remoteBlueprintCache = { key: cacheKey, ...result, fetchedAt: now };
+    return result;
+  } catch (error) {
+    const isTimeout =
+      error instanceof Error &&
+      (error.name === 'AbortError' || error.message.toLowerCase().includes('abort'));
+    const result: RemoteBlueprintsFetchResult = {
+      status: isTimeout ? 'timeout' : 'error',
+      blueprints: [],
+      note: error instanceof Error ? error.message : 'fetch failed',
+    };
+    remoteBlueprintCache = { key: cacheKey, ...result, fetchedAt: now };
+    return result;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export function getCachedRemoteJourneyBlueprints(): JourneyBlueprint[] {
+  return remoteBlueprintCache?.blueprints ?? [];
+}
+
+export async function resolveTourDraftOptionsWithRemoteBlueprints(
+  options?: TourDraftGenerationOptions,
+): Promise<TourDraftGenerationOptions | undefined> {
+  if (!options) return options;
+
+  const url = resolveJourneyBlueprintsRemoteUrl(options);
+  if (!url || options.journeyBlueprintsRemoteEnabled === false) {
+    return options;
+  }
+
+  const remoteResult = await fetchRemoteJourneyBlueprints(options);
+  const remote = remoteResult.blueprints;
+  if (remote.length === 0) {
+    return options;
+  }
+
+  const merged = mergeLocalAndRemoteJourneyBlueprints(
+    options.journeyBlueprints as JourneyBlueprint[] | undefined,
+    remote,
+  );
+
+  return {
+    ...options,
+    journeyBlueprints: merged,
+  };
+}

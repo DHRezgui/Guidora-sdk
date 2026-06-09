@@ -36,6 +36,8 @@ export interface SDKConfig {
   syncIntervalMs?: number;
   syncOnFocus?: boolean;
   syncOnReconnect?: boolean;
+  /** Force dismiss/complete user-state channel when both sandbox test and prod are active. */
+  tourAudience?: 'sandbox' | 'production';
 }
 
 export interface NormalizedSDKConfig {
@@ -52,6 +54,7 @@ export interface NormalizedSDKConfig {
   syncIntervalMs: number;
   syncOnFocus: boolean;
   syncOnReconnect: boolean;
+  tourAudience?: 'sandbox' | 'production';
 }
 
 export interface SDKInitResult {
@@ -466,12 +469,42 @@ export interface TourDraftExplainability {
   conflictNotes: string[];
 }
 
+export type ContextualGenerationMode = 'auto' | 'blueprint' | 'heuristic';
+
+/** Runtime path used for one generation scan (shown in debug UI). */
+export type ContextualGenerationPath = 'blueprint' | 'heuristic' | 'single-page';
+
+export type AutoDecisionShortCircuit =
+  | 'singlePageTour'
+  | 'auto-single-page-detected'
+  | 'no-blueprints'
+  | 'no-domain-vertical'
+  | 'resolution-success'
+  | 'resolution-partial'
+  | 'resolution-failed'
+  | null;
+
+export interface AutoDecisionReport {
+  decision: 'blueprint' | 'heuristic';
+  reason: string;
+  shortCircuit: AutoDecisionShortCircuit;
+  blueprintDraftsCount: number;
+  resolvedStepsPerDraft: number[];
+}
+
 export interface ContextualGenerationDebugReport {
   generatedAt: string;
   elapsedMs: number;
   optionsSnapshot: {
     minScore: number;
     minConfidence: number;
+    /** Value from host config (`contextualSuggestions.mode`). */
+    mode?: ContextualGenerationMode;
+    /**
+     * What actually ran this scan (differs from `mode` when `mode` is `auto`).
+     * Prefer this for the debug panel label.
+     */
+    generationPath?: ContextualGenerationPath;
     conflictResolutionEnabled: boolean;
     conflictResolutionStrategy: ConflictResolutionStrategy;
     blueprintStepReservation?: boolean;
@@ -563,6 +596,8 @@ export interface ContextualGenerationDebugReport {
     rejectedAsTrivial: number;
     rejectedReasons: Array<{ reason: string; count: number }>;
   };
+  /** Present when `mode === 'auto'` (resolution-first planner). */
+  autoDecision?: AutoDecisionReport;
   /**
    * Top candidates per intent with effective rank and why the winner beat rivals.
    * Format: `place-order · score 45 · lost to: credit-debit-card (score 62)`.
@@ -807,27 +842,56 @@ export interface TourDraftGenerationOptions {
   analysisSeverity?: ContextualAnalysisSeverity;
   publishFallbackPolicy?: ContextualPublishFallbackPolicy;
   /**
-   * Verticals whose built-in blueprints are activated for this scan. Enables
-   * business-meaningful, possibly multi-page tours (e.g. e-commerce purchase
-   * funnel, SaaS first-resource creation, marketing lead capture). When the
-   * resolver successfully produces blueprint-based drafts, they are prioritized
-   * over the legacy heuristic drafts. Set to an empty array to disable
-   * blueprint-based generation entirely. Defaults to no verticals (heuristic
-   * only) unless a preset like `ecommerce-default` provides them.
+   * Verticals whose blueprints are activated for this scan (built-in catalog
+   * plus opt-in packs). When set, `journeyBlueprints` from packs are filtered
+   * to matching `blueprint.vertical` values — e.g. `['healthtech']` with
+   * `allBlueprintPacks` only resolves healthtech templates in `mode: 'auto'`.
+   * Empty array disables blueprint generation entirely.
+   *
+   * In `mode: 'auto'`, if omitted, verticals may be inferred from `projectDomain`
+   * (e.g. "healthcare" → healthtech, "sales crm" → saas). If neither explicit
+   * nor inferable verticals exist, the pack catalog is not scanned and the
+   * heuristic path is used (domain-first auto).
    */
   journeyVerticals?: JourneyVertical[];
   /**
    * Custom blueprints injected by the host application. Merged with built-in
-   * blueprints of the active verticals. Use this to model app-specific funnels
-   * that aren't covered by the defaults.
+   * blueprints for the active verticals (pack entries outside those verticals
+   * are skipped when `journeyVerticals` is non-empty).
    */
   journeyBlueprints?: JourneyBlueprint[];
   /**
    * When true, the heuristic generator is suppressed if at least one
    * blueprint-based draft was produced. Defaults to false: heuristic drafts
    * are kept as additional suggestions, ranked below blueprint drafts.
+   *
+   * @deprecated Prefer `mode: 'blueprint'` for blueprint-only drafts. Still
+   * honored for backward compatibility (treated like `mode: 'blueprint'` when
+   * `mode` is omitted).
    */
   blueprintsExclusive?: boolean;
+  /**
+   * How blueprint vs heuristic generation is chosen.
+   * - `auto` (default): resolution-first — try blueprints, fall back to heuristic
+   * - `blueprint`: always run blueprint resolution (+ hybrid unless exclusive)
+   * - `heuristic`: ignore blueprints (generic or singlePageTour chain)
+   */
+  mode?: ContextualGenerationMode;
+  /**
+   * In `mode: 'auto'` only: minimum share of blueprint steps that must resolve
+   * (`resolvedSteps / declaredSteps`) before taking the blueprint path. The
+   * resolver's `produced` flag alone only requires `minResolvedSteps` (often 2),
+   * which can false-match unrelated pages (generic buttons/tabs). Default `0.8`.
+   */
+  autoBlueprintMinResolutionRatio?: number;
+  /**
+   * In `mode: 'auto'` only: when blueprint path is not taken, detect tabbed
+   * shallow UIs (CRM, POS) and run the singlePageTour 7-slot chain instead of
+   * multi-draft heuristic. Default true. Set false to always use multi-draft
+   * heuristic on fallback (like explicit `mode: 'heuristic'` without
+   * `--single-page-tour`).
+   */
+  autoDetectSinglePageTour?: boolean;
   /**
    * In hybrid mode (blueprint + heuristic drafts), reserve DOM targets that
    * appear in a produced blueprint **draft** (steps actually resolved on scan).
@@ -929,6 +993,25 @@ export interface TourDraftGenerationOptions {
    * passes `publishConfig` from `useContextualTourSuggestions`).
    */
   publishConfig?: Partial<SDKConfig>;
+  /**
+   * Fetch custom blueprints from TrustDev API (`GET /tours/contextual/blueprints`).
+   * Appended after local `journeyBlueprints`; built-ins are never replaced.
+   * On failure the SDK continues with built-ins + local only (no throw).
+   */
+  journeyBlueprintsRemoteUrl?: string;
+  /**
+   * When true and `publishConfig.apiUrl` is set, defaults remote URL to
+   * `{apiUrl}/tours/contextual/blueprints`. Set false to disable remote fetch.
+   */
+  journeyBlueprintsRemoteEnabled?: boolean;
+  /** Timeout (ms) for remote blueprint fetch. Default 4000. */
+  journeyBlueprintsRemoteTimeoutMs?: number;
+  /** In-memory cache TTL (ms) for successful fetches. Default 300000. */
+  journeyBlueprintsRemoteCacheTtlMs?: number;
+  /**
+   * Bearer token for remote blueprint fetch (same JWT as publish/semantic-hints).
+   */
+  journeyBlueprintsAccessToken?: string | (() => string | null | undefined);
 }
 
 export interface GuidedTour {
@@ -937,6 +1020,8 @@ export interface GuidedTour {
   description?: string;
   targetUrl: string;
   isActive?: boolean;
+  isSandboxTestActive?: boolean;
+  environment?: string;
   priority?: number;
   triggerConditions?: TriggerConditions;
   steps: Step[];
