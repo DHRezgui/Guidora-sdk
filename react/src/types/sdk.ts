@@ -1118,6 +1118,15 @@ export interface PublishContextualDraftsRequest {
   scenario: ContextualScenario;
   drafts: PublishContextualDraft[];
   autoActivate?: boolean;
+  /** Evaluate decisions without writing tours (panel status refresh). */
+  dryRun?: boolean;
+}
+
+export interface ContextualPublishTourState {
+  environment: string;
+  sandboxStatus: string | null;
+  createdBy?: string | null;
+  assignedToModeration?: boolean;
 }
 
 export type ContextualFeedbackEventType = 'shown' | 'clicked' | 'completed' | 'skipped';
@@ -1166,11 +1175,15 @@ export interface PublishContextualDraftsResponse {
     activated: number;
     rejected: number;
     skipped: number;
+    blocked?: number;
+    refreshed?: number;
+    takenOver?: number;
     details: Array<{
       draftName: string;
-      outcome: 'created' | 'activated' | 'rejected' | 'skipped';
+      outcome: 'created' | 'activated' | 'rejected' | 'skipped' | 'blocked' | 'refreshed' | 'taken_over';
       reasons: string[];
       tourId?: string;
+      tourState?: ContextualPublishTourState;
     }>;
     monitoring?: {
       environment: string;

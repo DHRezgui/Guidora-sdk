@@ -161,7 +161,14 @@ export function recordAutoPublishedSignaturesFromReport(
 
   for (const detail of report.details ?? []) {
     if (!detail.tourId) continue;
-    if (detail.outcome !== 'created' && detail.outcome !== 'activated') continue;
+    if (
+      detail.outcome !== 'created' &&
+      detail.outcome !== 'activated' &&
+      detail.outcome !== 'taken_over' &&
+      detail.outcome !== 'refreshed'
+    ) {
+      continue;
+    }
 
     const draft = candidates.find((candidate) => candidate.name === detail.draftName);
     if (!draft) continue;

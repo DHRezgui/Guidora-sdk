@@ -1,6 +1,14 @@
 import { CSSProperties, useEffect, useMemo, useState } from 'react';
 import { ContextualScenario, SuggestedTourDraft } from '../types';
 import { UseContextualTourSuggestionsOptions, useContextualTourSuggestions } from '../hooks/useContextualTourSuggestions';
+import {
+  describePublishReportDetailLines,
+  describePublishReportStatus,
+  formatPublishDetailLine,
+  formatPublishReportSummary,
+  publishReportPanelTone,
+  type ContextualPublishReport,
+} from '../utils/contextual-publish-report';
 import { isTrustdevContextualPanelSelector } from '../utils/tour-suggestion-generator';
 
 export type ContextualSuggestionsUIMode = 'auto' | 'hidden' | 'manual' | 'debug';
@@ -21,7 +29,11 @@ export interface ContextualSuggestionsPublisherProps extends UseContextualTourSu
    * the panel during development.
    */
   developerMode?: boolean;
+  /** How long the publish status toast stays visible (ms). Default 20s; set 0 to keep it. */
+  publishReportVisibleMs?: number;
 }
+
+const DEFAULT_PUBLISH_REPORT_VISIBLE_MS = 20000;
 
 const STABLE_SELECTOR_HINTS = ['[data-tour-id=', '[data-testid=', '[data-cy=', '[data-qa='];
 const PHOENIX_GLASS_BG =
@@ -99,6 +111,7 @@ export function ContextualSuggestionsPublisher({
   style,
   stableOnly = true,
   developerMode = false,
+  publishReportVisibleMs = DEFAULT_PUBLISH_REPORT_VISIBLE_MS,
   ...options
 }: ContextualSuggestionsPublisherProps) {
   const suggestions = useContextualTourSuggestions({
@@ -107,6 +120,7 @@ export function ContextualSuggestionsPublisher({
   });
   const [collapsed, setCollapsed] = useState(true);
   const [localMessage, setLocalMessage] = useState<string | null>(null);
+  const [visiblePublishReport, setVisiblePublishReport] = useState<ContextualPublishReport | null>(null);
   const [publishHovered, setPublishHovered] = useState(false);
   const [publishPressed, setPublishPressed] = useState(false);
 
@@ -125,6 +139,24 @@ export function ContextualSuggestionsPublisher({
     const timer = setTimeout(() => setLocalMessage(null), 2500);
     return () => clearTimeout(timer);
   }, [localMessage]);
+
+  useEffect(() => {
+    const report = suggestions.publishStatusReport;
+    if (!report) {
+      setVisiblePublishReport(null);
+      return;
+    }
+
+    setVisiblePublishReport(report);
+    if (publishReportVisibleMs <= 0) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      setVisiblePublishReport(null);
+    }, publishReportVisibleMs);
+    return () => clearTimeout(timer);
+  }, [publishReportVisibleMs, suggestions.publishStatusReport]);
 
   if (mode === 'hidden') return null;
 
@@ -300,20 +332,60 @@ export function ContextualSuggestionsPublisher({
                 {suggestions.publishError ? <div style={{ color: '#fca5a5' }}>Publish error: {suggestions.publishError}</div> : null}
               </div>
 
-              {suggestions.lastPublishReport ? (
-                <div style={{ borderRadius: 8, border: '1px solid rgba(16,185,129,0.45)', background: 'rgba(6,40,32,0.55)', padding: 8, fontSize: 12, lineHeight: 1.45, marginBottom: 8, color: '#d1fae5' }}>
-                  Created: {suggestions.lastPublishReport.created} | Activated: {suggestions.lastPublishReport.activated} | Rejected:{' '}
-                  {suggestions.lastPublishReport.rejected}
-                </div>
-              ) : null}
+              {visiblePublishReport ? (() => {
+                const report = visiblePublishReport;
+                const tone = publishReportPanelTone(report);
+                const detailLines = describePublishReportDetailLines(report);
+                const statusMessage = describePublishReportStatus(report);
+                const panelStyle =
+                  tone === 'success'
+                    ? { border: '1px solid rgba(16,185,129,0.45)', background: 'rgba(6,40,32,0.55)', color: '#d1fae5' }
+                    : tone === 'warning'
+                      ? { border: '1px solid rgba(251,191,36,0.45)', background: 'rgba(69,45,8,0.55)', color: '#fde68a' }
+                      : tone === 'error'
+                        ? { border: '1px solid rgba(248,113,113,0.45)', background: 'rgba(69,10,10,0.55)', color: '#fecaca' }
+                        : { border: PHOENIX_SURFACE_BORDER, background: 'rgba(12,18,30,0.62)', color: '#f8fafc' };
+                return (
+                  <div
+                    style={{
+                      borderRadius: 8,
+                      padding: 8,
+                      fontSize: 12,
+                      lineHeight: 1.45,
+                      marginBottom: 8,
+                      ...panelStyle,
+                    }}
+                  >
+                    <div>{formatPublishReportSummary(report)}</div>
+                    {detailLines.length > 1 ? (
+                      <div style={{ marginTop: 6, display: 'grid', gap: 4 }}>
+                        {detailLines.map((line) => (
+                          <div key={line} style={{ fontWeight: 700 }}>
+                            {line}
+                          </div>
+                        ))}
+                      </div>
+                    ) : statusMessage ? (
+                      <div style={{ marginTop: 6, fontWeight: 700 }}>{statusMessage}</div>
+                    ) : null}
+                  </div>
+                );
+              })() : null}
 
-              {suggestions.lastPublishReport?.details?.length ? (
+              {visiblePublishReport?.details?.length ? (
                 <div style={{ borderRadius: 8, border: PHOENIX_SURFACE_BORDER, background: 'rgba(12,18,30,0.62)', padding: 8, fontSize: 12, lineHeight: 1.45, marginBottom: 8, color: '#f8fafc' }}>
                   <div style={{ marginBottom: 6, fontWeight: 700 }}>Publish details</div>
-                  {suggestions.lastPublishReport.details.map((detail, idx) => (
+                  {visiblePublishReport.details.map((detail, idx) => (
                     <div key={`${detail.draftName}-${idx}`} style={{ marginBottom: 4 }}>
-                      {detail.draftName}: {detail.outcome}
-                      {detail.reasons.length ? ` (${detail.reasons.join(', ')})` : ''}
+                      {formatPublishDetailLine(detail, { preview: visiblePublishReport.preview })}
+                      {detail.tourState ? (
+                        <span style={{ opacity: 0.78 }}>
+                          {' '}
+                          [{detail.tourState.environment}
+                          {detail.tourState.sandboxStatus ? ` · ${detail.tourState.sandboxStatus}` : ''}
+                          {detail.tourState.createdBy ? ` · owner ${detail.tourState.createdBy.slice(0, 8)}…` : ''}]
+                        </span>
+                      ) : null}
                     </div>
                   ))}
                 </div>

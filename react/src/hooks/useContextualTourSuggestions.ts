@@ -34,6 +34,10 @@ import {
   readAutoPublishedSignatures,
   recordAutoPublishedSignaturesFromReport,
 } from '../utils/auto-publish-session-dedupe';
+import {
+  publishReportsEquivalent,
+  shouldRevalidateBlockedPublishReport,
+} from '../utils/contextual-publish-report';
 
 export interface UseContextualTourSuggestionsOptions extends TourDraftGenerationOptions {
   enabled?: boolean;
@@ -53,6 +57,12 @@ export interface UseContextualTourSuggestionsOptions extends TourDraftGeneration
   maxAutoPublishedTours?: number;
   publishScenario?: ContextualScenario;
   publishConfig?: Partial<SDKConfig>;
+  /**
+   * When the last publish attempt was blocked, re-run publish on tab focus so the
+   * panel reflects dashboard changes (e.g. production → sandbox transfer).
+   * Defaults to true.
+   */
+  revalidateBlockedPublishOnFocus?: boolean;
 }
 
 export interface UseContextualTourSuggestionsResult {
@@ -62,6 +72,9 @@ export interface UseContextualTourSuggestionsResult {
   error: string | null;
   publishError: string | null;
   lastPublishReport: PublishContextualDraftsResponse['report'] | null;
+  /** Blocked-status preview (dry-run). Never overwrites a successful publish report. */
+  publishStatusReport: PublishContextualDraftsResponse['report'] | null;
+  clearLastPublishReport: () => void;
   /** Runs synchronously for local-only mode; returns a Promise in hybrid/backend semantic mode. */
   refresh: () => SuggestedTourDraft[] | Promise<SuggestedTourDraft[]>;
   /** Bumps after each generation completes so consumers can re-read `getDebugReport()`. */
@@ -218,11 +231,20 @@ export function useContextualTourSuggestions(
   const [error, setError] = useState<string | null>(null);
   const [publishError, setPublishError] = useState<string | null>(null);
   const [lastPublishReport, setLastPublishReport] = useState<PublishContextualDraftsResponse['report'] | null>(null);
+  const [blockedPublishPreview, setBlockedPublishPreview] = useState<PublishContextualDraftsResponse['report'] | null>(
+    null,
+  );
 
   const optionsRef = useRef(options);
   optionsRef.current = options;
   const autoPublishInFlightRef = useRef(false);
   const autoGenerateHasRunRef = useRef(false);
+  const lastPublishReportRef = useRef(lastPublishReport);
+  lastPublishReportRef.current = lastPublishReport;
+  const blockedPublishPreviewRef = useRef(blockedPublishPreview);
+  blockedPublishPreviewRef.current = blockedPublishPreview;
+  const lastBlockedRevalidateAtRef = useRef(0);
+  const revalidateBlockedPublishOnFocus = options?.revalidateBlockedPublishOnFocus ?? true;
 
   const fallbackPolicy = useMemo(() => resolveFallbackPolicy(options), [
     options?.publishFallbackPolicy?.enabled,
@@ -247,11 +269,13 @@ export function useContextualTourSuggestions(
       const nextDrafts = draftsToPublish ?? draftsRef.current;
       if (!enabled || nextDrafts.length === 0) {
         setLastPublishReport(null);
+        setBlockedPublishPreview(null);
         return null;
       }
 
       setPublishError(null);
       setLastPublishReport(null);
+      setBlockedPublishPreview(null);
 
       try {
         const resolvedConfig = resolveSDKConfig(currentOptions?.publishConfig);
@@ -313,6 +337,88 @@ export function useContextualTourSuggestions(
     [publishDraftsInternal],
   );
 
+  const clearLastPublishReport = useCallback(() => {
+    setLastPublishReport(null);
+    setBlockedPublishPreview(null);
+  }, []);
+
+  const publishStatusReport = blockedPublishPreview ?? lastPublishReport;
+
+  const previewBlockedPublishReport = useCallback(async (): Promise<void> => {
+    const currentOptions = optionsRef.current;
+    const nextDrafts = draftsRef.current;
+    if (!enabled || nextDrafts.length === 0) {
+      return;
+    }
+    if (!shouldRevalidateBlockedPublishReport(lastPublishReportRef.current)) {
+      return;
+    }
+    if (autoPublishInFlightRef.current) {
+      return;
+    }
+
+    try {
+      const resolvedConfig = resolveSDKConfig(currentOptions?.publishConfig);
+      const sanitizedDrafts = toPublishPayloadDrafts(nextDrafts);
+      if (sanitizedDrafts.length === 0) {
+        return;
+      }
+
+      const response = await sdkApiClient.publishContextualDrafts(resolvedConfig, {
+        scenario: currentOptions?.publishScenario ?? 'medium',
+        drafts: sanitizedDrafts,
+        autoActivate: currentOptions?.autoActivatePublishedDrafts ?? false,
+        dryRun: true,
+      });
+
+      const previewReport = { ...response.report, preview: true as const };
+      if (!publishReportsEquivalent(blockedPublishPreviewRef.current, previewReport)) {
+        setBlockedPublishPreview(previewReport);
+      }
+    } catch {
+      // Preview is best-effort; keep the last known blocked preview on failure.
+    }
+  }, [enabled]);
+
+  useEffect(() => {
+    if (!enabled || !revalidateBlockedPublishOnFocus || typeof window === 'undefined') {
+      return;
+    }
+
+    const maybePreviewBlockedReport = () => {
+      if (document.visibilityState === 'hidden') {
+        return;
+      }
+      if (!shouldRevalidateBlockedPublishReport(lastPublishReportRef.current)) {
+        return;
+      }
+      if (draftsRef.current.length === 0 || autoPublishInFlightRef.current) {
+        return;
+      }
+
+      const now = Date.now();
+      if (now - lastBlockedRevalidateAtRef.current < 3000) {
+        return;
+      }
+      lastBlockedRevalidateAtRef.current = now;
+
+      void previewBlockedPublishReport();
+    };
+
+    const intervalId = window.setInterval(() => {
+      void previewBlockedPublishReport();
+    }, 12000);
+
+    window.addEventListener('focus', maybePreviewBlockedReport);
+    document.addEventListener('visibilitychange', maybePreviewBlockedReport);
+
+    return () => {
+      window.clearInterval(intervalId);
+      window.removeEventListener('focus', maybePreviewBlockedReport);
+      document.removeEventListener('visibilitychange', maybePreviewBlockedReport);
+    };
+  }, [enabled, previewBlockedPublishReport, revalidateBlockedPublishOnFocus]);
+
   const selectAutoPublishCandidates = useCallback(
     (allDrafts: SuggestedTourDraft[]): SuggestedTourDraft[] => {
       if (allDrafts.length === 0) return [];
@@ -362,7 +468,12 @@ export function useContextualTourSuggestions(
       autoPublishInFlightRef.current = true;
       try {
         const report = await publishDrafts(candidates);
-        if (report && report.created > 0) {
+        if (
+          report &&
+          (report.created > 0 ||
+            (report.refreshed ?? 0) > 0 ||
+            (report.takenOver ?? 0) > 0)
+        ) {
           recordAutoPublishedSignaturesFromReport(report, candidates);
         }
       } finally {
@@ -389,6 +500,7 @@ export function useContextualTourSuggestions(
     setError(null);
     setPublishError(null);
     setLastPublishReport(null);
+    setBlockedPublishPreview(null);
 
     try {
       const semanticMode = currentOptions?.semanticEngineMode ?? 'hybrid';
@@ -421,6 +533,7 @@ export function useContextualTourSuggestions(
         void runAutoPublish(next);
       } else {
         setLastPublishReport(null);
+        setBlockedPublishPreview(null);
       }
       return next;
     } catch (err) {
@@ -557,6 +670,8 @@ export function useContextualTourSuggestions(
     error,
     publishError,
     lastPublishReport,
+    publishStatusReport,
+    clearLastPublishReport,
     refresh,
     publishDrafts,
     getDebugReport,
