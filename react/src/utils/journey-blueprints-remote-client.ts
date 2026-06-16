@@ -3,8 +3,9 @@
  * Failures are non-fatal: returns [] and leaves built-in / local blueprints intact.
  */
 
-import type { JourneyBlueprint, TourDraftGenerationOptions } from '../types';
+import { resolveSdkAuthBearerTokenFromSources } from '../core/auth-token';
 import { resolveSDKConfig } from '../core/sdk-state';
+import type { JourneyBlueprint, TourDraftGenerationOptions } from '../types';
 
 export type RemoteBlueprintsFetchStatus = 'ok' | 'timeout' | 'error' | 'disabled' | 'unconfigured';
 
@@ -28,21 +29,6 @@ let remoteBlueprintCache: RemoteBlueprintCacheEntry | null = null;
 
 export function clearRemoteJourneyBlueprintsCache(): void {
   remoteBlueprintCache = null;
-}
-
-function resolveAuthToken(
-  token: TourDraftGenerationOptions['journeyBlueprintsAccessToken'],
-): string | null {
-  if (!token) return null;
-  if (typeof token === 'function') {
-    try {
-      const value = token();
-      return value ? String(value) : null;
-    } catch {
-      return null;
-    }
-  }
-  return String(token);
 }
 
 export function resolveJourneyBlueprintsRemoteUrl(
@@ -124,16 +110,25 @@ export async function fetchRemoteJourneyBlueprints(
   const timeoutMs = options?.journeyBlueprintsRemoteTimeoutMs ?? DEFAULT_TIMEOUT_MS;
   const cacheTtlMs = options?.journeyBlueprintsRemoteCacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
 
-  let token =
-    resolveAuthToken(options?.journeyBlueprintsAccessToken) ??
-    resolveAuthToken(() => {
-      try {
-        const config = resolveSDKConfig(options?.publishConfig);
-        return config.sdkToken ?? config.getAccessToken?.() ?? config.accessToken ?? null;
-      } catch {
-        return null;
-      }
-    });
+  let resolvedPublishToken = options?.publishConfig?.sdkToken ?? null;
+  let debug = options?.publishConfig?.debug;
+  try {
+    const config = resolveSDKConfig(options?.publishConfig);
+    resolvedPublishToken = resolvedPublishToken ?? config.sdkToken ?? null;
+    debug = config.debug;
+  } catch {
+    // publishConfig may be partial when only remote blueprints are requested.
+  }
+
+  const token = resolveSdkAuthBearerTokenFromSources(
+    [
+      options?.journeyBlueprintsAccessToken,
+      resolvedPublishToken,
+      options?.publishConfig?.getAccessToken,
+      options?.publishConfig?.accessToken,
+    ],
+    debug,
+  );
 
   const cacheKey = buildCacheKey(url, token);
   const now = Date.now();

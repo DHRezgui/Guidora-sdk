@@ -10,13 +10,13 @@ import {
   TrackEventInput,
   TrackEventResponse,
 } from '../types';
+import { resolveSdkAuthBearerTokenAsync } from './auth-token';
 
-function buildHeaders(config: NormalizedSDKConfig): Record<string, string> {
-  const token = config.sdkToken || config.getAccessToken?.() || config.accessToken;
+async function buildHeaders(config: NormalizedSDKConfig): Promise<Record<string, string>> {
+  const token = await resolveSdkAuthBearerTokenAsync(config);
 
   const headers: Record<string, string> = {};
 
-  // For authenticated dashboard flows, JWT is sufficient and avoids extra CORS preflight constraints.
   if (!token && config.apiKey) {
     headers['x-api-key'] = config.apiKey;
   }
@@ -36,7 +36,7 @@ async function request<T>(config: NormalizedSDKConfig, path: string, init?: Requ
   const response = await fetch(`${config.apiUrl}${path}`, {
     ...init,
     headers: {
-      ...buildHeaders(config),
+      ...(await buildHeaders(config)),
       ...(shouldSendJsonContentType ? { 'Content-Type': 'application/json' } : {}),
       ...(init?.headers || {}),
     },
@@ -59,26 +59,31 @@ function sendKeepaliveBatch(config: NormalizedSDKConfig, events: TrackEventInput
 
   if (typeof window === 'undefined') return;
 
-  if (typeof fetch === 'function') {
-    void fetch(`${config.apiUrl}/tracking/events/batch`, {
-      method: 'POST',
-      headers: buildHeaders(config),
-      body,
-      keepalive: true,
-    }).catch(() => {
-      // Fallback best effort when keepalive fails.
-      if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
-        const blob = new Blob([body], { type: 'application/json' });
-        navigator.sendBeacon(`${config.apiUrl}/tracking/events/batch`, blob);
-      }
-    });
-    return;
-  }
+  void (async () => {
+    const headers = await buildHeaders(config);
 
-  if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
-    const blob = new Blob([body], { type: 'application/json' });
-    navigator.sendBeacon(`${config.apiUrl}/tracking/events/batch`, blob);
-  }
+    if (typeof fetch === 'function') {
+      try {
+        await fetch(`${config.apiUrl}/tracking/events/batch`, {
+          method: 'POST',
+          headers,
+          body,
+          keepalive: true,
+        });
+      } catch {
+        if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+          const blob = new Blob([body], { type: 'application/json' });
+          navigator.sendBeacon(`${config.apiUrl}/tracking/events/batch`, blob);
+        }
+      }
+      return;
+    }
+
+    if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+      const blob = new Blob([body], { type: 'application/json' });
+      navigator.sendBeacon(`${config.apiUrl}/tracking/events/batch`, blob);
+    }
+  })();
 }
 
 export const sdkApiClient = {
@@ -117,24 +122,35 @@ export const sdkApiClient = {
   ): void {
     if (typeof window === 'undefined') return;
     const body = JSON.stringify(payload);
-    if (typeof fetch === 'function') {
-      void fetch(`${config.apiUrl}/tours/contextual/feedback`, {
-        method: 'POST',
-        headers: { ...buildHeaders(config), 'Content-Type': 'application/json' },
-        body,
-        keepalive: true,
-      }).catch(() => {
-        if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
-          const blob = new Blob([body], { type: 'application/json' });
-          navigator.sendBeacon(`${config.apiUrl}/tours/contextual/feedback`, blob);
+
+    void (async () => {
+      const headers = {
+        ...(await buildHeaders(config)),
+        'Content-Type': 'application/json',
+      };
+
+      if (typeof fetch === 'function') {
+        try {
+          await fetch(`${config.apiUrl}/tours/contextual/feedback`, {
+            method: 'POST',
+            headers,
+            body,
+            keepalive: true,
+          });
+        } catch {
+          if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+            const blob = new Blob([body], { type: 'application/json' });
+            navigator.sendBeacon(`${config.apiUrl}/tours/contextual/feedback`, blob);
+          }
         }
-      });
-      return;
-    }
-    if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
-      const blob = new Blob([body], { type: 'application/json' });
-      navigator.sendBeacon(`${config.apiUrl}/tours/contextual/feedback`, blob);
-    }
+        return;
+      }
+
+      if (typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+        const blob = new Blob([body], { type: 'application/json' });
+        navigator.sendBeacon(`${config.apiUrl}/tours/contextual/feedback`, blob);
+      }
+    })();
   },
 
   getContextualFeedbackAggregates(

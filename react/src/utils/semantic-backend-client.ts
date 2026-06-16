@@ -7,6 +7,7 @@
  * local-only inference so the generator stays operational offline.
  */
 
+import { resolveSdkAuthBearerTokenFromSources } from '../core/auth-token';
 import type { TourDraftGenerationOptions } from '../types';
 import type {
   SemanticCandidateRole,
@@ -80,21 +81,6 @@ export interface BackendSemanticInferenceResult {
   implementation: BackendSemanticImplementation | null;
 }
 
-function resolveAuthToken(
-  token: TourDraftGenerationOptions['semanticBackendAccessToken'],
-): string | null {
-  if (!token) return null;
-  if (typeof token === 'function') {
-    try {
-      const value = token();
-      return value ? String(value) : null;
-    } catch {
-      return null;
-    }
-  }
-  return String(token);
-}
-
 export async function fetchBackendSemanticHints(
   request: BackendSemanticInferenceRequest,
   options?: TourDraftGenerationOptions,
@@ -118,9 +104,15 @@ export async function fetchBackendSemanticHints(
       'Content-Type': 'application/json',
       Accept: 'application/json',
     };
-    const token =
-      resolveAuthToken(options?.semanticBackendAccessToken) ??
-      resolveAuthToken(options?.publishConfig?.getAccessToken);
+    const token = resolveSdkAuthBearerTokenFromSources(
+      [
+        options?.semanticBackendAccessToken,
+        options?.publishConfig?.sdkToken,
+        options?.publishConfig?.getAccessToken,
+        options?.publishConfig?.accessToken,
+      ],
+      options?.publishConfig?.debug,
+    );
     if (token) headers.Authorization = `Bearer ${token}`;
 
     const response = await fetch(url, {

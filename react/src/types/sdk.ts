@@ -26,6 +26,11 @@ export interface SDKConfig {
   apiKey: string;
   apiUrl?: string;
   sdkToken?: string;
+  /**
+   * Async resolver for browser BFF sessions (`td_sess_...`).
+   * Preferred in production instead of exposing PAT in `NEXT_PUBLIC_*`.
+   */
+  getSdkToken?: () => string | null | Promise<string | null>;
   accessToken?: string;
   getAccessToken?: () => string | null;
   organizationId?: string;
@@ -44,6 +49,7 @@ export interface NormalizedSDKConfig {
   apiKey: string;
   apiUrl: string;
   sdkToken?: string;
+  getSdkToken?: () => string | null | Promise<string | null>;
   accessToken?: string;
   getAccessToken?: () => string | null;
   organizationId?: string;
@@ -1009,7 +1015,7 @@ export interface TourDraftGenerationOptions {
   /** In-memory cache TTL (ms) for successful fetches. Default 300000. */
   journeyBlueprintsRemoteCacheTtlMs?: number;
   /**
-   * Bearer token for remote blueprint fetch (same JWT as publish/semantic-hints).
+   * Bearer integration token (td_sdk_...) for remote blueprint fetch.
    */
   journeyBlueprintsAccessToken?: string | (() => string | null | undefined);
 }

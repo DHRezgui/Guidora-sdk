@@ -14,6 +14,7 @@ function normalizeConfig(config: SDKConfig): NormalizedSDKConfig {
     apiKey: config.apiKey,
     apiUrl: config.apiUrl ?? DEFAULT_API_URL,
     sdkToken: config.sdkToken,
+    getSdkToken: config.getSdkToken,
     accessToken: config.accessToken,
     getAccessToken: config.getAccessToken,
     organizationId: config.organizationId,
