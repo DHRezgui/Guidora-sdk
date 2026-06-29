@@ -63,6 +63,15 @@ export interface UseContextualTourSuggestionsOptions extends TourDraftGeneration
    * Defaults to true.
    */
   revalidateBlockedPublishOnFocus?: boolean;
+  /**
+   * Host DOM zones SDK chrome must not overlap.
+   * Merged with `TourViewer.hostAvoidSelectors` and FAQ selectors in `TourViewer`.
+   */
+  avoidSelectors?: string[];
+  /** Minimum horizontal clearance (px) before flipping dock side (default `420`). */
+  minDockClearancePx?: number;
+  /** Preferred horizontal dock when space allows (default `right`). */
+  dockSide?: 'left' | 'right';
 }
 
 export interface UseContextualTourSuggestionsResult {

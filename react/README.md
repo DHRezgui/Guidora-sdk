@@ -88,6 +88,18 @@ initSDK({
   apiUrl: 'http://localhost:3002/api/v1',
   sdkToken: 'optional-jwt',
 
+  // Dock layout: ON by default (host heuristics + collision avoidance).
+  // Pass `dockLayout: false` to restore legacy static positioning.
+  dockLayout: {
+    hostAvoidSelectors: ['[data-tour-id="cart-panel"]'],
+  },
+
+  // FAQ defaults merged into TourViewer `faq` (sidebar presentation by default).
+  // Pass `faqDefaults: false` to opt out. FAQ stays hidden until `faq={{ enabled: true }}`.
+  faqDefaults: {
+    title: 'Aide',
+  },
+
   // Tracking
   trackBatchSize: 20,
   trackFlushIntervalMs: 5000,
@@ -212,3 +224,151 @@ V2 expose egalement:
 - Integrer le hook dans une page ou un dashboard d'administration.
 - Recuperer les drafts proposes.
 - Les modifier avant de les enregistrer ou de les publier.
+
+## FAQ in-app (recherche semantique)
+
+Le `TourViewer` peut afficher une aide contextuelle via la prop `faq`. Deux presentations sont disponibles :
+
+- `widget` — bouton flottant en bas de l'ecran (defaut du composant `FaqSearchWidget`).
+- `sidebar` — panneau lateral pleine hauteur avec suggestions contextuelles.
+
+### Defaults universels et overrides
+
+Le SDK applique des conventions par defaut pour reduire la configuration dans l'app hote. Ces valeurs sont **surchargeables** : l'integration minimale reste `faq={{ enabled: true }}` et `contextualSuggestions={{ mode: 'auto' }}`. Les specifics metier (selecteurs DOM, mots-cles FAQ, domaine projet) restent dans l'app hote, pas dans le SDK.
+
+| Option | Defaut SDK | Quand le surcharger |
+| --- | --- | --- |
+| `sidebarLayout` | `push` | Layout simple, POS, ou sans conteneur plein ecran → `overlay` |
+| `themeMode` | `host` | Pas de `[data-tour-id]` ou theme fixe → `auto`, `light`, `dark` |
+| `modal` | `false` | Bloquer l'interaction hors panneau → `true` |
+| `persona` (mode contextual `auto`) | `admin` | Parcours end-user en production → `end-user` via `contextualSuggestions` |
+| `pushTargetSelector` | auto-detecte | Layout custom → selecteur explicite sur le conteneur racine |
+| `hostThemeReference` | premier `[data-tour-id]` hote | Panneau de reference precis → selecteur explicite |
+| `pageContext.suggestionKeywords` | — (app hote) | Mots-cles metier pour le ranking des questions frequentes |
+
+Heuristiques runtime (aucune config requise) :
+
+1. **Push target** : `.h-screen.w-screen` si present (courant Tailwind), sinon `body > div:first-of-type`.
+2. **Theme hote** : premier `[data-tour-id]` hors chrome TrustDev.
+3. **Init `journeyVerticals`** : infere depuis `--project-domain` ou des mots-cles generiques (`crm`, `checkout`, `dashboard`, …) — pas depuis un projet de demo specifique.
+
+Exemple d'overrides pour une app sans layout Tailwind :
+
+```tsx
+<TourViewer
+  config={sdkConfig}
+  contextualSuggestions={{
+    mode: 'auto',
+    projectDomain: 'My SaaS product',
+    persona: 'end-user',
+  }}
+  faq={{
+    enabled: true,
+    sidebarLayout: 'overlay',
+    themeMode: 'auto',
+    pushTargetSelector: '#app-root',
+    pageContext: {
+      suggestionKeywords: ['billing', 'subscription', 'invoice'],
+    },
+  }}
+/>
+```
+
+### Eviter les collisions avec l'UI hote
+
+Sur des applications type POS ou dashboard, un panneau metier (panier, navigation laterale, resume de commande, etc.) peut occuper les bords de l'ecran. Declarez ces zones via `hostAvoidSelectors` (global `TourViewer`) et/ou `avoidSelectors` sur `faq` / `contextualSuggestions`.
+
+Le SDK mesure l'espace disponible au runtime, coordonne **l'aide FAQ** et le **panneau contextuel**, et choisit le cote avec le plus d'espace libre quand les deux bords sont contraints.
+
+```tsx
+<TourViewer
+  config={sdkConfig}
+  hostAvoidSelectors={[
+    '[data-tour-id="cart-panel"]',
+    '[data-tour-id="pos-sidebar"]',
+    '.order-summary-panel',
+  ]}
+  faq={{
+    enabled: true,
+    presentation: 'sidebar',
+    side: 'right',
+    startCollapsed: true,
+  }}
+  contextualSuggestions={{
+    enabled: true,
+    uiMode: 'debug',
+    dockSide: 'right',
+  }}
+/>
+```
+
+| Option | Portee | Description | Defaut |
+| --- | --- | --- | --- |
+| `hostAvoidSelectors` | `TourViewer` | Zones hote pour tout le chrome SDK | — |
+| `avoidSelectors` | `faq`, `contextualSuggestions` | Zones supplementaires par surface | — |
+| `minDockClearancePx` | `faq`, `contextualSuggestions` | Largeur minimale libre avant bascule | `420` |
+| `side` / `dockSide` | `faq` / contextuel | Cote prefere quand l'espace le permet | `right` |
+
+Sans selecteurs d'evitement, le comportement reste identique a avant (pas de bascule automatique).
+
+Algorithme :
+
+1. Mesure la clearance gauche/droite via `getBoundingClientRect()`.
+2. Garde le cote prefere s'il a assez d'espace.
+3. Sinon bascule sur l'autre cote s'il est libre.
+4. Sinon choisit le cote avec **la plus grande clearance** (meme partielle).
+5. Evite qu'aide FAQ et panneau contextuel se superposent (passe de coordination mutuelle).
+
+### Theme adaptatif
+
+| Option | Description | Defaut |
+| --- | --- | --- |
+| `themeMode` | `dark`, `light`, `auto`, ou `host` (caméléon tokens hôte) | `host` (via `faqDefaults`) |
+| `hostThemeReference` | Sélecteur d'un panneau hôte à mirroir (`themeMode: 'host'`) | auto-detecte si absent |
+| `sidebarLayout` | `push` (decale le contenu) ou `overlay` (panneau par-dessus) | `push` |
+| `modal` | Backdrop plein ecran pour le sidebar (desactiver sur POS) | `false` |
+
+En mode `auto`, le SDK détecte le thème hôte dans cet ordre :
+
+1. `data-theme` / `data-color-scheme` sur `<html>` ou `<body>`
+2. classes `dark` / `light`
+3. propriété CSS `color-scheme`
+4. variables CSS (`--background`, `--bg`, `--surface`, …)
+5. couleur de fond réellement rendue (`body`, puis `<html>`)
+6. `prefers-color-scheme` (dernier recours uniquement)
+
+Mode `host` — mappe les tokens CSS de l'app (`--background`, `--primary`, `--border`, `--radius`, …) vers les variables FAQ du SDK. Optionnel : `hostThemeReference` pour copier le rendu d'un panneau natif.
+
+```tsx
+<TourViewer
+  faq={{
+    presentation: 'sidebar',
+    themeMode: 'host',
+    hostThemeReference: '[data-tour-id="main-dashboard-panel"]',
+    modal: false,
+  }}
+/>
+```
+
+L'app hote peut exposer son theme :
+
+```html
+<html data-theme="light">
+```
+
+### Composants exportes
+
+```ts
+import {
+  FaqSearchWidget,
+  HelpSidebar,
+  useFaqSemanticSearch,
+  useFaqThemeMode,
+  useHelpDockSide,
+  useSdkDockLayout,
+  mergeAvoidSelectors,
+  resolveSdkDockLayout,
+  resolveFaqThemeAppearance,
+} from '@trustdev/onboarding-sdk-react';
+```
+

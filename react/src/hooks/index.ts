@@ -1,4 +1,12 @@
 export * from './useActiveToursForUrl';
+export * from './useFaqSemanticSearch';
+export * from './useFaqFrequentQuestions';
+export * from './useFaqResultUsageTracking';
+export * from './useHelpDockSide';
+export * from './useHelpTabEdgeInset';
+export * from './useFaqThemeMode';
+export { useFaqTheme, type FaqThemeSnapshot } from './useFaqThemeMode';
+export * from './useSdkDockLayout';
 export * from './useFrictionDetection';
 export * from './useFrictionScore';
 export * from './useContextualTourSuggestions';

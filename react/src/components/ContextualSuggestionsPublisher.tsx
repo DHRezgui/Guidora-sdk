@@ -1,6 +1,7 @@
 import { CSSProperties, useEffect, useMemo, useState } from 'react';
 import { ContextualScenario, SuggestedTourDraft } from '../types';
 import { UseContextualTourSuggestionsOptions, useContextualTourSuggestions } from '../hooks/useContextualTourSuggestions';
+import { useHelpDockSide } from '../hooks/useHelpDockSide';
 import {
   describePublishReportDetailLines,
   describePublishReportStatus,
@@ -31,6 +32,17 @@ export interface ContextualSuggestionsPublisherProps extends UseContextualTourSu
   developerMode?: boolean;
   /** How long the publish status toast stays visible (ms). Default 20s; set 0 to keep it. */
   publishReportVisibleMs?: number;
+  /** Horizontal dock when a help sidebar occupies the same edge (default `right`). */
+  dockSide?: 'left' | 'right';
+  /**
+   * Host DOM zones SDK chrome must not overlap. Merged with `TourViewer.hostAvoidSelectors`
+   * and FAQ selectors when used through `TourViewer`.
+   */
+  avoidSelectors?: string[];
+  /** Minimum horizontal clearance (px) before flipping dock side (default `420`). */
+  minDockClearancePx?: number;
+  /** When set, skips internal collision resolution (used by `TourViewer` orchestration). */
+  resolvedDockSide?: 'left' | 'right';
 }
 
 const DEFAULT_PUBLISH_REPORT_VISIBLE_MS = 20000;
@@ -112,8 +124,20 @@ export function ContextualSuggestionsPublisher({
   stableOnly = true,
   developerMode = false,
   publishReportVisibleMs = DEFAULT_PUBLISH_REPORT_VISIBLE_MS,
+  dockSide = 'right',
+  avoidSelectors,
+  minDockClearancePx,
+  resolvedDockSide,
   ...options
 }: ContextualSuggestionsPublisherProps) {
+  const autoDockSide = useHelpDockSide({
+    preferredSide: dockSide,
+    avoidSelectors,
+    minClearancePx: minDockClearancePx,
+    enabled: resolvedDockSide == null,
+  });
+  const effectiveDockSide = resolvedDockSide ?? autoDockSide;
+
   const suggestions = useContextualTourSuggestions({
     ...options,
     autoPublish,
@@ -194,7 +218,15 @@ export function ContextualSuggestionsPublisher({
     setLocalMessage('Feedback reset (local + remote cache cleared).');
   };
 
-  const panelClassName = ['trustdev-contextual-debug-panel', className].filter(Boolean).join(' ');
+  const panelClassName = [
+    'trustdev-contextual-debug-panel',
+    effectiveDockSide === 'left'
+      ? 'trustdev-contextual-debug-panel--dock-left'
+      : 'trustdev-contextual-debug-panel--dock-right',
+    className,
+  ]
+    .filter(Boolean)
+    .join(' ');
 
   return (
     <div
@@ -204,7 +236,6 @@ export function ContextualSuggestionsPublisher({
       aria-label="Trustdev contextual suggestions panel"
       style={{
         position: 'fixed',
-        right: 16,
         bottom: 16,
         zIndex: 'calc(var(--td-z-index) + 10)',
         width: 360,

@@ -1,4 +1,8 @@
 import { NormalizedSDKConfig, SDKConfig, SDKInitResult } from '../types';
+import {
+  normalizeSdkDockLayoutConfig,
+  normalizeSdkFaqDefaults,
+} from '../utils/sdk-ui-defaults';
 
 export const SDK_VERSION = '0.1.0';
 const DEFAULT_API_URL = 'http://localhost:3002/api/v1';
@@ -26,6 +30,8 @@ function normalizeConfig(config: SDKConfig): NormalizedSDKConfig {
     syncOnFocus: config.syncOnFocus ?? true,
     syncOnReconnect: config.syncOnReconnect ?? true,
     tourAudience: config.tourAudience,
+    dockLayout: normalizeSdkDockLayoutConfig(config.dockLayout),
+    faqDefaults: normalizeSdkFaqDefaults(config.faqDefaults),
   };
 }
 

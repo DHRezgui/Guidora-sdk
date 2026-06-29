@@ -1,6 +1,8 @@
 import {
   ActiveToursResponse,
   ContextualFeedbackAggregatesResponse,
+  FaqSemanticSearchRequest,
+  FaqSemanticSearchResponse,
   NormalizedSDKConfig,
   PublishContextualDraftsRequest,
   PublishContextualDraftsResponse,
@@ -206,5 +208,26 @@ export const sdkApiClient = {
     return request<unknown>(config, `/tours/${tourId}/complete${qs}`, {
       method: 'POST',
     });
+  },
+
+  faqSemanticSearch(
+    config: NormalizedSDKConfig,
+    payload: FaqSemanticSearchRequest,
+  ): Promise<FaqSemanticSearchResponse> {
+    return request<FaqSemanticSearchResponse>(config, '/faq/semantic-search', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  faqSuggestions(
+    config: NormalizedSDKConfig,
+    params: { context?: string; limit?: number },
+  ): Promise<{ success: boolean; count: number; suggestions: Array<{ id: string; question: string }> }> {
+    const search = new URLSearchParams();
+    if (params.context) search.set('context', params.context);
+    if (params.limit) search.set('limit', String(params.limit));
+    const qs = search.toString();
+    return request(config, `/faq/suggestions${qs ? `?${qs}` : ''}`, { method: 'GET' });
   },
 };

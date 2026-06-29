@@ -145,7 +145,7 @@ function inferProjectDomain(flowVersionName, explicit) {
   return flowVersionName ? `${flowVersionName} web application` : 'web application onboarding';
 }
 
-/** Optional e2e folder → vertical hints (init auto mode). */
+/** Optional e2e folder → vertical hints (init auto mode, internal QA only). */
 const E2E_FOLDER_VERTICAL_HINTS = {
   test_3: ['fintech'],
   test_6: ['fintech'],
@@ -214,7 +214,7 @@ function formatJourneyVerticalsLine(verticals) {
   if (!verticals || verticals.length === 0) return '';
   const serialized = JSON.stringify(verticals);
   return `
-      journeyVerticals: ${serialized} as JourneyVertical[],`;
+        journeyVerticals: ${serialized} as JourneyVertical[],`;
 }
 
 /** Domain-agnostic heuristic baseline — no vertical-specific terminology. */
@@ -266,6 +266,16 @@ const HEURISTIC_CONTEXT_BLOCK = `
         'discovery': ['Analytics', 'Reports', 'Insights', 'Overview', 'Summary', 'Activity'],
       },`;
 
+function formatFaqBlock() {
+  return `      faq={{
+        enabled: true,
+        // Optional host overrides:
+        // hostThemeReference: '[data-tour-id="your-anchor"]',
+        // avoidSelectors: ['[data-tour-id="your-anchor"]'],
+        // pageContext: { suggestionKeywords: ['keyword-one', 'keyword-two'] },
+      }}`;
+}
+
 function buildBlueprintsComponentTemplate(flowVersionName, packKey) {
   const pack = BLUEPRINT_PACKS[packKey] || BLUEPRINT_PACKS.fintech;
 
@@ -277,49 +287,43 @@ import '@trustdev/onboarding-sdk-react/styles.css'
 
 /**
  * TrustDev — contextual generation with blueprint preset "${pack.preset}".
+ * SDK defaults cover FAQ sidebar, push layout, and semantic wiring.
  * Initialized via: trustdev-init --mode=blueprints --pack=${packKey}
  */
 export function TrustdevOnboarding() {
   const sdkToken = process.env.NEXT_PUBLIC_TRUSTDEV_SDK_TOKEN
-
-  const sdkConfig = useMemo(() => ({
-    apiKey: process.env.NEXT_PUBLIC_TRUSTDEV_API_KEY || 'demo-local-key',
-    apiUrl: process.env.NEXT_PUBLIC_TRUSTDEV_API_URL || 'http://localhost:3020/api/v1',
-    sdkToken,
-    organizationId: process.env.NEXT_PUBLIC_TRUSTDEV_ORGANIZATION_ID || 'org_demo_1',
-    debug: true,
-    syncEnabled: true,
-    syncIntervalMs: 8000,
-    trackBatchSize: 20,
-    trackFlushIntervalMs: 5000,
-  }), [sdkToken])
-
   if (!sdkToken) return null
+
+  const config = useMemo(
+    () => ({
+      apiKey: process.env.NEXT_PUBLIC_TRUSTDEV_API_KEY || 'demo-local-key',
+      apiUrl: process.env.NEXT_PUBLIC_TRUSTDEV_API_URL || 'http://localhost:3020/api/v1',
+      sdkToken,
+      organizationId: process.env.NEXT_PUBLIC_TRUSTDEV_ORGANIZATION_ID || 'org_demo_1',
+      debug: true,
+      syncEnabled: true,
+      syncIntervalMs: 8000,
+    }),
+    [sdkToken],
+  )
 
   return (
     <TourViewer
-      config={sdkConfig}
-      autoStart={true}
-      debug={true}
-      showHighlight={true}
-      showTooltip={true}
+      config={config}
+      autoStart
+      debug
+      showHighlight
+      showTooltip
       showBeacon={false}
       contextualSuggestions={{
         uiMode: 'debug',
         title: '${flowVersionName} — blueprints (${pack.label})',
         mode: 'blueprint',
         preset: '${pack.preset}',
-        autoPublish: false,
-        publishScenario: 'simple',
-        noiseSelectors: [
-          '.trustdev-contextual-debug-panel',
-          '[data-tour-id="contextual-debug-panel"]',
-        ],
-        flowVersioningEnabled: true,
         flowVersion: '${flowVersionName}-v1',
         baselineFlowVersion: '${flowVersionName}-v0',
-        stableOnly: true,
       }}
+${formatFaqBlock()}
     />
   )
 }
@@ -334,49 +338,43 @@ import '@trustdev/onboarding-sdk-react/styles.css'
 
 /**
  * TrustDev — contextual generation with journeyBlueprints (${pack.label}).
+ * SDK defaults cover FAQ sidebar, push layout, and semantic wiring.
  * Initialized via: trustdev-init --mode=blueprints --pack=${packKey}
  */
 export function TrustdevOnboarding() {
   const sdkToken = process.env.NEXT_PUBLIC_TRUSTDEV_SDK_TOKEN
-
-  const sdkConfig = useMemo(() => ({
-    apiKey: process.env.NEXT_PUBLIC_TRUSTDEV_API_KEY || 'demo-local-key',
-    apiUrl: process.env.NEXT_PUBLIC_TRUSTDEV_API_URL || 'http://localhost:3020/api/v1',
-    sdkToken,
-    organizationId: process.env.NEXT_PUBLIC_TRUSTDEV_ORGANIZATION_ID || 'org_demo_1',
-    debug: true,
-    syncEnabled: true,
-    syncIntervalMs: 8000,
-    trackBatchSize: 20,
-    trackFlushIntervalMs: 5000,
-  }), [sdkToken])
-
   if (!sdkToken) return null
+
+  const config = useMemo(
+    () => ({
+      apiKey: process.env.NEXT_PUBLIC_TRUSTDEV_API_KEY || 'demo-local-key',
+      apiUrl: process.env.NEXT_PUBLIC_TRUSTDEV_API_URL || 'http://localhost:3020/api/v1',
+      sdkToken,
+      organizationId: process.env.NEXT_PUBLIC_TRUSTDEV_ORGANIZATION_ID || 'org_demo_1',
+      debug: true,
+      syncEnabled: true,
+      syncIntervalMs: 8000,
+    }),
+    [sdkToken],
+  )
 
   return (
     <TourViewer
-      config={sdkConfig}
-      autoStart={true}
-      debug={true}
-      showHighlight={true}
-      showTooltip={true}
+      config={config}
+      autoStart
+      debug
+      showHighlight
+      showTooltip
       showBeacon={false}
       contextualSuggestions={{
         uiMode: 'debug',
         title: '${flowVersionName} — blueprints (${pack.label})',
         mode: 'blueprint',
         journeyBlueprints: ${pack.exportName},
-        autoPublish: false,
-        publishScenario: 'simple',
-        noiseSelectors: [
-          '.trustdev-contextual-debug-panel',
-          '[data-tour-id="contextual-debug-panel"]',
-        ],
-        flowVersioningEnabled: true,
         flowVersion: '${flowVersionName}-v1',
         baselineFlowVersion: '${flowVersionName}-v0',
-        stableOnly: true,
       }}
+${formatFaqBlock()}
     />
   )
 }
@@ -390,14 +388,6 @@ function buildAutoComponentTemplate(flowVersionName, options) {
   const journeyVerticalsLine = formatJourneyVerticalsLine(journeyVerticals);
   const flowSuffix = singlePage ? '-single' : '';
   const titleSuffix = singlePage ? ', singlePageTour' : '';
-  const singlePageBlock = singlePage
-    ? `
-      singlePageTour: true,
-      maxDrafts: 1,
-      maxSteps: 7,
-      sequenceMinConfidence: 35,`
-    : `
-      maxDrafts: 2,`;
   const blueprintBlock = singlePage
     ? ''
     : `
@@ -406,7 +396,15 @@ import { allBlueprintPacks } from '@trustdev/onboarding-sdk-react/packs'`;
   const journeyBlueprintsLine = singlePage
     ? ''
     : `
-      journeyBlueprints: allBlueprintPacks,`;
+        journeyBlueprints: allBlueprintPacks,`;
+
+  const singlePageContextualBlock = singlePage
+    ? `
+        singlePageTour: true,
+        maxDrafts: 1,
+        maxSteps: 7,
+        sequenceMinConfidence: 35,`
+    : '';
 
   return `'use client'
 
@@ -416,27 +414,14 @@ import '@trustdev/onboarding-sdk-react/styles.css'
 
 /**
  * TrustDev — resolution-first auto mode (blueprint when DOM resolves, else heuristic).
+ * SDK defaults cover FAQ sidebar, push layout, semantic wiring, and noise filtering.
  * Initialized via: trustdev-init --mode=auto${singlePage ? ' --single-page-tour' : ''}
  */
-const SEMANTIC_HINTS_PATH = '/tours/contextual/semantic-hints'
-
-const NOISE_SELECTORS = [
-  '.trustdev-contextual-debug-panel',
-  '[data-tour-id="contextual-debug-panel"]',
-  '[data-trustdev-contextual-panel]',
-  '[aria-label="Trustdev contextual suggestions panel"]',
-] as const
-
-function resolveSemanticBackendUrl(apiUrl: string): string | undefined {
-  const mode = (process.env.NEXT_PUBLIC_TRUSTDEV_SEMANTIC_ENGINE_MODE || 'hybrid').toLowerCase()
-  if (mode === 'local') return undefined
-  return \`\${apiUrl.replace(/\\/$/, '')}\${SEMANTIC_HINTS_PATH}\`
-}
-
 export function TrustdevOnboarding() {
   const sdkToken = process.env.NEXT_PUBLIC_TRUSTDEV_SDK_TOKEN
+  if (!sdkToken) return null
 
-  const sdkConfig = useMemo(
+  const config = useMemo(
     () => ({
       apiKey: process.env.NEXT_PUBLIC_TRUSTDEV_API_KEY || 'demo-local-key',
       apiUrl: process.env.NEXT_PUBLIC_TRUSTDEV_API_URL || 'http://localhost:3020/api/v1',
@@ -445,69 +430,33 @@ export function TrustdevOnboarding() {
       debug: true,
       syncEnabled: true,
       syncIntervalMs: 8000,
-      trackBatchSize: 20,
-      trackFlushIntervalMs: 5000,
     }),
     [sdkToken],
   )
 
-  const apiUrl = sdkConfig.apiUrl as string
-
-  const contextualSuggestions = useMemo(() => {
-    const semanticEngineMode = (process.env.NEXT_PUBLIC_TRUSTDEV_SEMANTIC_ENGINE_MODE || 'hybrid') as
-      | 'local'
-      | 'hybrid'
-      | 'backend'
-    const semanticBackendUrl = resolveSemanticBackendUrl(apiUrl)
-
-    return {
-      uiMode: 'debug' as const,
-      title: '${flowVersionName} — contextual auto${titleSuffix}',
-      mode: 'auto' as const,
-      projectDomain: '${domain}',${journeyVerticalsLine}${HEURISTIC_CONTEXT_BLOCK}${journeyBlueprintsLine}
-      journeyBlueprintsRemoteEnabled: true,
-      journeyBlueprintsAccessToken: () => sdkToken ?? null,
-      publishConfig: sdkConfig,
-      // autoDetectSinglePageTour defaults true: tabbed UIs fall back to 7-slot chain
-      persona: 'admin' as const,
-      autoPublish: false,
-      publishScenario: 'simple' as const,
-      feedbackEnabled: true,
-      useSemanticRanking: true,
-      enableSequenceDetection: true,
-      explainabilityEnabled: true,
-      conflictResolutionEnabled: true,
-      conflictResolutionStrategy: 'hybrid' as const,
-      includeSupportDraft: false,
-      includeNavigationDraft: false,
-      includeFormDraft: false,${singlePageBlock}
-      minConfidence: 45,
-      noiseSelectors: [...NOISE_SELECTORS],
-      flowVersioningEnabled: true,
-      flowVersion: '${flowVersionName}${flowSuffix}-v1',
-      baselineFlowVersion: '${flowVersionName}${flowSuffix}-v0',
-      stableOnly: false,
-      semanticEnhancementEnabled: true,
-      semanticEngineMode,
-      semanticBackendUrl,
-      semanticBackendTimeoutMs: 12_000,
-      semanticSnapshotMinDomAgeMs: 300,
-      semanticBackendAccessToken: () => sdkToken ?? null,
-      semanticRoleWeights: { role: 0.6, order: 0.4, copy: 0.5 },
-    }
-  }, [apiUrl, sdkToken])
-
-  if (!sdkToken) return null
+  const semanticEngineMode = (process.env.NEXT_PUBLIC_TRUSTDEV_SEMANTIC_ENGINE_MODE || 'hybrid') as
+    | 'local'
+    | 'hybrid'
+    | 'backend'
 
   return (
     <TourViewer
-      config={sdkConfig}
-      autoStart={true}
-      debug={true}
-      showHighlight={true}
-      showTooltip={true}
+      config={config}
+      autoStart
+      debug
+      showHighlight
+      showTooltip
       showBeacon={false}
-      contextualSuggestions={contextualSuggestions}
+      contextualSuggestions={{
+        mode: 'auto',
+        uiMode: 'debug',
+        title: '${flowVersionName} — contextual auto${titleSuffix}',
+        projectDomain: '${domain}',${journeyVerticalsLine}${singlePageContextualBlock}${journeyBlueprintsLine}
+        semanticEngineMode,
+        flowVersion: '${flowVersionName}${flowSuffix}-v1',
+        baselineFlowVersion: '${flowVersionName}${flowSuffix}-v0',
+      }}
+${formatFaqBlock()}
     />
   )
 }
@@ -626,6 +575,7 @@ export function TrustdevOnboarding() {
       showTooltip={true}
       showBeacon={false}
       contextualSuggestions={contextualSuggestions}
+${formatFaqBlock()}
     />
   )
 }

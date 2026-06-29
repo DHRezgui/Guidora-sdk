@@ -1,13 +1,27 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useOnboarding } from '../hooks/useOnboarding';
+import type { ResolveOptions } from '../hooks/useTourTargetResolver';
+import type { UseTourResult } from '../hooks/useTour';
+import { useSdkDockLayout } from '../hooks/useSdkDockLayout';
+import { resolveSDKConfig } from '../core/sdk-state';
 import { PositionType, SDKConfig, Step, TourDraftIntent } from '../types';
 import { UseContextualTourSuggestionsOptions } from '../hooks/useContextualTourSuggestions';
 import { ContextualSuggestionsPublisher, ContextualSuggestionsUIMode } from './ContextualSuggestionsPublisher';
+import { FaqSearchWidget } from './FaqSearchWidget';
+import { HelpSidebar } from './HelpSidebar';
+import type { FaqWidgetOptions } from '../types/faq';
 import { OnboardingTheme } from './theme';
 import { TourRenderer } from './TourRenderer';
 import { recordTourSuggestionFeedback } from '../utils/tour-suggestion-generator';
 import { enqueueContextualFeedback } from '../utils/contextual-feedback-flusher';
 import { findElement } from '../utils/dom-utils';
+import {
+  mergeTourViewerFaqOptions,
+  normalizeSdkDockLayoutConfig,
+  normalizeSdkFaqDefaults,
+  resolveInitHostAvoidSelectors,
+} from '../utils/sdk-ui-defaults';
+import { resolveContextualTourViewerOptions } from '../utils/sdk-auto-defaults';
 
 const VALID_INTENTS: TourDraftIntent[] = ['discovery', 'primary-action', 'support-navigation', 'form-flow'];
 const NAVIGATION_CLICK_RESUME_DELAY_MS = 5000;
@@ -270,7 +284,20 @@ export interface TourViewerProps {
      * appears automatically only in development.
      */
     developerMode?: boolean;
+    /** Host DOM zones all SDK floating chrome should avoid (FAQ + contextual). */
+    avoidSelectors?: string[];
+    /** Minimum horizontal clearance (px) before flipping dock side (default `420`). */
+    minDockClearancePx?: number;
+    /** Preferred dock for the contextual panel when space allows (default `right`). */
+    dockSide?: 'left' | 'right';
   }) | null;
+  /**
+   * Host DOM zones all SDK floating chrome should avoid (merged with FAQ/contextual selectors).
+   * Use for persistent host UI such as nav sidebars, carts, or order summaries.
+   */
+  hostAvoidSelectors?: string[];
+  /** In-app FAQ semantic search (RAG). Requires SDK token scope `faq:search`. */
+  faq?: (FaqWidgetOptions & { config?: Partial<SDKConfig> }) | null;
 }
 
 const SHARED_CONTEXTUAL_DEFAULTS: Partial<UseContextualTourSuggestionsOptions> = {
@@ -667,6 +694,22 @@ function isActiveInPageNavigationTarget(element: HTMLElement): boolean {
   );
 }
 
+function isOverlayChromeControl(element: HTMLElement): boolean {
+  if (element.closest('[data-trustdev-help-sidebar], [data-trustdev-faq-panel], [data-trustdev-contextual-panel]')) {
+    return true;
+  }
+  if (element.closest('[data-slot="sheet-trigger"], [data-slot="dialog-trigger"], [data-slot="drawer-trigger"]')) {
+    return true;
+  }
+  if (element.getAttribute('aria-haspopup') === 'dialog') {
+    return true;
+  }
+  const label = normalizeSearchText(
+    [element.getAttribute('aria-label'), element.textContent].filter(Boolean).join(' '),
+  );
+  return label.includes('open menu') || label.includes('ouvrir le menu') || label.includes('toggle menu');
+}
+
 function activateInPageNavigationForStep(step?: Step | null): boolean {
   if (typeof window === 'undefined' || !step) return false;
 
@@ -678,7 +721,7 @@ function activateInPageNavigationForStep(step?: Step | null): boolean {
     requirePreferredMatch: true,
   });
 
-  if (!target || isActiveInPageNavigationTarget(target)) return false;
+  if (!target || isOverlayChromeControl(target) || isActiveInPageNavigationTarget(target)) return false;
   if (target.getAttribute('aria-disabled') === 'true' || target.hasAttribute('disabled')) return false;
 
   target.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
@@ -742,7 +785,30 @@ export function TourViewer({
   onTourSkipped,
   runtimeBehavior,
   contextualSuggestions = null,
+  faq = null,
+  hostAvoidSelectors,
 }: TourViewerProps) {
+  const sdkUiConfig = useMemo(() => {
+    try {
+      return resolveSDKConfig(config);
+    } catch {
+      return {
+        dockLayout: normalizeSdkDockLayoutConfig(),
+        faqDefaults: normalizeSdkFaqDefaults(),
+      };
+    }
+  }, [config]);
+
+  const resolvedFaq = useMemo(
+    () => mergeTourViewerFaqOptions(sdkUiConfig.faqDefaults, faq),
+    [sdkUiConfig.faqDefaults, faq],
+  );
+
+  const mergedHostAvoidSelectors = useMemo(
+    () => resolveInitHostAvoidSelectors(sdkUiConfig.dockLayout, hostAvoidSelectors),
+    [sdkUiConfig.dockLayout, hostAvoidSelectors],
+  );
+
   const activeTargetRef = useRef<HTMLElement | null>(null);
   const previewBridgeRef = useRef<{
     selector: string;
@@ -755,12 +821,18 @@ export function TourViewer({
   const [resolvePath, setResolvePath] = useState<RuntimeResolvePath | null>(null);
   const [resolveMatchScore, setResolveMatchScore] = useState<number | null>(null);
   const [resolvedSelector, setResolvedSelector] = useState<string | null>(null);
-  const [resolveAttempt, setResolveAttempt] = useState(0);
+  const activeSelectorForSyncRef = useRef<string>('');
+  const attachedStepRuntimeKeyRef = useRef<string | null>(null);
+  const softReResolveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const runTargetResolutionRef = useRef<(() => void) | null>(null);
   const [currentPathname, setCurrentPathname] = useState(() =>
     typeof window !== 'undefined' ? window.location.pathname : '',
   );
   const [autoNavigatingToRoute, setAutoNavigatingToRoute] = useState<string | null>(null);
   const [navigationClickResumeAt, setNavigationClickResumeAt] = useState(readNavigationClickResumeAt);
+  const [helpSidebarOpen, setHelpSidebarOpen] = useState(
+    () => resolvedFaq?.presentation === 'sidebar' && resolvedFaq?.startCollapsed === false,
+  );
   const lastRouteAutoNavigateKeyRef = useRef<string | null>(null);
   const suppressRouteAutoNavigateUntilRef = useRef(0);
   const targetClickAdvanceInFlightRef = useRef(false);
@@ -771,6 +843,16 @@ export function TourViewer({
   const runtimeFeedbackRecorderRef = useRef<
     (event: 'shown' | 'clicked' | 'completed' | 'skipped', selectorOverride?: string) => void
   >(() => undefined);
+  const resolveTargetRef = useRef<
+    (selector?: string, options?: ResolveOptions) => Promise<HTMLElement | null>
+  >(async () => null);
+  const debugRef = useRef<{
+    info: (message: string, payload?: unknown) => void;
+    warn: (message: string, payload?: unknown) => void;
+    error: (message: string, payload?: unknown) => void;
+  } | null>(null);
+  const lastResolutionLogKeyRef = useRef<string | null>(null);
+  const tourRef = useRef<UseTourResult | null>(null);
   const isEmbeddedSimulatorPreview =
     typeof window !== 'undefined' &&
     window.self !== window.top &&
@@ -802,6 +884,10 @@ export function TourViewer({
     debug,
     activeFlowVersion: contextualSuggestions?.flowVersion,
   });
+
+  resolveTargetRef.current = onboarding.resolver.resolveTarget;
+  debugRef.current = onboarding.debug;
+  tourRef.current = onboarding.tour;
 
   useEffect(() => {
     if (selectorHealsBootstrappedRef.current) return;
@@ -1020,6 +1106,38 @@ export function TourViewer({
   const expectedStepRoute = normalizeRoutePath(onboarding.tour.currentStep?.stepTargetUrl);
   const normalizedCurrentRoute = normalizeRoutePath(currentPathname);
   const routeMismatch = Boolean(expectedStepRoute) && expectedStepRoute !== normalizedCurrentRoute;
+  const stepResolutionKey = useMemo(() => {
+    const step = onboarding.tour.currentStep;
+    return [
+      onboarding.tour.isOpen ? 'open' : 'closed',
+      onboarding.activeTour?.id ?? 'unknown',
+      onboarding.tour.currentStepIndex,
+      step?.targetSelector ?? '',
+      step?.selectorAlternatives?.join('|') ?? '',
+      step?.targetFingerprint?.textSample ?? '',
+      step?.targetFingerprint?.tagName ?? '',
+      step?.targetFingerprint?.role ?? '',
+      step?.targetFingerprint?.ariaLabel ?? '',
+      step?.action ?? '',
+      step?.title ?? '',
+      step?.content ?? '',
+      routeMismatch ? 'route-mismatch' : 'route-ok',
+    ].join('|');
+  }, [
+    onboarding.activeTour?.id,
+    onboarding.tour.currentStep?.action,
+    onboarding.tour.currentStep?.content,
+    onboarding.tour.currentStep?.selectorAlternatives?.join('|'),
+    onboarding.tour.currentStep?.targetFingerprint?.ariaLabel,
+    onboarding.tour.currentStep?.targetFingerprint?.role,
+    onboarding.tour.currentStep?.targetFingerprint?.tagName,
+    onboarding.tour.currentStep?.targetFingerprint?.textSample,
+    onboarding.tour.currentStep?.targetSelector,
+    onboarding.tour.currentStep?.title,
+    onboarding.tour.currentStepIndex,
+    onboarding.tour.isOpen,
+    routeMismatch,
+  ]);
   const isAutoNavigating = Boolean(autoNavigatingToRoute) && routeMismatch;
 
   useEffect(() => {
@@ -1068,6 +1186,9 @@ export function TourViewer({
   useEffect(() => {
     if (!onboarding.tour.isOpen) {
       lastRouteAutoNavigateKeyRef.current = null;
+      lastResolutionLogKeyRef.current = null;
+      attachedStepRuntimeKeyRef.current = null;
+      activeSelectorForSyncRef.current = '';
     }
   }, [onboarding.tour.isOpen]);
 
@@ -1076,7 +1197,9 @@ export function TourViewer({
     targetClickAdvanceInFlightRef.current = true;
     runtimeFeedbackRecorderRef.current('clicked');
 
-    const isLast = onboarding.tour.currentStepIndex >= onboarding.tour.steps.length - 1;
+    const tourState = tourRef.current;
+    if (!tourState) return;
+    const isLast = tourState.currentStepIndex >= tourState.steps.length - 1;
     const isNavigationTarget = targetEl ? isNavigationActivationTarget(targetEl) : false;
 
     if (isNavigationTarget) {
@@ -1087,11 +1210,10 @@ export function TourViewer({
 
       if (isLast) {
         runtimeFeedbackRecorderRef.current('completed');
-        onboarding.tour.completeTour();
+        tourState.completeTour();
         onTourComplete?.(onboarding.activeTour?.id);
       } else {
-        onboarding.tour.nextStep();
-        setResolveAttempt((prev) => prev + 1);
+        tourState.nextStep();
       }
 
       window.setTimeout(() => {
@@ -1103,12 +1225,11 @@ export function TourViewer({
     suppressRouteAutoNavigateUntilRef.current = Date.now() + 2500;
     if (isLast) {
       runtimeFeedbackRecorderRef.current('completed');
-      onboarding.tour.completeTour();
+      tourState.completeTour();
       onTourComplete?.(onboarding.activeTour?.id);
     } else {
-      const nextStep = onboarding.tour.steps[onboarding.tour.currentStepIndex + 1];
-      onboarding.tour.nextStep();
-      setResolveAttempt((prev) => prev + 1);
+      const nextStep = tourState.steps[tourState.currentStepIndex + 1];
+      tourState.nextStep();
 
       window.setTimeout(() => {
         navigateToStepRoute(nextStep?.stepTargetUrl);
@@ -1118,7 +1239,7 @@ export function TourViewer({
     window.setTimeout(() => {
       targetClickAdvanceInFlightRef.current = false;
     }, 900);
-  }, [navigateToStepRoute, onboarding.activeTour?.id, onboarding.tour, onTourComplete]);
+  }, [navigateToStepRoute, onTourComplete, onboarding.activeTour?.id]);
 
   // Résoudre le sélecteur de la step courante
   useEffect(() => {
@@ -1138,6 +1259,8 @@ export function TourViewer({
     const selectorCandidates = getRuntimeSelectorCandidates(currentStep, healedSelector);
     if (!onboarding.tour.isOpen || routeMismatch || selectorCandidates.length === 0) {
       activeTargetRef.current = null;
+      attachedStepRuntimeKeyRef.current = null;
+      activeSelectorForSyncRef.current = '';
       setTargetRect(null);
       setTargetNotFound(false);
       setResolvePath(null);
@@ -1177,15 +1300,32 @@ export function TourViewer({
           lastTargetRectSyncAt = Date.now();
 
           const currentTarget = activeTargetRef.current;
-          const latestTarget = findElement(activeSelectorForSync, {
-            preferredText: currentStepSearchText,
-            preferActive: true,
-          });
-          if (!currentTarget?.isConnected || !latestTarget || latestTarget !== currentTarget) {
-            setResolveAttempt((prev) => prev + 1);
+          if (!currentTarget?.isConnected) {
+            const selector = activeSelectorForSyncRef.current;
+            if (selector) {
+              const replacement = findElement(selector, {
+                preferredText: currentStepSearchText,
+                preferActive: true,
+              });
+              if (replacement?.isConnected) {
+                activeTargetRef.current = replacement;
+                syncTargetRect();
+                return;
+              }
+            }
+
+            if (softReResolveTimerRef.current !== null) return;
+            softReResolveTimerRef.current = setTimeout(() => {
+              softReResolveTimerRef.current = null;
+              if (cancelled) return;
+              runTargetResolutionRef.current?.();
+            }, 280);
             return;
           }
 
+          // Keep tracking the attached node while it stays connected. Ambiguous
+          // selectors (e.g. `main h1`) can make findElement return a different
+          // sibling on each query — that must not trigger a full re-resolution loop.
           syncTargetRect();
         });
       };
@@ -1207,6 +1347,8 @@ export function TourViewer({
       resolvedMatchScore: number | null,
     ) => {
       activeSelectorForSync = resolvedSelector || activeSelectorForSync;
+      activeSelectorForSyncRef.current = activeSelectorForSync;
+      attachedStepRuntimeKeyRef.current = stepRuntimeKey;
       if (
         resolvedSelector &&
         resolvedSelector !== currentSelector &&
@@ -1302,18 +1444,21 @@ export function TourViewer({
       });
 
       setTargetNotFound(false);
-      setResolvePath(resolvedPath);
-      setResolveMatchScore(resolvedMatchScore);
-      setResolvedSelector(resolvedSelector);
-      onboarding.debug.info('Runtime fallback resolution', {
-        resolvePath: resolvedPath,
-        matchScore: resolvedMatchScore,
-        lowConfidenceMatch:
-          typeof resolvedMatchScore === 'number' && resolvedMatchScore < LOW_CONFIDENCE_RUNTIME_MATCH_SCORE,
-        selector: resolvedSelector,
-        stepRuntimeKey,
-        cacheHit: false,
-      });
+      setResolvePath((previous) => (previous === resolvedPath ? previous : resolvedPath));
+      setResolveMatchScore((previous) => (previous === resolvedMatchScore ? previous : resolvedMatchScore));
+      setResolvedSelector((previous) => (previous === resolvedSelector ? previous : resolvedSelector));
+      if (lastResolutionLogKeyRef.current !== stepRuntimeKey) {
+        lastResolutionLogKeyRef.current = stepRuntimeKey;
+        debugRef.current?.info('Runtime fallback resolution', {
+          resolvePath: resolvedPath,
+          matchScore: resolvedMatchScore,
+          lowConfidenceMatch:
+            typeof resolvedMatchScore === 'number' && resolvedMatchScore < LOW_CONFIDENCE_RUNTIME_MATCH_SCORE,
+          selector: resolvedSelector,
+          stepRuntimeKey,
+          cacheHit: false,
+        });
+      }
     };
 
     const resolveSelector = async () => {
@@ -1360,7 +1505,7 @@ export function TourViewer({
           retries: number,
           intervalMs: number,
           ): Promise<HTMLElement | null> => {
-            return onboarding.resolver.resolveTarget(selector, {
+            return resolveTargetRef.current(selector, {
               retries,
               intervalMs,
               preferredText: currentStepSearchText,
@@ -1434,13 +1579,13 @@ export function TourViewer({
           setResolvePath('not-found');
           setResolveMatchScore(null);
           setResolvedSelector(null);
-          onboarding.debug.warn('Runtime fallback failed to resolve target', {
+          debugRef.current?.warn('Runtime fallback failed to resolve target', {
             stepRuntimeKey,
             selectorCandidates,
           });
         }
       } catch (error) {
-        onboarding.debug.error('Failed to resolve target', { error });
+        debugRef.current?.error('Failed to resolve target', { error });
         activeTargetRef.current = null;
         setTargetRect(null);
         setTargetNotFound(true);
@@ -1450,11 +1595,22 @@ export function TourViewer({
       }
     };
 
+    runTargetResolutionRef.current = () => {
+      if (cancelled) return;
+      void resolveSelector();
+    };
+
     void resolveSelector();
 
     return () => {
+      runTargetResolutionRef.current = null;
       cancelled = true;
       activeTargetRef.current = null;
+      attachedStepRuntimeKeyRef.current = null;
+      if (softReResolveTimerRef.current !== null) {
+        clearTimeout(softReResolveTimerRef.current);
+        softReResolveTimerRef.current = null;
+      }
       if (raf1 !== null) window.cancelAnimationFrame(raf1);
       if (raf2 !== null) window.cancelAnimationFrame(raf2);
       if (syncRaf !== null) window.cancelAnimationFrame(syncRaf);
@@ -1466,39 +1622,21 @@ export function TourViewer({
       document.removeEventListener('scroll', scheduleTargetRectSync, true);
       window.removeEventListener('resize', scheduleTargetRectSync);
     };
-  }, [
-    onboarding.tour.isOpen,
-    onboarding.tour.currentStep?.targetSelector,
-    onboarding.tour.currentStep?.selectorAlternatives?.join('|'),
-    onboarding.tour.currentStep?.targetFingerprint?.textSample,
-    onboarding.tour.currentStep?.targetFingerprint?.tagName,
-    onboarding.tour.currentStep?.targetFingerprint?.role,
-    onboarding.tour.currentStep?.targetFingerprint?.ariaLabel,
-    onboarding.tour.currentStep?.action,
-    onboarding.tour.currentStep?.title,
-    onboarding.tour.currentStep?.content,
-    onboarding.tour.currentStepIndex,
-    onboarding.activeTour?.id,
-    onboarding.resolver,
-    onboarding.debug,
-    routeMismatch,
-    resolveAttempt,
-    syncTargetRect,
-    advanceAfterTargetActivation,
-  ]);
+  }, [stepResolutionKey, syncTargetRect, advanceAfterTargetActivation]);
 
-  const resolvedContextualSuggestions = (() => {
+  const resolvedContextualSuggestions = useMemo(() => {
     if (!contextualSuggestions) return null;
     const presetName = contextualSuggestions.preset;
     const preset = presetName ? CONTEXTUAL_SUGGESTIONS_PRESETS[presetName] ?? {} : {};
-    return {
+    const withPreset = {
       ...preset,
       ...contextualSuggestions,
       noiseSelectors: contextualSuggestions.noiseSelectors ?? preset.noiseSelectors,
       businessObjectives: contextualSuggestions.businessObjectives ?? preset.businessObjectives,
       semanticHints: contextualSuggestions.semanticHints ?? preset.semanticHints,
     };
-  })();
+    return resolveContextualTourViewerOptions(config, withPreset, { debug });
+  }, [config, contextualSuggestions, debug]);
 
   const activeTourIntent = (() => {
     const meta = onboarding.activeTour?.triggerConditions as
@@ -1526,6 +1664,41 @@ export function TourViewer({
     isContextualTour &&
     isPreviewRuntime === false &&
     resolvedContextualSuggestions?.feedbackEnabled === true;
+
+  const isTourActive = onboarding.tour.isOpen;
+  const isSdkChromeSuspendedDuringTour = isTourActive;
+
+  useEffect(() => {
+    if (isSdkChromeSuspendedDuringTour) {
+      setHelpSidebarOpen((open) => (open ? false : open));
+    }
+  }, [isSdkChromeSuspendedDuringTour]);
+
+  const dockLayout = useSdkDockLayout({
+    dockLayoutEnabled: sdkUiConfig.dockLayout.enabled,
+    hostAvoidSelectors: mergedHostAvoidSelectors,
+    helpAvoidSelectors: resolvedFaq?.avoidSelectors,
+    contextualAvoidSelectors: resolvedContextualSuggestions?.avoidSelectors,
+    helpPreferredSide: resolvedFaq?.side ?? 'right',
+    contextualPreferredSide: resolvedContextualSuggestions?.dockSide ?? 'right',
+    minClearancePx:
+      resolvedFaq?.minDockClearancePx ??
+      resolvedContextualSuggestions?.minDockClearancePx ??
+      sdkUiConfig.dockLayout.minClearancePx,
+    helpEnabled: Boolean(
+      resolvedFaq && resolvedFaq.enabled !== false && !isSdkChromeSuspendedDuringTour,
+    ),
+    contextualEnabled: Boolean(
+      resolvedContextualSuggestions && !isSdkChromeSuspendedDuringTour,
+    ),
+    helpSidebarOpen: Boolean(
+      resolvedFaq &&
+        resolvedFaq.enabled !== false &&
+        resolvedFaq.presentation === 'sidebar' &&
+        helpSidebarOpen &&
+        !isSdkChromeSuspendedDuringTour,
+    ),
+  });
 
   const recordRuntimeFeedback = useCallback(
     (event: 'shown' | 'clicked' | 'completed' | 'skipped', selectorOverride?: string) => {
@@ -1572,8 +1745,8 @@ export function TourViewer({
   }, [
     runtimeFeedbackEnabled,
     onboarding.tour.isOpen,
-    onboarding.tour.currentStep,
     onboarding.tour.currentStepIndex,
+    onboarding.tour.currentStep?.targetSelector,
     onboarding.activeTour?.id,
     routeMismatch,
     shouldTemporarilyHideTourUi,
@@ -1599,7 +1772,6 @@ export function TourViewer({
       recordRuntimeFeedback('clicked');
       const nextStep = onboarding.tour.steps[onboarding.tour.currentStepIndex + 1];
       onboarding.tour.nextStep();
-      setResolveAttempt((prev) => prev + 1); // Trigger re-resolution
       navigateToStepRoute(nextStep?.stepTargetUrl);
     }
   }, [onboarding.tour, onboarding.activeTour?.id, onTourComplete, navigateToStepRoute, recordRuntimeFeedback]);
@@ -1607,7 +1779,6 @@ export function TourViewer({
   const handlePrev = useCallback(() => {
     const prevStep = onboarding.tour.steps[onboarding.tour.currentStepIndex - 1];
     onboarding.tour.prevStep();
-    setResolveAttempt((prev) => prev + 1);
     navigateToStepRoute(prevStep?.stepTargetUrl);
   }, [onboarding.tour, navigateToStepRoute]);
 
@@ -1652,18 +1823,63 @@ export function TourViewer({
         resolveMatchScore={debug ? resolveMatchScore : null}
         resolvedSelector={debug ? resolvedSelector : null}
       />
-      {resolvedContextualSuggestions ? (
+      {resolvedContextualSuggestions && !isSdkChromeSuspendedDuringTour ? (
         <ContextualSuggestionsPublisher
           {...resolvedContextualSuggestions}
           uiMode={resolvedContextualSuggestions.uiMode ?? 'auto'}
           title={resolvedContextualSuggestions.title}
           stableOnly={resolvedContextualSuggestions.stableOnly}
           developerMode={resolvedContextualSuggestions.developerMode ?? debug}
+          dockSide={resolvedContextualSuggestions.dockSide ?? 'right'}
+          avoidSelectors={dockLayout.avoidSelectors}
+          minDockClearancePx={
+            resolvedFaq?.minDockClearancePx ??
+            resolvedContextualSuggestions.minDockClearancePx ??
+            sdkUiConfig.dockLayout.minClearancePx
+          }
+          resolvedDockSide={dockLayout.contextualSide}
           publishConfig={{
             ...(config ?? {}),
             ...(resolvedContextualSuggestions.publishConfig ?? {}),
           }}
         />
+      ) : null}
+      {resolvedFaq &&
+      resolvedFaq.enabled !== false &&
+      !isSdkChromeSuspendedDuringTour ? (
+        resolvedFaq.presentation === 'sidebar' ? (
+          <HelpSidebar
+            {...resolvedFaq}
+            enabled
+            side={resolvedFaq.side ?? 'right'}
+            avoidSelectors={dockLayout.avoidSelectors}
+            resolvedDockSide={dockLayout.helpSide}
+            contextualSuggestionsEnabled={resolvedFaq.contextualSuggestionsEnabled ?? true}
+            pageContext={resolvedFaq.pageContext}
+            runtimePageContext={{
+              tourId: onboarding.activeTour?.id,
+              tourName: onboarding.activeTour?.name,
+              tourStepTitle: onboarding.tour.currentStep?.title,
+              projectDomain: resolvedContextualSuggestions?.projectDomain,
+            }}
+            config={{
+              ...(config ?? {}),
+              ...(resolvedFaq.config ?? {}),
+            }}
+            onOpenChange={setHelpSidebarOpen}
+          />
+        ) : (
+          <FaqSearchWidget
+            {...resolvedFaq}
+            enabled
+            avoidSelectors={dockLayout.avoidSelectors}
+            resolvedDockSide={dockLayout.helpSide}
+            config={{
+              ...(config ?? {}),
+              ...(resolvedFaq.config ?? {}),
+            }}
+          />
+        )
       ) : null}
     </>
   );

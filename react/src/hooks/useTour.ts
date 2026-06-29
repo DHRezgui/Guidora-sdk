@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { GuidedTour, Step } from '../types';
 
 export interface UseTourOptions {
@@ -36,18 +36,22 @@ function sortStepsByOrderIndex(steps: Step[]): Step[] {
     .map((entry) => entry.step);
 }
 
+const EMPTY_TOUR_STEPS: Step[] = [];
+
 export function useTour(options?: UseTourOptions): UseTourResult {
   const initialStepIndex = options?.initialStepIndex ?? 0;
   const autoOpen = options?.autoOpen ?? false;
-  const onComplete = options?.onComplete;
-  const onSkip = options?.onSkip;
+  const onCompleteRef = useRef(options?.onComplete);
+  const onSkipRef = useRef(options?.onSkip);
+  onCompleteRef.current = options?.onComplete;
+  onSkipRef.current = options?.onSkip;
 
   const [activeTour, setActiveTour] = useState<GuidedTour | null>(null);
   const [currentStepIndex, setCurrentStepIndex] = useState(initialStepIndex);
   const [isOpen, setIsOpen] = useState(autoOpen);
   const [isCompleted, setIsCompleted] = useState(false);
 
-  const steps = activeTour?.steps || [];
+  const steps = activeTour?.steps ?? EMPTY_TOUR_STEPS;
   const currentStep = steps[currentStepIndex] || null;
 
   const startTour = useCallback(
@@ -73,9 +77,9 @@ export function useTour(options?: UseTourOptions): UseTourResult {
     setIsCompleted(true);
     const finishedTour = activeTour;
     if (finishedTour) {
-      onComplete?.(finishedTour);
+      onCompleteRef.current?.(finishedTour);
     }
-  }, [activeTour, onComplete]);
+  }, [activeTour]);
 
   const nextStep = useCallback(() => {
     if (!steps.length) return;
@@ -106,9 +110,9 @@ export function useTour(options?: UseTourOptions): UseTourResult {
     setIsOpen(false);
     const skippedTour = activeTour;
     if (skippedTour) {
-      onSkip?.(skippedTour);
+      onSkipRef.current?.(skippedTour);
     }
-  }, [activeTour, onSkip]);
+  }, [activeTour]);
 
   return useMemo(
     () => ({

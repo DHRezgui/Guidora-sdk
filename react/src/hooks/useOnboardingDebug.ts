@@ -38,15 +38,22 @@ export function useOnboardingDebug(options?: UseOnboardingDebugOptions) {
   const warn = useCallback((message: string, payload?: unknown) => push('warn', message, payload), [push]);
   const error = useCallback((message: string, payload?: unknown) => push('error', message, payload), [push]);
 
-  return useMemo(
+  const api = useMemo(
     () => ({
       enabled,
-      logs,
       info,
       warn,
       error,
       clearLogs,
     }),
-    [clearLogs, enabled, error, info, logs, warn],
+    [clearLogs, enabled, error, info, warn],
+  );
+
+  return useMemo(
+    () => ({
+      ...api,
+      logs,
+    }),
+    [api, logs],
   );
 }

@@ -100,7 +100,7 @@ export const findElement = (selector: string, options?: FindElementOptions): HTM
     const visibleElements = elements.filter(isVisibleElement);
     const candidates = visibleElements.length > 0 ? visibleElements : elements.filter((element) => element.isConnected);
 
-    if (options?.preferredText && candidates.length > 1) {
+    if (options?.preferredText) {
       let bestElement: HTMLElement | null = null;
       let bestScore = 0;
 

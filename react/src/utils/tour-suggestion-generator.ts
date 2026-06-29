@@ -303,6 +303,13 @@ const DEFAULT_NOISE_SELECTORS = [
   '[data-tour-id="contextual-debug-panel"]',
   '[data-trustdev-contextual-panel]',
   '[aria-label="Trustdev contextual suggestions panel"]',
+  // Trustdev FAQ / help chrome.
+  '.trustdev-faq-widget',
+  '[data-tour-id="trustdev-faq-widget"]',
+  '[data-trustdev-faq-panel]',
+  '.trustdev-help-sidebar',
+  '[data-tour-id="trustdev-help-sidebar"]',
+  '[data-trustdev-help-sidebar]',
 ];
 
 /** Host-facing debug panel — never a tour target (even with legacy data-tour-id). */
@@ -310,13 +317,23 @@ const CONTEXTUAL_PANEL_SELECTOR_MARKERS = [
   'contextual-debug-panel',
   'trustdev-contextual-panel',
   'trustdev-contextual-debug-panel',
+  'trustdev-faq-widget',
+  'trustdev-help-sidebar',
 ] as const;
 
 function isTrustdevContextualPanelElement(element: HTMLElement): boolean {
   if (element.closest('[data-trustdev-contextual-panel]')) return true;
+  if (element.closest('[data-trustdev-faq-panel]')) return true;
+  if (element.closest('[data-trustdev-help-sidebar]')) return true;
+  if (element.closest('.trustdev-faq-widget')) return true;
+  if (element.closest('.trustdev-help-sidebar')) return true;
   if (element.closest('.trustdev-contextual-debug-panel')) return true;
   if (element.getAttribute('data-tour-id') === 'contextual-debug-panel') return true;
+  if (element.getAttribute('data-tour-id') === 'trustdev-faq-widget') return true;
+  if (element.getAttribute('data-tour-id') === 'trustdev-help-sidebar') return true;
   if (element.closest('[data-tour-id="contextual-debug-panel"]')) return true;
+  if (element.closest('[data-tour-id="trustdev-faq-widget"]')) return true;
+  if (element.closest('[data-tour-id="trustdev-help-sidebar"]')) return true;
   const aria = normalizeText(element.getAttribute('aria-label') || '');
   if (aria === 'trustdev contextual suggestions panel') return true;
   return false;

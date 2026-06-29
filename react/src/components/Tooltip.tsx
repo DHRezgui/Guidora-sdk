@@ -438,7 +438,6 @@ export function Tooltip({
       });
     };
 
-    updateRect();
     scheduleUpdateRect();
     window.addEventListener('resize', scheduleUpdateRect);
     window.addEventListener('scroll', scheduleUpdateRect, { capture: true, passive: true });

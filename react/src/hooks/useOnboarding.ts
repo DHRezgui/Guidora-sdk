@@ -264,14 +264,14 @@ export function useOnboarding(options?: UseOnboardingOptions) {
         }
       }
     },
-    [toursForFlow, debugInfo, debugWarn, pageUrl, pickTour, resolver, tour, tourProgress.progress?.stepIndex],
+    [toursForFlow, debugInfo, debugWarn, pageUrl, pickTour, resolver.resolveTarget, tour.startTour, tourProgress.progress?.stepIndex],
   );
 
   const stop = useCallback(() => {
     tour.closeTour();
     writeActiveTourSnapshot(activeTourSessionKey, null);
     debugInfo('Tour stopped');
-  }, [activeTourSessionKey, debugInfo, tour]);
+  }, [activeTourSessionKey, debugInfo, tour.closeTour]);
 
   useEffect(() => {
     if (!activeTour?.id) return;
@@ -322,9 +322,14 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     toursForFlow,
   ]);
 
+  const autostartAttemptKeyRef = useRef<string | null>(null);
+
   useEffect(() => {
     if (!options?.autoStart) return;
-    if (tour.isOpen) return;
+    if (tour.isOpen) {
+      autostartAttemptKeyRef.current = null;
+      return;
+    }
     if (isSuppressed()) return;
     if (activeTours.loading) return;
     if (toursForFlow.length === 0) return;
@@ -333,14 +338,25 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       return;
     }
 
+    const attemptKey = [
+      pageUrl,
+      activeFlowVersion ?? '',
+      toursForFlow.map((item) => item.id).join(','),
+    ].join('|');
+    if (autostartAttemptKeyRef.current === attemptKey) return;
+    autostartAttemptKeyRef.current = attemptKey;
+
     void start();
   }, [
+    activeFlowVersion,
     activeTours.loading,
     activeTours.tours,
     debugInfo,
     options?.autoStart,
+    pageUrl,
     start,
     tour.isOpen,
+    toursForFlow,
     triggerCheck.shouldStart,
   ]);
 
@@ -360,7 +376,16 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     const maxIdx = Math.max(0, (fresh.steps?.length ?? 1) - 1);
     tour.startTour(fresh, Math.min(tour.currentStepIndex, maxIdx));
     debugInfo('Active tour definition refreshed from server', { tourId: fresh.id });
-  }, [toursForFlow, activeTours.loading, tour.isOpen, activeTour, tour, debugInfo]);
+  }, [
+    activeTours.loading,
+    activeTours.tours,
+    activeTour,
+    debugInfo,
+    tour.currentStepIndex,
+    tour.isOpen,
+    tour.startTour,
+    toursForFlow,
+  ]);
 
   const syncLocalFinishMarks = useCallback((tours: GuidedTour[]) => {
     for (const item of tours) {
@@ -417,8 +442,13 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       friction,
       frictionScore,
       triggerCheck,
-      resolver,
-      debug,
+      resolver.resolveTarget,
+      resolver.isResolving,
+      debug.info,
+      debug.warn,
+      debug.error,
+      debug.clearLogs,
+      debug.enabled,
       activeTours.loading,
       activeTours.error,
       start,

@@ -1,3 +1,5 @@
+import type { NormalizedSdkDockLayoutConfig, SdkDockLayoutConfig, SdkFaqDefaults } from './sdk-ui';
+
 export type PositionType =
   | 'TOP'
   | 'BOTTOM'
@@ -22,6 +24,8 @@ export type FrictionType =
   | 'FORM_ABANDONMENT'
   | 'NAVIGATION_BACK';
 
+export type { SdkDockLayoutConfig, SdkFaqDefaults, NormalizedSdkDockLayoutConfig } from './sdk-ui';
+
 export interface SDKConfig {
   apiKey: string;
   apiUrl?: string;
@@ -43,6 +47,16 @@ export interface SDKConfig {
   syncOnReconnect?: boolean;
   /** Force dismiss/complete user-state channel when both sandbox test and prod are active. */
   tourAudience?: 'sandbox' | 'production';
+  /**
+   * Collision-aware docking for FAQ help + contextual SDK chrome.
+   * **Enabled by default** (with host heuristics). Pass `dockLayout: false` to disable.
+   */
+  dockLayout?: SdkDockLayoutConfig | false;
+  /**
+   * Default FAQ / help sidebar options merged into `TourViewer` `faq` prop.
+   * Includes `presentation: 'sidebar'` by default. Pass `faqDefaults: false` to opt out.
+   */
+  faqDefaults?: SdkFaqDefaults | false;
 }
 
 export interface NormalizedSDKConfig {
@@ -61,6 +75,8 @@ export interface NormalizedSDKConfig {
   syncOnFocus: boolean;
   syncOnReconnect: boolean;
   tourAudience?: 'sandbox' | 'production';
+  dockLayout: NormalizedSdkDockLayoutConfig;
+  faqDefaults: SdkFaqDefaults | null;
 }
 
 export interface SDKInitResult {

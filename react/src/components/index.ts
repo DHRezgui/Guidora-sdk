@@ -15,3 +15,6 @@ export * from './TargetNotFoundFallback';
 export * from './TourRenderer';
 export * from './TourViewer';
 export * from './ContextualSuggestionsPublisher';
+export * from './FaqSearchWidget';
+export * from './FaqSearchPanel';
+export * from './HelpSidebar';
