@@ -53,6 +53,7 @@ export function collectFaqPageContext(partial?: Partial<FaqPageContext>): FaqPag
     tourStepTitle: partial?.tourStepTitle,
     projectDomain: partial?.projectDomain,
     suggestionKeywords: partial?.suggestionKeywords,
+    flowVersion: partial?.flowVersion,
   };
 }
 

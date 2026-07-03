@@ -99,9 +99,15 @@ export type {
 } from './utils/faq-theme';
 export type { ContextualFaqSuggestion } from './utils/faq-context';
 export {
+  DEFAULT_SDK_PROJECT_KEY,
+  resolveSdkProjectKey,
+} from './utils/sdk-project-key';
+export { resolveFaqProjectKey } from './utils/faq-project-key';
+export {
   fetchRemoteJourneyBlueprints,
   mergeLocalAndRemoteJourneyBlueprints,
   resolveJourneyBlueprintsRemoteUrl,
+  resolveRemoteBlueprintsProjectKey,
   resolveTourDraftOptionsWithRemoteBlueprints,
   clearRemoteJourneyBlueprintsCache,
 } from './utils/journey-blueprints-remote-client';

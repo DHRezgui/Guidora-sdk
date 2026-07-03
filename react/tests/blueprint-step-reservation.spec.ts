@@ -101,4 +101,77 @@ describe('blueprint step reservation (resolveDraftConflicts)', () => {
     const { drafts } = __resolveDraftConflictsForTests([blueprintDraft]);
     expect(drafts[0].steps).toHaveLength(2);
   });
+
+  it('preserves authored step order after cross-draft conflict resolution', () => {
+    const workspaceBlueprint = makeDraft({
+      name: 'Workspace onboarding',
+      origin: {
+        kind: 'blueprint',
+        blueprintId: 'productivity.workspace-onboarding',
+        vertical: 'productivity',
+        resolvedSteps: 4,
+        declaredSteps: 4,
+      },
+      score: 86,
+      confidence: 100,
+      steps: [
+        {
+          title: 'Dashboard overview',
+          content: 'Overview',
+          targetSelector: '[data-tour-id="dashboard-stats"]',
+          orderIndex: 0,
+          stabilityScore: 90,
+        },
+        {
+          title: 'Search workspace',
+          content: 'Search',
+          targetSelector: '[data-tour-id="search-task"]',
+          orderIndex: 1,
+          stabilityScore: 90,
+        },
+        {
+          title: 'Create project',
+          content: 'Create',
+          targetSelector: '[data-tour-id="add-project"]',
+          orderIndex: 2,
+          stabilityScore: 90,
+        },
+        {
+          title: 'Import data',
+          content: 'Import',
+          targetSelector: '[data-tour-id="import-data"]',
+          orderIndex: 3,
+          stabilityScore: 90,
+        },
+      ],
+    });
+
+    const heuristicDraft = makeDraft({
+      name: 'Heuristic add project',
+      origin: { kind: 'heuristic' },
+      score: 100,
+      confidence: 79,
+      steps: [
+        {
+          title: 'Heuristic CTA',
+          content: 'Competing primary action',
+          targetSelector: '[data-tour-id="add-project"]',
+          orderIndex: 0,
+          semanticRoleConfidence: 0.99,
+          stabilityScore: 22,
+        },
+      ],
+    });
+
+    const { drafts } = __resolveDraftConflictsForTests([heuristicDraft, workspaceBlueprint]);
+    const workspace = drafts.find((draft) => draft.name === 'Workspace onboarding');
+
+    expect(workspace?.steps.map((step) => step.title)).toEqual([
+      'Dashboard overview',
+      'Search workspace',
+      'Create project',
+      'Import data',
+    ]);
+    expect(workspace?.steps.map((step) => step.orderIndex)).toEqual([0, 1, 2, 3]);
+  });
 });

@@ -19,9 +19,12 @@ import { selectActiveBlueprints } from './journey-blueprints';
 import { resolveTourDraftOptionsWithRemoteBlueprints } from './journey-blueprints-remote-client';
 import { BlueprintResolutionReport } from './journey-resolver';
 import {
+  applyProjectScopedBlueprintRankingBoost,
+  isActiveProjectScopedBlueprintDraft,
   planContextualGenerationMode,
   resolveEffectiveContextualMode,
   resolveGenerationPathFromPlan,
+  selectBlueprintDraftsForAutoHybrid,
 } from './contextual-generation-mode';
 import {
   buildSemanticPageSnapshot,
@@ -1171,7 +1174,9 @@ function resolveDraftConflicts(
 
   const resolvedDrafts = drafts
     .map((draft, index) => {
-      const keptSteps = recomputeStepOrderIndex(stepsByDraftName.get(draft.name) || []);
+      const keptSteps = recomputeStepOrderIndex(
+        sortStepsByAuthoredOrder(stepsByDraftName.get(draft.name) || []),
+      );
       const conflictNotes = conflicts
         .filter((conflict) => conflict.loserDraft === draft.name || conflict.winnerDraft === draft.name)
         .map((conflict) => `${conflict.selector}: ${conflict.reason}`);
@@ -3726,6 +3731,11 @@ function recomputeStepOrderIndex(steps: Step[]): Step[] {
   return steps.map((step, index) => ({ ...step, orderIndex: index }));
 }
 
+/** Restore authored step order after conflict resolution (map iteration is nondeterministic). */
+function sortStepsByAuthoredOrder(steps: Step[]): Step[] {
+  return [...steps].sort((left, right) => (left.orderIndex ?? 0) - (right.orderIndex ?? 0));
+}
+
 function dedupeDraftStepTitles(steps: Step[]): Step[] {
   const counts = new Map<string, number>();
   return steps.map((step) => {
@@ -5823,6 +5833,7 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
     if (!blueprintDraft.flowVersioning) {
       blueprintDraft.flowVersioning = buildFlowVersioningMetadata(blueprintDraft, options);
     }
+    applyProjectScopedBlueprintRankingBoost(blueprintDraft, options);
     if (
       options?.feedbackEnabled === true &&
       blueprintDraft.origin?.kind === 'blueprint'
@@ -5833,14 +5844,18 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
       }
     }
   }
+  const blueprintDraftsForPipeline = selectBlueprintDraftsForAutoHybrid(
+    blueprintOutcome.drafts,
+    resolvedOptions,
+  );
   // Blueprint drafts are appended last so they don't get pre-empted by
   // legacy `drafts.push` ordering, but they sort to the top later via score.
-  drafts.push(...blueprintOutcome.drafts);
+  drafts.push(...blueprintDraftsForPipeline);
 
   // `blueprintsExclusive`: when at least one blueprint produced a draft and
   // the host opted in, drop the heuristic drafts entirely.
   let filteredByExclusive = drafts;
-  if (options?.blueprintsExclusive === true && blueprintOutcome.drafts.length > 0) {
+  if (options?.blueprintsExclusive === true && blueprintDraftsForPipeline.length > 0) {
     filteredByExclusive = drafts.filter((d) => d.origin?.kind === 'blueprint');
   }
 
@@ -5901,6 +5916,11 @@ export function generateContextualTourDrafts(options?: TourDraftGenerationOption
     const aIsBlueprint = a.origin?.kind === 'blueprint' ? 1 : 0;
     const bIsBlueprint = b.origin?.kind === 'blueprint' ? 1 : 0;
     if (aIsBlueprint !== bIsBlueprint) return bIsBlueprint - aIsBlueprint;
+
+    const aProject = isActiveProjectScopedBlueprintDraft(a, options) ? 1 : 0;
+    const bProject = isActiveProjectScopedBlueprintDraft(b, options) ? 1 : 0;
+    if (bProject !== aProject) return bProject - aProject;
+
     return b.score - a.score;
   });
   const limited = blueprintFirst.slice(0, maxDrafts);

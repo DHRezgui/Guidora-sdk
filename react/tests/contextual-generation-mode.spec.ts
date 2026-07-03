@@ -1,8 +1,12 @@
 import {
+  applyProjectScopedBlueprintRankingBoost,
   blueprintDraftResolutionRatio,
   filterAutoQualifyingBlueprintDrafts,
+  isActiveProjectScopedBlueprintDraft,
   planContextualGenerationMode,
+  rankBlueprintDraftsForAuto,
   resolveEffectiveContextualMode,
+  selectBlueprintDraftsForAutoHybrid,
 } from '../src/utils/contextual-generation-mode';
 import {
   inferJourneyVerticalsFromText,
@@ -32,6 +36,35 @@ function blueprintDraft(resolved: number, declared: number): SuggestedTourDraft 
       vertical: 'fintech',
       resolvedSteps: resolved,
       declaredSteps: declared,
+    },
+  };
+}
+
+function namedBlueprintDraft(partial: {
+  name: string;
+  blueprintId: string;
+  score: number;
+  confidence: number;
+  priority: number;
+  resolved: number;
+  declared: number;
+  catalogSource?: 'builtin' | 'pack' | 'remote-project';
+  projectKey?: string;
+}): SuggestedTourDraft {
+  return {
+    ...blueprintDraft(partial.resolved, partial.declared),
+    name: partial.name,
+    score: partial.score,
+    confidence: partial.confidence,
+    priority: partial.priority,
+    origin: {
+      kind: 'blueprint',
+      blueprintId: partial.blueprintId,
+      vertical: 'productivity',
+      resolvedSteps: partial.resolved,
+      declaredSteps: partial.declared,
+      catalogSource: partial.catalogSource,
+      projectKey: partial.projectKey,
     },
   };
 }
@@ -189,5 +222,151 @@ describe('contextual-generation-mode', () => {
     expect(plan.effectiveMode).toBe('heuristic');
     expect(plan.autoDecision).toBeNull();
     expect(plan.prefetchedBlueprintOutcome.reports).toHaveLength(0);
+  });
+
+  it('caps auto hybrid to one blueprint draft when maxDrafts is 2', () => {
+    const drafts = [
+      namedBlueprintDraft({
+        name: 'Workspace onboarding',
+        blueprintId: 'productivity.workspace-onboarding',
+        score: 86,
+        confidence: 100,
+        priority: 10,
+        resolved: 4,
+        declared: 4,
+      }),
+      namedBlueprintDraft({
+        name: 'Task management',
+        blueprintId: 'productivity.task-management',
+        score: 80,
+        confidence: 100,
+        priority: 8,
+        resolved: 3,
+        declared: 3,
+      }),
+    ];
+
+    const selected = selectBlueprintDraftsForAutoHybrid(drafts, { mode: 'auto', maxDrafts: 2 });
+    expect(selected).toHaveLength(1);
+    expect(selected[0]?.origin?.kind === 'blueprint' && selected[0].origin.blueprintId).toBe(
+      'productivity.workspace-onboarding',
+    );
+  });
+
+  it('prefers fuller workspace-style blueprints when scores tie in auto ranking', () => {
+    const ranked = rankBlueprintDraftsForAuto([
+      namedBlueprintDraft({
+        name: 'Task management',
+        blueprintId: 'productivity.task-management',
+        score: 100,
+        confidence: 100,
+        priority: 8,
+        resolved: 3,
+        declared: 3,
+      }),
+      namedBlueprintDraft({
+        name: 'Workspace onboarding',
+        blueprintId: 'productivity.workspace-onboarding',
+        score: 100,
+        confidence: 100,
+        priority: 10,
+        resolved: 4,
+        declared: 4,
+      }),
+    ]);
+
+    expect(
+      ranked[0]?.origin?.kind === 'blueprint' ? ranked[0].origin.blueprintId : null,
+    ).toBe('productivity.workspace-onboarding');
+  });
+
+  it('prefers project-scoped remote blueprints over built-ins at equal score', () => {
+    const builtin = namedBlueprintDraft({
+      name: 'Creation premiere ressource',
+      blueprintId: 'saas.first-resource-creation',
+      score: 100,
+      confidence: 100,
+      priority: 10,
+      resolved: 3,
+      declared: 3,
+      catalogSource: 'builtin',
+    });
+    const projectRemote = namedBlueprintDraft({
+      name: 'Portfolio Pulse',
+      blueprintId: 'custom.test13.portfolio-pulse',
+      score: 100,
+      confidence: 100,
+      priority: 8,
+      resolved: 3,
+      declared: 3,
+      catalogSource: 'remote-project',
+      projectKey: 'test-13-v1',
+    });
+
+    const ranked = rankBlueprintDraftsForAuto([builtin, projectRemote], {
+      flowVersion: 'test-13-v1',
+    });
+
+    expect(
+      ranked[0]?.origin?.kind === 'blueprint' ? ranked[0].origin.blueprintId : null,
+    ).toBe('custom.test13.portfolio-pulse');
+    expect(isActiveProjectScopedBlueprintDraft(projectRemote, { flowVersion: 'test-13-v1' })).toBe(
+      true,
+    );
+    expect(isActiveProjectScopedBlueprintDraft(builtin, { flowVersion: 'test-13-v1' })).toBe(false);
+  });
+
+  it('selects project remote blueprint in auto hybrid cap over built-in', () => {
+    const selected = selectBlueprintDraftsForAutoHybrid(
+      [
+        namedBlueprintDraft({
+          name: 'Built-in',
+          blueprintId: 'saas.first-resource-creation',
+          score: 100,
+          confidence: 100,
+          priority: 10,
+          resolved: 3,
+          declared: 3,
+          catalogSource: 'builtin',
+        }),
+        namedBlueprintDraft({
+          name: 'Portfolio Pulse',
+          blueprintId: 'custom.test13.portfolio-pulse',
+          score: 98,
+          confidence: 100,
+          priority: 8,
+          resolved: 3,
+          declared: 3,
+          catalogSource: 'remote-project',
+          projectKey: 'test-13-v1',
+        }),
+      ],
+      { mode: 'auto', maxDrafts: 2, flowVersion: 'test-13-v1' },
+    );
+
+    expect(selected).toHaveLength(1);
+    expect(selected[0]?.origin?.kind === 'blueprint' && selected[0].origin.blueprintId).toBe(
+      'custom.test13.portfolio-pulse',
+    );
+  });
+
+  it('applies score boost to project remote drafts below the cap', () => {
+    const draft = namedBlueprintDraft({
+      name: 'Portfolio Pulse',
+      blueprintId: 'custom.test13.portfolio-pulse',
+      score: 90,
+      confidence: 100,
+      priority: 8,
+      resolved: 3,
+      declared: 3,
+      catalogSource: 'remote-project',
+      projectKey: 'test-13-v1',
+    });
+
+    applyProjectScopedBlueprintRankingBoost(draft, { flowVersion: 'test-13-v1' });
+    expect(draft.score).toBe(100);
+    expect(draft.reasons.some((reason) => reason.includes('project-scoped blueprint ranking boost'))).toBe(
+      true,
+    );
   });
 });

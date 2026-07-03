@@ -1,6 +1,7 @@
 import {
   mergeLocalAndRemoteJourneyBlueprints,
   resolveJourneyBlueprintsRemoteUrl,
+  resolveRemoteBlueprintsProjectKey,
 } from '../src/utils/journey-blueprints-remote-client';
 import { selectActiveBlueprints } from '../src/utils/journey-blueprints';
 import type { JourneyBlueprint } from '../src/types';
@@ -42,7 +43,16 @@ describe('mergeLocalAndRemoteJourneyBlueprints', () => {
     const merged = mergeLocalAndRemoteJourneyBlueprints([localBp], [remoteBp]);
     expect(merged).toHaveLength(2);
     expect(merged[0].id).toBe('custom.local.only');
+    expect(merged[0].catalogSource).toBe('pack');
     expect(merged[1].id).toBe('custom.remote.only');
+    expect(merged[1].catalogSource).toBe('remote-project');
+    expect(merged[1].projectKey).toBe('default');
+  });
+
+  it('tags remote rows with the active projectKey', () => {
+    const merged = mergeLocalAndRemoteJourneyBlueprints([], [remoteBp], 'test-13-v1');
+    expect(merged[0].projectKey).toBe('test-13-v1');
+    expect(merged[0].catalogSource).toBe('remote-project');
   });
 });
 
@@ -80,5 +90,15 @@ describe('resolveJourneyBlueprintsRemoteUrl', () => {
       publishConfig: { apiUrl: 'http://localhost:3002/api/v1' },
     });
     expect(url).toBe('http://localhost:3002/api/v1/tours/contextual/blueprints');
+  });
+});
+
+describe('resolveRemoteBlueprintsProjectKey', () => {
+  it('uses flowVersion when set', () => {
+    expect(resolveRemoteBlueprintsProjectKey({ flowVersion: 'test-13-v1' })).toBe('test-13-v1');
+  });
+
+  it('defaults to generic corpus when flowVersion is absent', () => {
+    expect(resolveRemoteBlueprintsProjectKey()).toBe('default');
   });
 });

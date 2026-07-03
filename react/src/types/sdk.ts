@@ -305,6 +305,9 @@ export interface JourneyStepBlueprint {
    * step cannot be resolved (neither on the current page nor cross-page), the
    * entire blueprint is rejected and no draft is produced. Non-required steps
    * are silently skipped when unresolvable.
+   *
+   * At runtime, required steps also map to `skipAllowed: false` on the
+   * generated tour step so end users cannot click "Passer" on them.
    */
   required?: boolean;
   /**
@@ -403,6 +406,16 @@ export interface JourneyBlueprint {
    * resolution). Defaults to 0.
    */
   priority?: number;
+  /**
+   * Provenance for ranking: built-in SDK catalogue, host opt-in pack, or
+   * dashboard-published row scoped to a projectKey / flowVersion.
+   */
+  catalogSource?: 'builtin' | 'pack' | 'remote-project';
+  /**
+   * Dashboard project scope (`flowVersion`) for `remote-project` blueprints.
+   * Set by the remote merge layer; not required in stored payloads.
+   */
+  projectKey?: string;
 }
 
 export type TourPersona = 'admin' | 'support' | 'manager' | 'editor' | 'viewer' | 'operator' | 'other';
@@ -792,7 +805,15 @@ export interface SuggestedTourDraft extends GuidedTour {
    * developer can tell at a glance which generation strategy fired.
    */
   origin?:
-    | { kind: 'blueprint'; blueprintId: string; vertical: JourneyVertical; resolvedSteps: number; declaredSteps: number }
+    | {
+        kind: 'blueprint';
+        blueprintId: string;
+        vertical: JourneyVertical;
+        resolvedSteps: number;
+        declaredSteps: number;
+        catalogSource?: 'builtin' | 'pack' | 'remote-project';
+        projectKey?: string;
+      }
     | { kind: 'heuristic' };
   metadata?: {
     previewContext?: PageStructuralSnapshot;
@@ -906,6 +927,13 @@ export interface TourDraftGenerationOptions {
    * which can false-match unrelated pages (generic buttons/tabs). Default `0.8`.
    */
   autoBlueprintMinResolutionRatio?: number;
+  /**
+   * In `mode: 'auto'` hybrid (blueprint + heuristic drafts): maximum blueprint
+   * drafts kept before heuristics fill remaining `maxDrafts` slots. Default:
+   * `max(1, maxDrafts - 1)` so a typical `maxDrafts: 2` scan yields one
+   * blueprint plus one heuristic without host-specific blueprint filtering.
+   */
+  autoBlueprintMaxDrafts?: number;
   /**
    * In `mode: 'auto'` only: when blueprint path is not taken, detect tabbed
    * shallow UIs (CRM, POS) and run the singlePageTour 7-slot chain instead of

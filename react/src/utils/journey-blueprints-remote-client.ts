@@ -6,6 +6,7 @@
 import { resolveSdkAuthBearerTokenFromSources } from '../core/auth-token';
 import { resolveSDKConfig } from '../core/sdk-state';
 import type { JourneyBlueprint, TourDraftGenerationOptions } from '../types';
+import { DEFAULT_SDK_PROJECT_KEY, resolveSdkProjectKey } from './sdk-project-key';
 
 export type RemoteBlueprintsFetchStatus = 'ok' | 'timeout' | 'error' | 'disabled' | 'unconfigured';
 
@@ -52,8 +53,14 @@ export function resolveJourneyBlueprintsRemoteUrl(
   return `${base}/tours/contextual/blueprints`;
 }
 
-function buildCacheKey(url: string, token: string | null): string {
-  return `${url}::${token ?? ''}`;
+function buildCacheKey(url: string, token: string | null, projectKey?: string): string {
+  const projectSegment = projectKey?.trim() || '';
+  return `${url}::${token ?? ''}::${projectSegment}`;
+}
+
+function appendProjectKeyToUrl(url: string, projectKey: string): string {
+  const separator = url.includes('?') ? '&' : '?';
+  return `${url}${separator}projectKey=${encodeURIComponent(projectKey)}`;
 }
 
 function isValidBlueprintShape(value: unknown): value is JourneyBlueprint {
@@ -84,15 +91,32 @@ function parseBlueprintsResponse(body: unknown): JourneyBlueprint[] {
 export function mergeLocalAndRemoteJourneyBlueprints(
   local: JourneyBlueprint[] | undefined,
   remote: JourneyBlueprint[],
+  projectKey?: string,
 ): JourneyBlueprint[] {
+  const scopedKey = projectKey?.trim() || DEFAULT_SDK_PROJECT_KEY;
   const result: JourneyBlueprint[] = [];
   if (local?.length) {
-    result.push(...local);
+    for (const blueprint of local) {
+      result.push({
+        ...blueprint,
+        catalogSource: blueprint.catalogSource ?? 'pack',
+      });
+    }
   }
-  if (remote.length) {
-    result.push(...remote);
+  for (const blueprint of remote) {
+    result.push({
+      ...blueprint,
+      catalogSource: 'remote-project',
+      projectKey: blueprint.projectKey?.trim() || scopedKey,
+    });
   }
   return result;
+}
+
+export function resolveRemoteBlueprintsProjectKey(
+  options?: Pick<TourDraftGenerationOptions, 'flowVersion'>,
+): string {
+  return resolveSdkProjectKey({ flowVersion: options?.flowVersion });
 }
 
 export async function fetchRemoteJourneyBlueprints(
@@ -102,6 +126,9 @@ export async function fetchRemoteJourneyBlueprints(
   if (!url) {
     return { status: 'unconfigured', blueprints: [] };
   }
+
+  const projectKey = resolveRemoteBlueprintsProjectKey(options);
+  const requestUrl = appendProjectKeyToUrl(url, projectKey);
 
   if (options?.journeyBlueprintsRemoteEnabled === false) {
     return { status: 'disabled', blueprints: [] };
@@ -130,7 +157,7 @@ export async function fetchRemoteJourneyBlueprints(
     debug,
   );
 
-  const cacheKey = buildCacheKey(url, token);
+  const cacheKey = buildCacheKey(requestUrl, token, projectKey);
   const now = Date.now();
   if (
     remoteBlueprintCache &&
@@ -153,7 +180,7 @@ export async function fetchRemoteJourneyBlueprints(
       headers.Authorization = `Bearer ${token}`;
     }
 
-    const response = await fetch(url, {
+    const response = await fetch(requestUrl, {
       method: 'GET',
       headers,
       signal: controller.signal,
@@ -217,6 +244,7 @@ export async function resolveTourDraftOptionsWithRemoteBlueprints(
   const merged = mergeLocalAndRemoteJourneyBlueprints(
     options.journeyBlueprints as JourneyBlueprint[] | undefined,
     remote,
+    resolveRemoteBlueprintsProjectKey(options),
   );
 
   return {

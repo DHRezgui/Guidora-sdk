@@ -1504,6 +1504,32 @@ html.trustdev-help-push-active {
   background: var(--td-faq-surface-hover);
 }
 
+.trustdev-faq-panel__result-feedback-btn:active {
+  transform: scale(0.96);
+}
+
+.trustdev-faq-panel__result-feedback-thanks {
+  width: 100%;
+  margin: 0;
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--td-faq-accent);
+  text-align: right;
+  animation: td-faq-feedback-thanks 0.22s ease-out;
+}
+
+@keyframes td-faq-feedback-thanks {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 .trustdev-help-sidebar__backdrop {
   position: absolute;
   inset: 0;

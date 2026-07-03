@@ -11,6 +11,7 @@ import { resolveAutoBlueprintVerticalScope } from './infer-journey-verticals';
 import { shouldAutoApplySinglePageTour } from './infer-single-page-tour';
 import { selectActiveBlueprints } from './journey-blueprints';
 import { getCachedRemoteJourneyBlueprints } from './journey-blueprints-remote-client';
+import { resolveSdkProjectKey } from './sdk-project-key';
 import {
   BlueprintResolutionOutcome,
   resolveBlueprintsToDrafts,
@@ -21,6 +22,46 @@ const EMPTY_BLUEPRINT_OUTCOME: BlueprintResolutionOutcome = { drafts: [], report
 
 /** Auto mode: avoid blueprint path on weak partial matches (e.g. 2/5 on a pet shop). */
 const DEFAULT_AUTO_BLUEPRINT_MIN_RESOLUTION_RATIO = 0.8;
+
+/** Ensures dashboard-published project blueprints outrank generic built-in packs. */
+export const PROJECT_SCOPED_BLUEPRINT_SCORE_BOOST = 15;
+
+export function isActiveProjectScopedBlueprintDraft(
+  draft: SuggestedTourDraft,
+  options?: TourDraftGenerationOptions,
+): boolean {
+  if (draft.origin?.kind !== 'blueprint') return false;
+  if (draft.origin.catalogSource !== 'remote-project') return false;
+
+  const activeProjectKey = resolveSdkProjectKey({ flowVersion: options?.flowVersion });
+  const blueprintProjectKey = draft.origin.projectKey?.trim() || activeProjectKey;
+  return blueprintProjectKey === activeProjectKey;
+}
+
+export function applyProjectScopedBlueprintRankingBoost(
+  draft: SuggestedTourDraft,
+  options?: TourDraftGenerationOptions,
+): void {
+  if (!isActiveProjectScopedBlueprintDraft(draft, options)) return;
+
+  const before = draft.score;
+  draft.score = Math.min(100, draft.score + PROJECT_SCOPED_BLUEPRINT_SCORE_BOOST);
+  if (draft.score !== before) {
+    draft.reasons.push(
+      `project-scoped blueprint ranking boost (+${PROJECT_SCOPED_BLUEPRINT_SCORE_BOOST})`,
+    );
+  }
+}
+
+function compareProjectScopedBlueprintDrafts(
+  left: SuggestedTourDraft,
+  right: SuggestedTourDraft,
+  options?: TourDraftGenerationOptions,
+): number {
+  const leftProject = isActiveProjectScopedBlueprintDraft(left, options) ? 1 : 0;
+  const rightProject = isActiveProjectScopedBlueprintDraft(right, options) ? 1 : 0;
+  return rightProject - leftProject;
+}
 
 export interface ContextualGenerationModePlan {
   effectiveMode: ContextualGenerationMode;
@@ -99,6 +140,60 @@ export function filterAutoQualifyingBlueprintDrafts(
     const ratio = blueprintDraftResolutionRatio(draft);
     return ratio !== null && ratio >= minRatio;
   });
+}
+
+/** Ranks competing blueprint drafts; project-published rows win over built-ins. */
+export function rankBlueprintDraftsForAuto(
+  drafts: SuggestedTourDraft[],
+  options?: TourDraftGenerationOptions,
+): SuggestedTourDraft[] {
+  return [...drafts].sort((left, right) => {
+    const projectBias = compareProjectScopedBlueprintDrafts(left, right, options);
+    if (projectBias !== 0) return projectBias;
+
+    if (right.score !== left.score) return right.score - left.score;
+    if (right.confidence !== left.confidence) return right.confidence - left.confidence;
+
+    const leftRatio = blueprintDraftResolutionRatio(left) ?? 0;
+    const rightRatio = blueprintDraftResolutionRatio(right) ?? 0;
+    if (rightRatio !== leftRatio) return rightRatio - leftRatio;
+
+    const leftResolved = left.origin?.kind === 'blueprint' ? left.origin.resolvedSteps : 0;
+    const rightResolved = right.origin?.kind === 'blueprint' ? right.origin.resolvedSteps : 0;
+    if (rightResolved !== leftResolved) return rightResolved - leftResolved;
+
+    const leftPriority = left.priority ?? 0;
+    const rightPriority = right.priority ?? 0;
+    if (rightPriority !== leftPriority) return rightPriority - leftPriority;
+
+    return left.name.localeCompare(right.name, 'fr');
+  });
+}
+
+/**
+ * Auto hybrid contract: reserve at least one `maxDrafts` slot for heuristics by
+ * capping how many blueprint drafts enter the shared conflict/dedupe pipeline.
+ */
+export function selectBlueprintDraftsForAutoHybrid(
+  blueprintDrafts: SuggestedTourDraft[],
+  options?: TourDraftGenerationOptions,
+): SuggestedTourDraft[] {
+  if (blueprintDrafts.length <= 1) return blueprintDrafts;
+  if (resolveEffectiveContextualMode(options) !== 'auto') return blueprintDrafts;
+  if (options?.blueprintsExclusive === true || options?.singlePageTour === true) {
+    return blueprintDrafts;
+  }
+
+  const maxDrafts = Math.max(1, options?.maxDrafts ?? 2);
+  const defaultCap = Math.max(1, maxDrafts - 1);
+  const explicitCap = options?.autoBlueprintMaxDrafts;
+  const cap =
+    typeof explicitCap === 'number' && Number.isFinite(explicitCap) && explicitCap > 0
+      ? Math.min(Math.floor(explicitCap), blueprintDrafts.length)
+      : Math.min(defaultCap, blueprintDrafts.length);
+
+  if (cap >= blueprintDrafts.length) return blueprintDrafts;
+  return rankBlueprintDraftsForAuto(blueprintDrafts, options).slice(0, cap);
 }
 
 function buildAutoDecisionReport(params: {

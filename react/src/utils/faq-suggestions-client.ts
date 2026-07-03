@@ -1,6 +1,7 @@
 import { resolveSdkAuthBearerTokenAsync } from '../core/auth-token';
 import type { NormalizedSDKConfig } from '../types';
 import type { FaqPageContext } from '../types/faq';
+import { resolveSdkProjectKey } from './sdk-project-key';
 
 export interface FaqSuggestionItem {
   id: string;
@@ -17,6 +18,7 @@ export interface FetchFaqSuggestionsOptions {
   context?: string;
   limit?: number;
   timeoutMs?: number;
+  projectKey?: string;
 }
 
 const DEFAULT_LIMIT = 4;
@@ -37,9 +39,10 @@ function buildCacheKey(
   config: NormalizedSDKConfig,
   context: string,
   limit: number,
+  projectKey: string,
 ): string {
   const tokenSuffix = config.sdkToken?.slice(-8) ?? config.apiKey.slice(-8);
-  return [config.apiUrl, tokenSuffix, context.trim().toLowerCase(), limit].join('::');
+  return [config.apiUrl, tokenSuffix, context.trim().toLowerCase(), limit, projectKey].join('::');
 }
 
 /** Builds a ranking context string from page/tour metadata. */
@@ -63,7 +66,8 @@ export async function fetchFaqSuggestions(
 ): Promise<FaqSuggestionItem[]> {
   const limit = Math.max(1, Math.min(options.limit ?? DEFAULT_LIMIT, 10));
   const context = options.context?.trim() ?? '';
-  const cacheKey = buildCacheKey(config, context, limit);
+  const projectKey = resolveSdkProjectKey({ projectKey: options.projectKey });
+  const cacheKey = buildCacheKey(config, context, limit, projectKey);
   const cached = suggestionsCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
     return cached.suggestions;
@@ -77,6 +81,7 @@ export async function fetchFaqSuggestions(
     const params = new URLSearchParams();
     params.set('limit', String(limit));
     if (context) params.set('context', context);
+    params.set('projectKey', projectKey);
 
     const headers: Record<string, string> = {
       Accept: 'application/json',

@@ -4,7 +4,7 @@ import type { FaqAudienceMode } from '../types/faq';
 import type { ContextualFaqSuggestion } from '../utils/faq-context';
 import type { FaqPageContext, FaqSemanticSearchResult, SDKConfig } from '../types';
 import { formatFaqCategoryLabel } from '../utils/faq-content';
-import { useFaqResultUsageTracking } from '../hooks/useFaqResultUsageTracking';
+import { useFaqResultUsageTracking, type FaqFeedbackChoice } from '../hooks/useFaqResultUsageTracking';
 
 function formatScore(score: number): string {
   return `${Math.round(Math.max(0, Math.min(1, score)) * 100)}%`;
@@ -15,6 +15,7 @@ interface FaqSearchResultCardProps {
   audience: FaqAudienceMode;
   showResultScore: boolean;
   showResultFeedback?: boolean;
+  feedbackChoice?: FaqFeedbackChoice | null;
   onFeedback?: (helpful: boolean) => void;
   onResultClick?: (result: FaqSemanticSearchResult) => void;
 }
@@ -24,6 +25,7 @@ function FaqSearchResultCard({
   audience,
   showResultScore,
   showResultFeedback = false,
+  feedbackChoice = null,
   onFeedback,
   onResultClick,
 }: FaqSearchResultCardProps) {
@@ -48,15 +50,37 @@ function FaqSearchResultCard({
       <p className="trustdev-faq-panel__result-answer">{result.answer}</p>
       {showResultFeedback && onFeedback ? (
         <div className="trustdev-faq-panel__result-feedback">
-          <span className="trustdev-faq-panel__result-feedback-label">Cette réponse vous aide ?</span>
-          <div className="trustdev-faq-panel__result-feedback-actions">
-            <button type="button" className="trustdev-faq-panel__result-feedback-btn" onClick={() => onFeedback(true)}>
-              Oui
-            </button>
-            <button type="button" className="trustdev-faq-panel__result-feedback-btn" onClick={() => onFeedback(false)}>
-              Non
-            </button>
-          </div>
+          {feedbackChoice ? (
+            <p className="trustdev-faq-panel__result-feedback-thanks" aria-live="polite">
+              Merci pour votre retour.
+            </p>
+          ) : (
+            <>
+              <span className="trustdev-faq-panel__result-feedback-label">Cette réponse vous aide ?</span>
+              <div className="trustdev-faq-panel__result-feedback-actions">
+                <button
+                  type="button"
+                  className="trustdev-faq-panel__result-feedback-btn"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onFeedback(true);
+                  }}
+                >
+                  Oui
+                </button>
+                <button
+                  type="button"
+                  className="trustdev-faq-panel__result-feedback-btn"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onFeedback(false);
+                  }}
+                >
+                  Non
+                </button>
+              </div>
+            </>
+          )}
         </div>
       ) : null}
     </>
@@ -141,7 +165,7 @@ export function FaqSearchPanel({
   const inputRef = useRef<HTMLInputElement>(null);
   const resolvedShowResultFeedback =
     showResultFeedback ?? (audience === 'end-user' && Boolean(trackingConfig));
-  const { submitFeedback } = useFaqResultUsageTracking(
+  const { submitFeedback, getFeedbackForResult } = useFaqResultUsageTracking(
     trackingConfig,
     faq.results,
     resolvedShowResultFeedback,
@@ -325,6 +349,7 @@ export function FaqSearchPanel({
                 audience={audience}
                 showResultScore={showResultScore}
                 showResultFeedback={resolvedShowResultFeedback}
+                feedbackChoice={getFeedbackForResult(result.id)}
                 onFeedback={(helpful) => submitFeedback(result.id, helpful)}
                 onResultClick={onResultClick}
               />

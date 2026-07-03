@@ -2,6 +2,8 @@ export interface FaqSemanticSearchRequest {
   question: string;
   topK?: number;
   minSimilarity?: number;
+  /** FAQ pack scoped to a host app / flow (aligns with `contextualSuggestions.flowVersion`). */
+  projectKey?: string;
 }
 
 export interface FaqSemanticSearchResult {
@@ -37,6 +39,8 @@ export interface FaqSearchOptions {
   timeoutMs?: number;             // défaut 120000 (premier appel ML lent)
   minQueryLength?: number;
   cacheTtlMs?: number;
+  /** FAQ pack / project key. Defaults to backend `default` when omitted. */
+  projectKey?: string;
 }
 
 /** Page / onboarding context passed to contextual FAQ suggestions. */
@@ -51,6 +55,8 @@ export interface FaqPageContext {
   projectDomain?: string;
   /** Extra keywords to rank FAQ suggestions for this page. */
   suggestionKeywords?: string[];
+  /** Host app / flow identifier for FAQ corpus scoping. */
+  flowVersion?: string;
 }
 
 export type FaqFrequentQuestionsMode = 'auto' | 'manual' | 'off';
@@ -145,4 +151,9 @@ export interface FaqWidgetOptions extends FaqSearchOptions, FaqContentOptions {
   /** Show helpful / not helpful actions under FAQ answers (default for end-user). */
   showResultFeedback?: boolean;
   className?: string;
+  /**
+   * FAQ pack key for semantic search and suggestions.
+   * When omitted, `pageContext.flowVersion` is used when available.
+   */
+  projectKey?: string;
 }

@@ -12,6 +12,9 @@
  *  3. Otherwise: mark the step unresolved. Required steps trigger rejection
  *     of the whole blueprint; optional steps are silently skipped.
  *
+ * Required steps also emit `skipAllowed: false` on the produced tour step so
+ * the runtime UI hides the "Passer" action for mandatory funnel steps.
+ *
  * Drafts produced here carry `origin = { kind: 'blueprint', ... }` so the
  * debug panel and the publisher can distinguish them from legacy heuristic
  * drafts.
@@ -76,6 +79,11 @@ interface InternalLink {
 }
 
 const DEFAULT_MIN_RESOLVED_STEPS = 2;
+
+/** Mandatory blueprint steps must not expose the runtime "Skip" action. */
+export function blueprintStepSkipAllowed(step: Pick<JourneyStepBlueprint, 'required'>): boolean {
+  return step.required !== true;
+}
 
 // ============================================================================
 // Public API
@@ -731,7 +739,7 @@ function assembleBlueprintDraft(
       action,
       stepType: 'tooltip',
       highlightElement: true,
-      skipAllowed: true,
+      skipAllowed: blueprintStepSkipAllowed(record.step),
       orderIndex: index,
     };
   });
@@ -770,6 +778,8 @@ function assembleBlueprintDraft(
       vertical: blueprint.vertical,
       resolvedSteps: resolvedSteps.length,
       declaredSteps: blueprint.steps.length,
+      catalogSource: blueprint.catalogSource,
+      projectKey: blueprint.projectKey,
     },
     triggerConditions: {
       contextualEngine: {
@@ -940,4 +950,13 @@ function normalize(value: string): string {
     .replace(/[^a-z0-9\s]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+/** @internal test-only — assembles a draft from pre-resolved step records. */
+export function __assembleBlueprintDraftForTests(
+  blueprint: JourneyBlueprint,
+  resolvedSteps: ResolvedStepRecord[],
+  currentTargetUrl: string,
+): SuggestedTourDraft {
+  return assembleBlueprintDraft(blueprint, resolvedSteps, currentTargetUrl);
 }

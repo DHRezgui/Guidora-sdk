@@ -414,7 +414,7 @@ import '@trustdev/onboarding-sdk-react/styles.css'
 
 /**
  * TrustDev — resolution-first auto mode (blueprint when DOM resolves, else heuristic).
- * SDK defaults cover FAQ sidebar, push layout, semantic wiring, and noise filtering.
+ * SDK auto wiring keeps one primary blueprint draft and reserves a heuristic slot.
  * Initialized via: trustdev-init --mode=auto${singlePage ? ' --single-page-tour' : ''}
  */
 export function TrustdevOnboarding() {

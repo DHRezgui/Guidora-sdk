@@ -110,6 +110,7 @@ const CONTEXTUAL_AUTO_WIRING: Partial<UseContextualTourSuggestionsOptions> = {
   flowVersioningEnabled: true,
   minConfidence: 45,
   maxDrafts: 2,
+  blueprintsExclusive: false,
   publishScenario: 'simple',
   autoPublish: false,
   persona: 'admin',

@@ -22,6 +22,7 @@ import {
   resolveInitHostAvoidSelectors,
 } from '../utils/sdk-ui-defaults';
 import { resolveContextualTourViewerOptions } from '../utils/sdk-auto-defaults';
+import { resolveSdkProjectKey } from '../utils/sdk-project-key';
 
 const VALID_INTENTS: TourDraftIntent[] = ['discovery', 'primary-action', 'support-navigation', 'form-flow'];
 const NAVIGATION_CLICK_RESUME_DELAY_MS = 5000;
@@ -799,10 +800,17 @@ export function TourViewer({
     }
   }, [config]);
 
-  const resolvedFaq = useMemo(
-    () => mergeTourViewerFaqOptions(sdkUiConfig.faqDefaults, faq),
-    [sdkUiConfig.faqDefaults, faq],
-  );
+  const resolvedFaq = useMemo(() => {
+    const merged = mergeTourViewerFaqOptions(sdkUiConfig.faqDefaults, faq);
+    if (!merged) return merged;
+    return {
+      ...merged,
+      projectKey: resolveSdkProjectKey({
+        projectKey: merged.projectKey,
+        flowVersion: contextualSuggestions?.flowVersion,
+      }),
+    };
+  }, [sdkUiConfig.faqDefaults, faq, contextualSuggestions?.flowVersion]);
 
   const mergedHostAvoidSelectors = useMemo(
     () => resolveInitHostAvoidSelectors(sdkUiConfig.dockLayout, hostAvoidSelectors),
@@ -1861,6 +1869,7 @@ export function TourViewer({
               tourName: onboarding.activeTour?.name,
               tourStepTitle: onboarding.tour.currentStep?.title,
               projectDomain: resolvedContextualSuggestions?.projectDomain,
+              flowVersion: resolvedFaq.projectKey,
             }}
             config={{
               ...(config ?? {}),

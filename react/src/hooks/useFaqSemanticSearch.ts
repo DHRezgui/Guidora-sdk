@@ -50,6 +50,7 @@ export function useFaqSemanticSearch(
       timeoutMs: options?.timeoutMs,
       minQueryLength: options?.minQueryLength,
       cacheTtlMs: options?.cacheTtlMs,
+      projectKey: options?.projectKey,
     }),
     [
       options?.topK,
@@ -57,6 +58,7 @@ export function useFaqSemanticSearch(
       options?.timeoutMs,
       options?.minQueryLength,
       options?.cacheTtlMs,
+      options?.projectKey,
     ],
   );
 

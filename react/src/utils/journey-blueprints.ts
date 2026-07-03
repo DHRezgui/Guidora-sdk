@@ -2002,7 +2002,12 @@ export function selectActiveBlueprints(
     for (const vertical of activeVerticals) {
       const builtins = BUILTIN_BLUEPRINTS[vertical];
       if (builtins) {
-        result.push(...builtins);
+        result.push(
+          ...builtins.map((blueprint) => ({
+            ...blueprint,
+            catalogSource: blueprint.catalogSource ?? 'builtin',
+          })),
+        );
       }
     }
   }

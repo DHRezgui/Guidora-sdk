@@ -60,3 +60,14 @@ export async function trackFaqFeedback(
     trackedFeedback.delete(dedupeKey);
   }
 }
+
+/** Restores UI state after the help panel unmounts (sidebar close) within the same page session. */
+export function readFaqFeedbackChoice(
+  config: NormalizedSDKConfig,
+  faqId: string,
+): 'helpful' | 'not_helpful' | null {
+  const prefix = `${config.apiUrl}::${faqId}::`;
+  if (trackedFeedback.has(`${prefix}yes`)) return 'helpful';
+  if (trackedFeedback.has(`${prefix}no`)) return 'not_helpful';
+  return null;
+}

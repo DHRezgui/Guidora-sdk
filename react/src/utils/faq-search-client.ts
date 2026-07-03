@@ -7,6 +7,7 @@ import type {
   FaqSemanticSearchResponse,
   FaqSemanticSearchResult,
 } from '../types/faq';
+import { resolveSdkProjectKey } from './sdk-project-key';
 
 /** First FAQ call may load Sentence Transformers in Python (30–120 s); align with backend FAQ_PYTHON_TIMEOUT_MS. */
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -37,6 +38,7 @@ function buildCacheKey(config: NormalizedSDKConfig, request: FaqSemanticSearchRe
     normalizeFaqQuery(request.question),
     request.topK ?? DEFAULT_TOP_K,
     request.minSimilarity ?? '',
+    request.projectKey ?? '',
   ].join('::');
 }
 
@@ -96,10 +98,13 @@ export async function searchFaq(
     };
   }
 
+  const projectKey = resolveSdkProjectKey({ projectKey: options?.projectKey });
+
   const request: FaqSemanticSearchRequest = {
     question: trimmed,
     topK: options?.topK ?? DEFAULT_TOP_K,
     ...(options?.minSimilarity !== undefined ? { minSimilarity: options.minSimilarity } : {}),
+    projectKey,
   };
 
   const cacheTtlMs = options?.cacheTtlMs ?? 60_000;

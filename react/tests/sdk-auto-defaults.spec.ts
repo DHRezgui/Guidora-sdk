@@ -76,6 +76,8 @@ describe('sdk-auto-defaults', () => {
     expect(resolved?.persona).toBe('admin');
     expect(resolved?.businessObjectives?.length).toBeGreaterThan(0);
     expect(resolved?.semanticHints?.length).toBeGreaterThan(0);
+    expect(resolved?.maxDrafts).toBe(2);
+    expect(resolved?.blueprintsExclusive).toBe(false);
   });
 
   it('allows contextual persona override in auto mode', () => {

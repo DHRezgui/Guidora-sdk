@@ -12,6 +12,7 @@ import {
   resolveContextualSuggestionsEnabled,
   resolveFaqContentOptions,
 } from '../utils/faq-content';
+import { resolveFaqProjectKey } from '../utils/faq-project-key';
 import { FaqSearchPanel } from './FaqSearchPanel';
 import { useFaqTheme } from '../hooks/useFaqThemeMode';
 import { useHelpTabEdgeInset } from '../hooks/useHelpTabEdgeInset';
@@ -92,6 +93,7 @@ export function HelpSidebar({
   starterQuestions,
   frequentQuestionsMode,
   frequentQuestionsLimit,
+  projectKey,
 }: HelpSidebarProps) {
   const themeVars = useThemeCssVars(theme);
   const resolvedPushTargetSelector = useMemo(
@@ -118,6 +120,21 @@ export function HelpSidebar({
   const tabEdgeInset = useHelpTabEdgeInset(resolvedSide, enabled && !open);
   const [query, setQuery] = useState('');
 
+  const resolvedContext = useMemo(
+    () =>
+      collectFaqPageContext({
+        organizationId: config?.organizationId,
+        ...pageContext,
+        ...runtimePageContext,
+      }),
+    [config?.organizationId, pageContext, runtimePageContext],
+  );
+
+  const resolvedProjectKey = useMemo(
+    () => resolveFaqProjectKey({ projectKey, pageContext: resolvedContext }),
+    [projectKey, resolvedContext],
+  );
+
   const faq = useFaqSemanticSearch({
     config,
     enabled: enabled && open,
@@ -126,6 +143,7 @@ export function HelpSidebar({
     timeoutMs,
     minQueryLength,
     cacheTtlMs,
+    projectKey: resolvedProjectKey,
   });
 
   const contentOptions = useMemo(
@@ -154,16 +172,6 @@ export function HelpSidebar({
     ],
   );
 
-  const resolvedContext = useMemo(
-    () =>
-      collectFaqPageContext({
-        organizationId: config?.organizationId,
-        ...pageContext,
-        ...runtimePageContext,
-      }),
-    [config?.organizationId, pageContext, runtimePageContext],
-  );
-
   const contextSummary = useMemo(
     () => formatFaqContextLabel(resolvedContext, contentOptions.contextDisplay),
     [contentOptions.contextDisplay, resolvedContext],
@@ -177,6 +185,7 @@ export function HelpSidebar({
       mode: contentOptions.frequentQuestionsMode,
       manualQuestions: contentOptions.starterQuestions,
       limit: contentOptions.frequentQuestionsLimit,
+      projectKey: resolvedProjectKey,
     });
 
   const suggestionsLabel =

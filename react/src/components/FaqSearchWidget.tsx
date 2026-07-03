@@ -5,6 +5,7 @@ import { useHelpDockSide } from '../hooks/useHelpDockSide';
 import type { FaqContentOptions, FaqPageContext, FaqSemanticSearchResult, SDKConfig } from '../types';
 import { collectFaqPageContext } from '../utils/faq-context';
 import { resolveFaqContentOptions } from '../utils/faq-content';
+import { resolveFaqProjectKey } from '../utils/faq-project-key';
 import { FaqSearchPanel } from './FaqSearchPanel';
 import { useFaqTheme } from '../hooks/useFaqThemeMode';
 import { OnboardingTheme, useThemeCssVars } from './theme';
@@ -88,6 +89,7 @@ export function FaqSearchWidget({
   frequentQuestionsMode,
   frequentQuestionsLimit,
   pageContext,
+  projectKey,
 }: FaqSearchWidgetProps) {
   const contentOptions = useMemo(
     () =>
@@ -122,6 +124,10 @@ export function FaqSearchWidget({
       }),
     [config?.organizationId, pageContext],
   );
+  const resolvedProjectKey = useMemo(
+    () => resolveFaqProjectKey({ projectKey, pageContext: resolvedContext }),
+    [projectKey, resolvedContext],
+  );
   const themeVars = useThemeCssVars(theme);
   const faqTheme = useFaqTheme(themeMode, hostThemeReference);
   const preferredSide = useMemo(() => preferredWidgetSide(position, side), [position, side]);
@@ -145,6 +151,7 @@ export function FaqSearchWidget({
       mode: contentOptions.frequentQuestionsMode,
       manualQuestions: contentOptions.starterQuestions,
       limit: contentOptions.frequentQuestionsLimit,
+      projectKey: resolvedProjectKey,
     });
 
   const faq = useFaqSemanticSearch({
@@ -155,6 +162,7 @@ export function FaqSearchWidget({
     timeoutMs,
     minQueryLength,
     cacheTtlMs,
+    projectKey: resolvedProjectKey,
   });
 
   const submitSearch = useCallback(() => {

@@ -6,6 +6,7 @@ import {
   buildFaqSuggestionContext,
   fetchFaqSuggestions,
 } from '../utils/faq-suggestions-client';
+import { resolveFaqProjectKey } from '../utils/faq-project-key';
 
 export interface UseFaqFrequentQuestionsOptions {
   config?: Partial<SDKConfig>;
@@ -14,6 +15,7 @@ export interface UseFaqFrequentQuestionsOptions {
   mode?: FaqFrequentQuestionsMode;
   manualQuestions?: string[];
   limit?: number;
+  projectKey?: string;
 }
 
 export function useFaqFrequentQuestions(
@@ -26,6 +28,10 @@ export function useFaqFrequentQuestions(
   const suggestionContext = useMemo(
     () => buildFaqSuggestionContext(options.context),
     [options.context],
+  );
+  const resolvedProjectKey = useMemo(
+    () => resolveFaqProjectKey({ projectKey: options.projectKey, pageContext: options.context }),
+    [options.context, options.projectKey],
   );
 
   const [questions, setQuestions] = useState<string[]>([]);
@@ -53,6 +59,7 @@ export function useFaqFrequentQuestions(
         const suggestions = await fetchFaqSuggestions(resolvedConfig, {
           context: suggestionContext,
           limit,
+          projectKey: resolvedProjectKey,
         });
         if (cancelled) return;
         setQuestions(suggestions.map((item) => item.question));
@@ -66,7 +73,7 @@ export function useFaqFrequentQuestions(
     return () => {
       cancelled = true;
     };
-  }, [enabled, limit, manualQuestions, mode, options.config, suggestionContext]);
+  }, [enabled, limit, manualQuestions, mode, options.config, resolvedProjectKey, suggestionContext]);
 
   return { questions, isLoading };
 }
