@@ -8,6 +8,8 @@ import { PositionType, SDKConfig, Step, TourDraftIntent } from '../types';
 import { UseContextualTourSuggestionsOptions } from '../hooks/useContextualTourSuggestions';
 import { ContextualSuggestionsPublisher, ContextualSuggestionsUIMode } from './ContextualSuggestionsPublisher';
 import { FaqSearchWidget } from './FaqSearchWidget';
+import { ProactiveHelpToast } from './ProactiveHelpToast';
+import { AbandonmentDebugPanel } from './AbandonmentDebugPanel';
 import { HelpSidebar } from './HelpSidebar';
 import type { FaqWidgetOptions } from '../types/faq';
 import { OnboardingTheme } from './theme';
@@ -23,6 +25,7 @@ import {
 } from '../utils/sdk-ui-defaults';
 import { resolveContextualTourViewerOptions } from '../utils/sdk-auto-defaults';
 import { resolveSdkProjectKey } from '../utils/sdk-project-key';
+import { measureDebugPanelStackOffsets } from '../utils/debug-panel-stack';
 
 const VALID_INTENTS: TourDraftIntent[] = ['discovery', 'primary-action', 'support-navigation', 'form-flow'];
 const NAVIGATION_CLICK_RESUME_DELAY_MS = 5000;
@@ -812,6 +815,15 @@ export function TourViewer({
     };
   }, [sdkUiConfig.faqDefaults, faq, contextualSuggestions?.flowVersion]);
 
+  const resolvedAbandonmentPrediction = useMemo(() => {
+    if (!config || config.abandonmentPrediction === false) return null;
+    return config.abandonmentPrediction ?? null;
+  }, [config]);
+
+  const proactiveHelpEnabled = Boolean(
+    resolvedAbandonmentPrediction?.enabled && resolvedAbandonmentPrediction?.proactiveHelp,
+  );
+
   const mergedHostAvoidSelectors = useMemo(
     () => resolveInitHostAvoidSelectors(sdkUiConfig.dockLayout, hostAvoidSelectors),
     [sdkUiConfig.dockLayout, hostAvoidSelectors],
@@ -891,6 +903,7 @@ export function TourViewer({
     autoStart: effectiveAutoStart,
     debug,
     activeFlowVersion: contextualSuggestions?.flowVersion,
+    abandonmentPrediction: resolvedAbandonmentPrediction ?? undefined,
   });
 
   resolveTargetRef.current = onboarding.resolver.resolveTarget;
@@ -1708,6 +1721,62 @@ export function TourViewer({
     ),
   });
 
+  const contextualDebugVisible = Boolean(
+    resolvedContextualSuggestions && !isSdkChromeSuspendedDuringTour,
+  );
+  const [abandonmentDockOffsets, setAbandonmentDockOffsets] = useState(() =>
+    measureDebugPanelStackOffsets(false),
+  );
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+
+    let frame = 0;
+    let resizeObserver: ResizeObserver | null = null;
+    let mutationObserver: MutationObserver | null = null;
+
+    const apply = () => {
+      frame = 0;
+      setAbandonmentDockOffsets(measureDebugPanelStackOffsets(contextualDebugVisible));
+    };
+    const schedule = () => {
+      if (frame) return;
+      frame = window.requestAnimationFrame(apply);
+    };
+
+    const observeContextual = (): boolean => {
+      const el = document.querySelector('[data-trustdev-contextual-panel]');
+      if (!(el instanceof HTMLElement) || typeof ResizeObserver === 'undefined') {
+        return false;
+      }
+      resizeObserver?.disconnect();
+      resizeObserver = new ResizeObserver(schedule);
+      resizeObserver.observe(el);
+      schedule();
+      return true;
+    };
+
+    schedule();
+    window.addEventListener('resize', schedule);
+
+    if (!observeContextual() && contextualDebugVisible) {
+      mutationObserver = new MutationObserver(() => {
+        if (observeContextual()) {
+          mutationObserver?.disconnect();
+          mutationObserver = null;
+        }
+      });
+      mutationObserver.observe(document.body, { childList: true, subtree: true });
+    }
+
+    return () => {
+      window.removeEventListener('resize', schedule);
+      if (frame) window.cancelAnimationFrame(frame);
+      resizeObserver?.disconnect();
+      mutationObserver?.disconnect();
+    };
+  }, [contextualDebugVisible, dockLayout.contextualSide]);
+
   const recordRuntimeFeedback = useCallback(
     (event: 'shown' | 'clicked' | 'completed' | 'skipped', selectorOverride?: string) => {
       if (!runtimeFeedbackEnabled || !activeTourIntent) return;
@@ -1852,6 +1921,29 @@ export function TourViewer({
           }}
         />
       ) : null}
+      {debug && resolvedAbandonmentPrediction?.enabled ? (
+        <AbandonmentDebugPanel
+          developerMode={debug}
+          title="Abandon — debug"
+          dockSide={dockLayout.contextualSide}
+          dockOffsetPx={abandonmentDockOffsets.offsetX}
+          dockBottomOffsetPx={abandonmentDockOffsets.offsetY}
+          threshold={resolvedAbandonmentPrediction.threshold ?? 0.35}
+          minConfidence={
+            resolvedAbandonmentPrediction.minConfidence ?? undefined
+          }
+          proactiveHelp={resolvedAbandonmentPrediction.proactiveHelp !== false}
+          proactiveIdleToast={resolvedAbandonmentPrediction.proactiveIdleToast !== false}
+          proactiveIdleMinSeconds={resolvedAbandonmentPrediction.proactiveIdleMinSeconds}
+          sessionIntent={onboarding.abandonmentSessionIntent}
+          intentPolicy={onboarding.abandonmentIntentPolicy}
+          assistanceState={onboarding.assistanceState}
+          assistanceMlPaused={onboarding.assistanceMlPaused}
+          abandonment={onboarding.abandonmentPrediction}
+          friction={onboarding.friction}
+          frictionScore={onboarding.frictionScore}
+        />
+      ) : null}
       {resolvedFaq &&
       resolvedFaq.enabled !== false &&
       !isSdkChromeSuspendedDuringTour ? (
@@ -1875,7 +1967,10 @@ export function TourViewer({
               ...(config ?? {}),
               ...(resolvedFaq.config ?? {}),
             }}
-            onOpenChange={setHelpSidebarOpen}
+            onOpenChange={(open) => {
+              setHelpSidebarOpen(open);
+              onboarding.assistance.reportFaqOpen(open);
+            }}
           />
         ) : (
           <FaqSearchWidget
@@ -1887,8 +1982,30 @@ export function TourViewer({
               ...(config ?? {}),
               ...(resolvedFaq.config ?? {}),
             }}
+            onOpenChange={(open) => {
+              onboarding.assistance.reportFaqOpen(open);
+            }}
           />
         )
+      ) : null}
+      {proactiveHelpEnabled && resolvedFaq?.enabled ? (
+        <ProactiveHelpToast
+          enabled={
+            onboarding.assistanceState === 'none' ||
+            onboarding.assistanceState === 'proactiveToast'
+          }
+          themeMode={resolvedFaq.themeMode ?? 'host'}
+          hostThemeReference={resolvedFaq.hostThemeReference}
+          onVisibleChange={onboarding.assistance.reportProactiveToastVisible}
+          onOpenHelp={(request) => {
+            if (!request.openFaq) return;
+            // proactiveToast → faq before opening sidebar.
+            onboarding.assistance.reportFaqOpen(true);
+            if (resolvedFaq.presentation === 'sidebar') {
+              setHelpSidebarOpen(true);
+            }
+          }}
+        />
       ) : null}
     </>
   );

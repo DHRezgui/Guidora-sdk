@@ -1,5 +1,6 @@
 import { TourProgress } from '../types';
 
+const ORG_VISITS_KEY_PREFIX = 'trustdev_sdk_org_visits:';
 const SESSION_KEY = 'trustdev_sdk_session_id';
 const VISITS_KEY_PREFIX = 'trustdev_sdk_visits:';
 const PROGRESS_KEY_PREFIX = 'trustdev_sdk_progress:';
@@ -56,6 +57,23 @@ export function getVisitCount(pageUrl: string): number {
   const storage = safeStorage();
   if (!storage) return 0;
   return Number(storage.getItem(`${VISITS_KEY_PREFIX}${pageUrl}`) || 0);
+}
+
+export function increaseOrganizationVisitCount(organizationId: string): number {
+  const storage = safeStorage();
+  if (!storage || !organizationId) return 1;
+
+  const key = `${ORG_VISITS_KEY_PREFIX}${organizationId}`;
+  const current = Number(storage.getItem(key) || 0);
+  const next = current + 1;
+  storage.setItem(key, String(next));
+  return next;
+}
+
+export function getOrganizationVisitCount(organizationId: string): number {
+  const storage = safeStorage();
+  if (!storage || !organizationId) return 0;
+  return Number(storage.getItem(`${ORG_VISITS_KEY_PREFIX}${organizationId}`) || 0);
 }
 
 export function saveTourProgress(progress: TourProgress): void {

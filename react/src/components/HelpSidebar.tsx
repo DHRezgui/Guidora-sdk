@@ -1,4 +1,5 @@
 import { CSSProperties, useCallback, useEffect, useMemo, useState } from 'react';
+import { subscribeProactiveHelp } from '../utils/proactive-help-bus';
 import { useFaqSemanticSearch, type UseFaqSemanticSearchOptions } from '../hooks/useFaqSemanticSearch';
 import { useFaqFrequentQuestions } from '../hooks/useFaqFrequentQuestions';
 import { useHelpDockSide } from '../hooks/useHelpDockSide';
@@ -117,8 +118,20 @@ export function HelpSidebar({
   });
   const resolvedSide = resolvedDockSide ?? autoDockSide;
   const [open, setOpen] = useState(!startCollapsed);
-  const tabEdgeInset = useHelpTabEdgeInset(resolvedSide, enabled && !open);
+  // Keep measuring while open so overlay panels can clear an inner host scrollbar.
+  const tabEdgeInset = useHelpTabEdgeInset(resolvedSide, enabled, open);
   const [query, setQuery] = useState('');
+
+  useEffect(() => {
+    if (!enabled) return;
+    return subscribeProactiveHelp((request) => {
+      if (!request.openFaq) return;
+      setOpen(true);
+      if (request.suggestedQuery?.trim()) {
+        setQuery(request.suggestedQuery.trim());
+      }
+    });
+  }, [enabled]);
 
   const resolvedContext = useMemo(
     () =>
@@ -279,7 +292,15 @@ export function HelpSidebar({
         ...themeVars,
         ...faqTheme.cssVars,
         ...style,
-        ...(tabEdgeInset > 0 ? { '--td-help-tab-edge-inset': `${tabEdgeInset}px` } : {}),
+        ...(tabEdgeInset > 0
+          ? {
+              '--td-help-tab-edge-inset': `${tabEdgeInset}px`,
+              // Push layout already shrinks the host; only overlay needs panel clearance.
+              ...(sidebarLayout === 'overlay' && open
+                ? { '--td-help-panel-edge-inset': `${tabEdgeInset}px` }
+                : {}),
+            }
+          : {}),
       }}
     >
       {!open ? (

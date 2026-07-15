@@ -306,6 +306,10 @@ const DEFAULT_NOISE_SELECTORS = [
   '[data-tour-id="contextual-debug-panel"]',
   '[data-trustdev-contextual-panel]',
   '[aria-label="Trustdev contextual suggestions panel"]',
+  // Trustdev abandonment debug panel (fixed bottom-left/right in debug mode).
+  '.trustdev-abandonment-debug-panel',
+  '[data-trustdev-abandonment-panel]',
+  '[aria-label="Trustdev abandonment debug panel"]',
   // Trustdev FAQ / help chrome.
   '.trustdev-faq-widget',
   '[data-tour-id="trustdev-faq-widget"]',
@@ -320,11 +324,15 @@ const CONTEXTUAL_PANEL_SELECTOR_MARKERS = [
   'contextual-debug-panel',
   'trustdev-contextual-panel',
   'trustdev-contextual-debug-panel',
+  'trustdev-abandonment-panel',
+  'trustdev-abandonment-debug-panel',
   'trustdev-faq-widget',
   'trustdev-help-sidebar',
 ] as const;
 
 function isTrustdevContextualPanelElement(element: HTMLElement): boolean {
+  if (element.closest('[data-trustdev-abandonment-panel]')) return true;
+  if (element.closest('.trustdev-abandonment-debug-panel')) return true;
   if (element.closest('[data-trustdev-contextual-panel]')) return true;
   if (element.closest('[data-trustdev-faq-panel]')) return true;
   if (element.closest('[data-trustdev-help-sidebar]')) return true;
@@ -338,6 +346,7 @@ function isTrustdevContextualPanelElement(element: HTMLElement): boolean {
   if (element.closest('[data-tour-id="trustdev-faq-widget"]')) return true;
   if (element.closest('[data-tour-id="trustdev-help-sidebar"]')) return true;
   const aria = normalizeText(element.getAttribute('aria-label') || '');
+  if (aria === 'trustdev abandonment debug panel') return true;
   if (aria === 'trustdev contextual suggestions panel') return true;
   return false;
 }
@@ -345,6 +354,7 @@ function isTrustdevContextualPanelElement(element: HTMLElement): boolean {
 export function isTrustdevContextualPanelSelector(selector?: string): boolean {
   if (!selector) return false;
   const normalized = normalizeText(selector);
+  if (normalized.includes('trustdev abandonment debug panel')) return true;
   if (normalized.includes('trustdev contextual suggestions panel')) return true;
   return CONTEXTUAL_PANEL_SELECTOR_MARKERS.some((marker) => selector.includes(marker));
 }

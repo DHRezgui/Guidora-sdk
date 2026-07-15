@@ -236,10 +236,7 @@ export function ContextualSuggestionsPublisher({
       aria-label="Trustdev contextual suggestions panel"
       style={{
         position: 'fixed',
-        bottom: 16,
         zIndex: 'calc(var(--td-z-index) + 10)',
-        width: 360,
-        maxWidth: 'calc(100vw - 24px)',
         maxHeight: mode === 'debug' ? '72vh' : 'calc(100vh - 24px)',
         overflow: 'auto',
         borderRadius: 14,

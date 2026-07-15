@@ -7,11 +7,31 @@ import {
   getActiveTourSessionStorageKey,
   isActiveTourSnapshotCompatible,
 } from '../utils/tour-flow-version';
-import { increaseVisitCount } from '../utils/storage';
+import { increaseVisitCount, increaseOrganizationVisitCount, getOrganizationVisitCount } from '../utils/storage';
 import { getCurrentPageUrl } from '../utils/url';
 import { useActiveToursForUrl } from './useActiveToursForUrl';
 import { useFrictionDetection } from './useFrictionDetection';
 import { useFrictionScore } from './useFrictionScore';
+import { useAbandonmentPrediction } from './useAbandonmentPrediction';
+import type {
+  AbandonmentPredictionClientResult,
+  AssistanceState,
+  SdkAbandonmentPredictionConfig,
+} from '../types/ml';
+import { countAbandonmentSignals } from '../utils/abandonment-features';
+import {
+  defaultAbandonmentMinConfidence,
+  evaluateAbandonmentToastEligibility,
+} from '../utils/abandonment-confidence';
+import {
+  resolveAbandonmentIntentPolicy,
+  resolveAbandonmentSessionIntent,
+} from '../utils/abandonment-session-intent';
+import {
+  ASSISTANCE_ML_RESUME_DELAY_MS,
+  canTransitionAssistance,
+} from '../utils/assistance-orchestrator';
+import { normalizeFrictionScore } from '../utils/friction-scoring';
 import { useOnboardingDebug } from './useOnboardingDebug';
 import { useOnboardingSession } from './useOnboardingSession';
 import { useRealtimeToursSync } from './useRealtimeToursSync';
@@ -24,6 +44,9 @@ import {
   isTourFinishedLocally,
   markTourFinishedForAudience,
 } from '../utils/tour-audience-finish';
+import { requestProactiveHelp } from '../utils/proactive-help-bus';
+
+export type { AssistanceState } from '../types/ml';
 
 export interface UseOnboardingOptions {
   config?: Partial<SDKConfig>;
@@ -32,6 +55,15 @@ export interface UseOnboardingOptions {
   role?: string;
   /** When set (e.g. contextualSuggestions.flowVersion), only active tours for this flow are started. */
   activeFlowVersion?: string;
+  /** Opt-in LightGBM abandonment prediction. Omitted or `enabled: false` keeps legacy friction-only behavior. */
+  abandonmentPrediction?: SdkAbandonmentPredictionConfig | false;
+}
+
+export interface AssistanceController {
+  /** Notify FAQ / sidebar open or close (manual or toast CTA). */
+  reportFaqOpen: (open: boolean) => void;
+  /** Notify proactive toast dismissed / auto-hidden (visible=false). */
+  reportProactiveToastVisible: (visible: boolean) => void;
 }
 
 type ActiveTourSessionSnapshot = {
@@ -202,6 +234,267 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     organizationId: options?.config?.organizationId,
   });
   const frictionScore = useFrictionScore(friction.counters);
+  const abandonmentConfig =
+    options?.abandonmentPrediction === false ? null : options?.abandonmentPrediction ?? null;
+  const organizationId = options?.config?.organizationId ?? '';
+  const [organizationVisitCount, setOrganizationVisitCount] = useState(() =>
+    getOrganizationVisitCount(organizationId),
+  );
+
+  useEffect(() => {
+    if (!organizationId) return;
+    setOrganizationVisitCount(increaseOrganizationVisitCount(organizationId));
+  }, [organizationId]);
+
+  const sessionIntent = useMemo(() => {
+    const signals = friction.getSignals();
+    return resolveAbandonmentSessionIntent({
+      explicitIntent: abandonmentConfig?.sessionIntent,
+      isTourActive: Boolean(activeTour && tour.isOpen),
+      organizationVisitCount,
+      pageVisitCount: signals.pageVisitCount,
+    });
+  }, [
+    abandonmentConfig?.sessionIntent,
+    activeTour,
+    tour.isOpen,
+    organizationVisitCount,
+    friction.counters.navigationBack,
+    friction.counters.clickMiss,
+  ]);
+
+  const intentPolicy = useMemo(
+    () => resolveAbandonmentIntentPolicy(abandonmentConfig, sessionIntent),
+    [abandonmentConfig, sessionIntent],
+  );
+
+  /** Orchestrator only when abandonment ML is opted in — otherwise legacy behavior. */
+  const orchestrationEnabled = abandonmentConfig?.enabled === true;
+
+  const [assistanceState, setAssistanceState] = useState<AssistanceState>('none');
+  const assistanceStateRef = useRef<AssistanceState>('none');
+  assistanceStateRef.current = assistanceState;
+
+  const [mlPausedUntil, setMlPausedUntil] = useState(0);
+  const [, setMlResumeTick] = useState(0);
+
+  useEffect(() => {
+    if (!orchestrationEnabled) {
+      setAssistanceState('none');
+      setMlPausedUntil(0);
+    }
+  }, [orchestrationEnabled]);
+
+  useEffect(() => {
+    if (mlPausedUntil <= Date.now()) return undefined;
+    const delay = Math.max(0, mlPausedUntil - Date.now());
+    const timer = window.setTimeout(() => setMlResumeTick((n) => n + 1), delay);
+    return () => window.clearTimeout(timer);
+  }, [mlPausedUntil]);
+
+  /**
+   * Single writer for assistanceState. Components only call the public
+   * `assistance` reporters — they must not set this state directly.
+   */
+  const transitionAssistance = useCallback(
+    (next: AssistanceState, meta?: { resetFriction?: boolean }) => {
+      if (!orchestrationEnabled) return false;
+      const from = assistanceStateRef.current;
+      if (!canTransitionAssistance(from, next)) {
+        debugWarn('Assistance transition rejected', { from, next });
+        return false;
+      }
+      if (from === next) return true;
+
+      if (from === 'none' && next !== 'none') {
+        friction.signalHelpTriggered();
+      }
+
+      if (from === 'tour' && next === 'none') {
+        friction.reset();
+        setMlPausedUntil(Date.now() + ASSISTANCE_ML_RESUME_DELAY_MS);
+      }
+
+      if (meta?.resetFriction && next === 'none' && from !== 'tour') {
+        friction.reset();
+      }
+
+      assistanceStateRef.current = next;
+      setAssistanceState(next);
+      debugWarn('Assistance transition', { from, next });
+      return true;
+    },
+    [debugWarn, friction, orchestrationEnabled],
+  );
+
+  // Tour owns `assistanceState === 'tour'` while open.
+  useEffect(() => {
+    if (!orchestrationEnabled) return;
+    if (tour.isOpen) {
+      transitionAssistance('tour');
+      return;
+    }
+    if (assistanceStateRef.current === 'tour') {
+      transitionAssistance('none');
+    }
+  }, [orchestrationEnabled, tour.isOpen, transitionAssistance]);
+
+  // Freeze friction while any assistance channel is active.
+  useEffect(() => {
+    if (!orchestrationEnabled) return;
+    if (assistanceState === 'none') {
+      friction.start();
+    } else {
+      friction.stop();
+    }
+  }, [assistanceState, friction, orchestrationEnabled]);
+
+  const reportFaqOpen = useCallback(
+    (open: boolean) => {
+      if (!orchestrationEnabled) return;
+      if (open) {
+        transitionAssistance('faq');
+      } else if (assistanceStateRef.current === 'faq') {
+        transitionAssistance('none');
+      }
+    },
+    [orchestrationEnabled, transitionAssistance],
+  );
+
+  const reportProactiveToastVisible = useCallback(
+    (visible: boolean) => {
+      if (!orchestrationEnabled) return;
+      if (visible) return;
+      if (assistanceStateRef.current === 'proactiveToast') {
+        transitionAssistance('none');
+      }
+    },
+    [orchestrationEnabled, transitionAssistance],
+  );
+
+  const assistance = useMemo<AssistanceController>(
+    () => ({
+      reportFaqOpen,
+      reportProactiveToastVisible,
+    }),
+    [reportFaqOpen, reportProactiveToastVisible],
+  );
+
+  const mlAssistancePaused =
+    orchestrationEnabled &&
+    (assistanceState !== 'none' || Date.now() < mlPausedUntil);
+
+  const proactiveCooldownUntilRef = useRef(0);
+  const abandonmentResultRef = useRef<AbandonmentPredictionClientResult | null>(null);
+
+  const tryProactiveAbandonmentHelp = useCallback(() => {
+    if (!abandonmentConfig?.proactiveHelp) return;
+
+    if (orchestrationEnabled) {
+      if (assistanceStateRef.current !== 'none') return;
+      if (Date.now() < mlPausedUntil) return;
+    } else if (activeTour && tour.isOpen) {
+      // Legacy path when abandonment orchestrator is off.
+      return;
+    }
+
+    const signals = friction.getSignals();
+    const signalCount = countAbandonmentSignals(friction.counters);
+    const verdict = evaluateAbandonmentToastEligibility({
+      result: abandonmentResultRef.current,
+      threshold: abandonmentConfig.threshold ?? 0.5,
+      minConfidence: abandonmentConfig.minConfidence ?? defaultAbandonmentMinConfidence(),
+      proactiveHelp: true,
+      sessionSeconds: signals.elapsedSeconds,
+      signalCount,
+      intentPolicy,
+      idle: {
+        seconds: signals.idleSeconds,
+        localRisk: normalizeFrictionScore(frictionScore.score),
+        signalCount,
+        enabled: abandonmentConfig.proactiveIdleToast !== false,
+        minSeconds: intentPolicy.proactiveIdleMinSeconds,
+        minLocalRisk: intentPolicy.proactiveIdleMinLocalRisk,
+        minSignals: intentPolicy.proactiveIdleMinSignals,
+      },
+    });
+
+    if (!verdict.eligible) return;
+
+    const now = Date.now();
+    const cooldownMs = abandonmentConfig.proactiveCooldownMs ?? 60_000;
+    if (now < proactiveCooldownUntilRef.current) return;
+
+    if (orchestrationEnabled) {
+      const accepted = transitionAssistance('proactiveToast');
+      if (!accepted) return;
+    }
+
+    proactiveCooldownUntilRef.current = now + cooldownMs;
+    if (!orchestrationEnabled) {
+      friction.signalHelpTriggered();
+    }
+    requestProactiveHelp({
+      message:
+        abandonmentConfig.proactiveToastMessage ??
+        'Souhaitez-vous consulter l’aide ?',
+      // Never auto-open help UI — the toast CTA must confirm (less intrusive).
+      openFaq: false,
+      suggestedQuery: abandonmentConfig.proactiveSuggestedQuery,
+    });
+    debugWarn('Proactive abandonment help triggered', {
+      cooldownMs,
+      via: verdict.via,
+      intent: sessionIntent,
+      reason: verdict.reason,
+    });
+  }, [
+    abandonmentConfig,
+    activeTour,
+    friction,
+    frictionScore.score,
+    intentPolicy,
+    mlPausedUntil,
+    orchestrationEnabled,
+    sessionIntent,
+    tour.isOpen,
+    transitionAssistance,
+    debugWarn,
+  ]);
+
+  const abandonmentPrediction = useAbandonmentPrediction({
+    enabled: abandonmentConfig?.enabled === true,
+    paused: mlAssistancePaused,
+    threshold: intentPolicy.threshold,
+    pollIntervalMs: abandonmentConfig?.pollIntervalMs,
+    minSignals: intentPolicy.minSignals,
+    cacheTtlMs: abandonmentConfig?.cacheTtlMs,
+    config: options?.config,
+    counters: friction.counters,
+    getSignals: friction.getSignals,
+    localScore: frictionScore,
+    sessionId: session.sessionId,
+    debug: options?.debug,
+    intentPolicy,
+    onHighRisk: () => {
+      tryProactiveAbandonmentHelp();
+    },
+  });
+
+  abandonmentResultRef.current = abandonmentPrediction.result;
+
+  useEffect(() => {
+    if (!abandonmentConfig?.proactiveHelp) return;
+    tryProactiveAbandonmentHelp();
+  }, [abandonmentConfig?.proactiveHelp, abandonmentPrediction.result, friction.counters, tryProactiveAbandonmentHelp]);
+
+  useEffect(() => {
+    if (!abandonmentConfig?.proactiveHelp) return;
+    const intervalId = window.setInterval(() => {
+      tryProactiveAbandonmentHelp();
+    }, 5_000);
+    return () => window.clearInterval(intervalId);
+  }, [abandonmentConfig?.proactiveHelp, tryProactiveAbandonmentHelp]);
 
   const triggerCheck = useTourTriggerConditions(activeTour?.triggerConditions, {
     currentRole: options?.role,
@@ -425,6 +718,12 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       tour,
       friction,
       frictionScore,
+      abandonmentPrediction,
+      abandonmentSessionIntent: sessionIntent,
+      abandonmentIntentPolicy: intentPolicy,
+      assistanceState,
+      assistanceMlPaused: mlAssistancePaused,
+      assistance,
       triggerCheck,
       resolver,
       debug,
@@ -441,6 +740,12 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       tour,
       friction,
       frictionScore,
+      abandonmentPrediction,
+      sessionIntent,
+      intentPolicy,
+      assistanceState,
+      mlAssistancePaused,
+      assistance,
       triggerCheck,
       resolver.resolveTarget,
       resolver.isResolving,

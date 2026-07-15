@@ -119,6 +119,11 @@ Options:
   --yes, -y                     Non-interactive (no prompts, overwrite component)
   --help, -h                    Show this help
 
+Notes:
+  Generated configs enable abandonment ML + proactive help with SDK defaults
+  (intent policies). Override thresholds only if needed; disable with
+  NEXT_PUBLIC_TRUSTDEV_ABANDONMENT=false in .env.local.
+
 Blueprint packs: ${Object.keys(BLUEPRINT_PACKS).join(', ')}
 
 Examples:
@@ -276,6 +281,22 @@ function formatFaqBlock() {
       }}`;
 }
 
+/**
+ * Universal abandonment wiring for lab/e2e scaffolds.
+ * - Friction listeners already run with TourViewer; this opts into ML + toast + debug panel.
+ * - No host-specific thresholds (unlike ad-hoc test_13 lab tuning) — SDK intent policies apply.
+ * - Kill-switch: NEXT_PUBLIC_TRUSTDEV_ABANDONMENT=false
+ */
+function formatAbandonmentConfigLines() {
+  return `      // Friction tracking is always on with TourViewer; this enables ML predict + proactive toast.
+      // Thresholds/confidence come from SDK intent policies (no host-specific bias).
+      // Disable: NEXT_PUBLIC_TRUSTDEV_ABANDONMENT=false
+      abandonmentPrediction: {
+        enabled: process.env.NEXT_PUBLIC_TRUSTDEV_ABANDONMENT !== 'false',
+        proactiveHelp: true,
+      },`;
+}
+
 function buildBlueprintsComponentTemplate(flowVersionName, packKey) {
   const pack = BLUEPRINT_PACKS[packKey] || BLUEPRINT_PACKS.fintech;
 
@@ -287,7 +308,7 @@ import '@trustdev/onboarding-sdk-react/styles.css'
 
 /**
  * TrustDev — contextual generation with blueprint preset "${pack.preset}".
- * SDK defaults cover FAQ sidebar, push layout, and semantic wiring.
+ * SDK defaults cover FAQ sidebar, push layout, semantic wiring, and abandonment help.
  * Initialized via: trustdev-init --mode=blueprints --pack=${packKey}
  */
 export function TrustdevOnboarding() {
@@ -303,6 +324,7 @@ export function TrustdevOnboarding() {
       debug: true,
       syncEnabled: true,
       syncIntervalMs: 8000,
+${formatAbandonmentConfigLines()}
     }),
     [sdkToken],
   )
@@ -338,7 +360,7 @@ import '@trustdev/onboarding-sdk-react/styles.css'
 
 /**
  * TrustDev — contextual generation with journeyBlueprints (${pack.label}).
- * SDK defaults cover FAQ sidebar, push layout, and semantic wiring.
+ * SDK defaults cover FAQ sidebar, push layout, semantic wiring, and abandonment help.
  * Initialized via: trustdev-init --mode=blueprints --pack=${packKey}
  */
 export function TrustdevOnboarding() {
@@ -354,6 +376,7 @@ export function TrustdevOnboarding() {
       debug: true,
       syncEnabled: true,
       syncIntervalMs: 8000,
+${formatAbandonmentConfigLines()}
     }),
     [sdkToken],
   )
@@ -430,6 +453,7 @@ export function TrustdevOnboarding() {
       debug: true,
       syncEnabled: true,
       syncIntervalMs: 8000,
+${formatAbandonmentConfigLines()}
     }),
     [sdkToken],
   )
@@ -518,6 +542,7 @@ export function TrustdevOnboarding() {
       syncIntervalMs: 8000,
       trackBatchSize: 20,
       trackFlushIntervalMs: 5000,
+${formatAbandonmentConfigLines()}
     }),
     [sdkToken],
   )
@@ -931,6 +956,9 @@ function printSummary(results, initOptions) {
     console.log(`🏷️  ${results.tourId.status}: ${results.tourId.path}`);
   }
   console.log(`🔐 ${results.env.changed ? 'Updated' : 'Checked'}: ${results.env.path}`);
+  console.log(
+    '🧠 Abandonment: enabled by default (SDK intent policies). Disable with NEXT_PUBLIC_TRUSTDEV_ABANDONMENT=false',
+  );
 
   if (results.layout.status === 'missing') {
     console.log(`⚠️  Layout: ${results.layout.warning}`);

@@ -12,6 +12,7 @@ import {
   TrackEventInput,
   TrackEventResponse,
 } from '../types';
+import type { AbandonmentPredictionRequest, AbandonmentPredictionResponse } from '../types/ml';
 import { resolveSdkAuthBearerTokenAsync } from './auth-token';
 
 async function buildHeaders(config: NormalizedSDKConfig): Promise<Record<string, string>> {
@@ -215,6 +216,16 @@ export const sdkApiClient = {
     payload: FaqSemanticSearchRequest,
   ): Promise<FaqSemanticSearchResponse> {
     return request<FaqSemanticSearchResponse>(config, '/faq/semantic-search', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  predictAbandonment(
+    config: NormalizedSDKConfig,
+    payload: AbandonmentPredictionRequest,
+  ): Promise<AbandonmentPredictionResponse> {
+    return request<AbandonmentPredictionResponse>(config, '/ml/predictions/abandonment', {
       method: 'POST',
       body: JSON.stringify(payload),
     });

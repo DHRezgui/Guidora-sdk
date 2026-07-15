@@ -225,6 +225,64 @@ V2 expose egalement:
 - Recuperer les drafts proposes.
 - Les modifier avant de les enregistrer ou de les publier.
 
+## Prédiction d'abandon (LightGBM)
+
+Fonctionnalité **opt-in** (`abandonmentPrediction.enabled: false` par défaut). Le score de friction local (`useFrictionScore`) reste le fallback silencieux si l'API ML est indisponible.
+
+### Prérequis
+
+- Scope PAT `ml:predict` (Paramètres → Tokens SDK)
+- Modèle chargé côté backend (`GET /ml/predictions/health` → `modelLoaded: true`)
+- Pour l'aide proactive + FAQ : scope `faq:search` et `faq={{ enabled: true }}`
+
+### Configuration minimale (`TourViewer`)
+
+```tsx
+<TourViewer
+  config={{
+    ...sdkConfig,
+    abandonmentPrediction: {
+      enabled: true,
+      threshold: 0.5,
+      proactiveHelp: true,
+      proactiveOpenFaq: true,
+      proactiveCooldownMs: 60_000,
+    },
+  }}
+  faq={{ enabled: true, presentation: 'sidebar' }}
+/>
+```
+
+### Comportement
+
+1. Le SDK collecte les signaux de friction (`useFrictionDetection`).
+2. Après `minSignals` (défaut 2), il appelle `POST /ml/predictions/abandonment` (cache 20s).
+3. Si l'API échoue → fallback local sans erreur visible.
+4. Si le risque dépasse le seuil → toast Phoenix + ouverture FAQ (cooldown 60s).
+
+### Hooks bas niveau
+
+```tsx
+import {
+  useAbandonmentPrediction,
+  useFrictionDetection,
+  useFrictionScore,
+  AbandonmentRiskBadge,
+  ProactiveHelpToast,
+} from '@trustdev/onboarding-sdk-react';
+```
+
+### Tests
+
+```bash
+# SDK (unitaires)
+cd sdks/react && npm test -- --testPathPattern="abandonment|proactive-help"
+
+# Backend (unitaires + e2e scope PAT)
+cd backend && npm test -- prediction.service.spec
+cd backend && npm run test:e2e:sdk -- ml-sdk.e2e-spec
+```
+
 ## FAQ in-app (recherche semantique)
 
 Le `TourViewer` peut afficher une aide contextuelle via la prop `faq`. Deux presentations sont disponibles :

@@ -1,6 +1,7 @@
 export function getCurrentPageUrl(): string {
   if (typeof window === 'undefined') return '/';
-  return window.location.pathname + window.location.search;
+  // Include hash so SPA view switches via #section (or ?view=) are distinct "pages".
+  return window.location.pathname + window.location.search + window.location.hash;
 }
 
 export function getCurrentDevice(): 'mobile' | 'tablet' | 'desktop' {

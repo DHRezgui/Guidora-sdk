@@ -1,4 +1,5 @@
 import type { NormalizedSdkDockLayoutConfig, SdkDockLayoutConfig, SdkFaqDefaults } from './sdk-ui';
+import type { SdkAbandonmentPredictionConfig } from './ml';
 
 export type PositionType =
   | 'TOP'
@@ -57,6 +58,8 @@ export interface SDKConfig {
    * Includes `presentation: 'sidebar'` by default. Pass `faqDefaults: false` to opt out.
    */
   faqDefaults?: SdkFaqDefaults | false;
+  /** Opt-in LightGBM abandonment prediction (`enabled` defaults to false). */
+  abandonmentPrediction?: SdkAbandonmentPredictionConfig | false;
 }
 
 export interface NormalizedSDKConfig {

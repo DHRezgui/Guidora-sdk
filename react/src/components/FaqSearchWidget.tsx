@@ -1,5 +1,6 @@
-import { CSSProperties, useCallback, useMemo, useState } from 'react';
+import { CSSProperties, useCallback, useEffect, useMemo, useState } from 'react';
 import { useFaqSemanticSearch, type UseFaqSemanticSearchOptions } from '../hooks/useFaqSemanticSearch';
+import { subscribeProactiveHelp } from '../utils/proactive-help-bus';
 import { useFaqFrequentQuestions } from '../hooks/useFaqFrequentQuestions';
 import { useHelpDockSide } from '../hooks/useHelpDockSide';
 import type { FaqContentOptions, FaqPageContext, FaqSemanticSearchResult, SDKConfig } from '../types';
@@ -29,6 +30,8 @@ export interface FaqSearchWidgetProps extends UseFaqSemanticSearchOptions, FaqCo
   resolvedDockSide?: 'left' | 'right';
   showResultFeedback?: boolean;
   onResultClick?: (result: FaqSemanticSearchResult) => void;
+  /** Notifies parent when the widget opens or closes (assistance orchestration). */
+  onOpenChange?: (open: boolean) => void;
 }
 
 function preferredWidgetSide(
@@ -79,6 +82,7 @@ export function FaqSearchWidget({
   cacheTtlMs,
   showResultFeedback,
   onResultClick,
+  onOpenChange,
   subtitle,
   audience,
   showResultScore,
@@ -142,6 +146,21 @@ export function FaqSearchWidget({
     position === 'inline' ? 'inline' : resolvedSide === 'right' ? 'bottom-right' : 'bottom-left';
   const [open, setOpen] = useState(!startCollapsed || position === 'inline');
   const [query, setQuery] = useState('');
+
+  useEffect(() => {
+    onOpenChange?.(open);
+  }, [onOpenChange, open]);
+
+  useEffect(() => {
+    if (!enabled) return;
+    return subscribeProactiveHelp((request) => {
+      if (!request.openFaq) return;
+      setOpen(true);
+      if (request.suggestedQuery?.trim()) {
+        setQuery(request.suggestedQuery.trim());
+      }
+    });
+  }, [enabled]);
 
   const { questions: frequentQuestions, isLoading: frequentQuestionsLoading } =
     useFaqFrequentQuestions({

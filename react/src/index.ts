@@ -32,6 +32,21 @@ export {
   searchFaq,
 } from './utils/faq-search-client';
 export {
+  buildAbandonmentFeatureFingerprint,
+  buildAbandonmentRawFeatures,
+  countAbandonmentSignals,
+  hasMinimumAbandonmentSignals,
+} from './utils/abandonment-features';
+export {
+  clearAbandonmentPredictionCache,
+  predictAbandonment,
+} from './utils/abandonment-prediction-client';
+export {
+  clearProactiveHelpListenersForTests,
+  requestProactiveHelp,
+  subscribeProactiveHelp,
+} from './utils/proactive-help-bus';
+export {
   buildFaqSuggestionContext,
   clearFaqSuggestionsCache,
   fetchFaqSuggestions,
@@ -141,3 +156,13 @@ export type {
   FaqWidgetOptions,
   FaqPageContext,
 } from './types/faq';
+export type {
+  AbandonmentPredictionClientResult,
+  AbandonmentPredictionOptions,
+  AbandonmentPredictionRequest,
+  AbandonmentPredictionResponse,
+  AbandonmentPredictionResult,
+  AbandonmentRawFeatures,
+  FrictionBehaviorSignals,
+  SdkAbandonmentPredictionConfig,
+} from './types/ml';

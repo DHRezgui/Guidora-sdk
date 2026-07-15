@@ -9,6 +9,7 @@ export { useFaqTheme, type FaqThemeSnapshot } from './useFaqThemeMode';
 export * from './useSdkDockLayout';
 export * from './useFrictionDetection';
 export * from './useFrictionScore';
+export * from './useAbandonmentPrediction';
 export * from './useContextualTourSuggestions';
 export {
   removeAutoPublishedSignaturesForTour,

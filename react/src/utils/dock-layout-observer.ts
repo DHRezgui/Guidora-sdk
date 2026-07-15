@@ -4,7 +4,7 @@ import {
 } from './help-dock-side';
 
 const TRUSTDEV_MUTATION_ROOT_SELECTOR =
-  '[data-trustdev-help-sidebar], [data-trustdev-faq-panel], [data-trustdev-contextual-panel], .trustdev-help-sidebar, .trustdev-faq-widget, .trustdev-contextual-debug-panel';
+  '[data-trustdev-help-sidebar], [data-trustdev-faq-panel], [data-trustdev-contextual-panel], [data-trustdev-abandonment-panel], [data-trustdev-proactive-toast], [data-trustdev-proactive-toast-portal], .trustdev-help-sidebar, .trustdev-faq-widget, .trustdev-contextual-debug-panel, .trustdev-abandonment-debug-panel, .trustdev-proactive-toast';
 
 /** Minimum clearance advantage required before flipping an already stable dock side. */
 export const DOCK_SIDE_FLIP_HYSTERESIS_PX = 48;

@@ -19,7 +19,10 @@
       "require": "./dist/packs/index.cjs.js",
       "types": "./dist/packs/index.d.ts"
     },
-    "./styles.css": "./dist/styles.css"
+    "./styles.css": {
+      "types": "./dist/styles.css.d.ts",
+      "default": "./dist/styles.css"
+    }
   },
   "files": [
     "dist",
@@ -33,7 +36,7 @@
     "clean": "rimraf dist",
     "dev": "rollup -c -w",
     "build": "npm run clean && rollup -c && npm run build:types",
-    "build:types": "tsc -p tsconfig.build.json",
+    "build:types": "tsc -p tsconfig.build.json && node -e \"require('fs').copyFileSync('src/styles.css.d.ts','dist/styles.css.d.ts')\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "eslint src --ext .ts,.tsx",
     "format": "prettier --write \"src/**/*.{ts,tsx}\"",
