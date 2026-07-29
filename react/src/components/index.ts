@@ -21,3 +21,4 @@ export * from './HelpSidebar';
 export * from './AbandonmentRiskBadge';
 export * from './AbandonmentDebugPanel';
 export * from './ProactiveHelpToast';
+export * from './SupportTicketForm';

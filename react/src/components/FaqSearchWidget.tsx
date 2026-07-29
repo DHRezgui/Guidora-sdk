@@ -1,9 +1,10 @@
-import { CSSProperties, useCallback, useEffect, useMemo, useState } from 'react';
+import { CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useFaqSemanticSearch, type UseFaqSemanticSearchOptions } from '../hooks/useFaqSemanticSearch';
 import { subscribeProactiveHelp } from '../utils/proactive-help-bus';
 import { useFaqFrequentQuestions } from '../hooks/useFaqFrequentQuestions';
 import { useHelpDockSide } from '../hooks/useHelpDockSide';
 import type { FaqContentOptions, FaqPageContext, FaqSemanticSearchResult, SDKConfig } from '../types';
+import type { SupportTicketSessionContext } from '../types/support';
 import { collectFaqPageContext } from '../utils/faq-context';
 import { resolveFaqContentOptions } from '../utils/faq-content';
 import { resolveFaqProjectKey } from '../utils/faq-project-key';
@@ -32,6 +33,8 @@ export interface FaqSearchWidgetProps extends UseFaqSemanticSearchOptions, FaqCo
   onResultClick?: (result: FaqSemanticSearchResult) => void;
   /** Notifies parent when the widget opens or closes (assistance orchestration). */
   onOpenChange?: (open: boolean) => void;
+  supportTicketContext?: Partial<SupportTicketSessionContext>;
+  resolveSupportTicketContext?: () => Partial<SupportTicketSessionContext>;
 }
 
 function preferredWidgetSide(
@@ -94,6 +97,13 @@ export function FaqSearchWidget({
   frequentQuestionsLimit,
   pageContext,
   projectKey,
+  supportContactUrl,
+  supportContactLabel,
+  supportInlineForm,
+  supportExternalWidget,
+  supportExternalWidgetLabel,
+  supportTicketContext,
+  resolveSupportTicketContext,
 }: FaqSearchWidgetProps) {
   const contentOptions = useMemo(
     () =>
@@ -107,6 +117,11 @@ export function FaqSearchWidget({
         starterQuestions,
         frequentQuestionsMode,
         frequentQuestionsLimit,
+        supportContactUrl,
+        supportContactLabel,
+        supportInlineForm,
+        supportExternalWidget,
+        supportExternalWidgetLabel,
       }),
     [
       subtitle,
@@ -118,6 +133,11 @@ export function FaqSearchWidget({
       starterQuestions,
       frequentQuestionsMode,
       frequentQuestionsLimit,
+      supportContactUrl,
+      supportContactLabel,
+      supportInlineForm,
+      supportExternalWidget,
+      supportExternalWidgetLabel,
     ],
   );
   const resolvedContext = useMemo(
@@ -145,9 +165,13 @@ export function FaqSearchWidget({
   const resolvedPosition =
     position === 'inline' ? 'inline' : resolvedSide === 'right' ? 'bottom-right' : 'bottom-left';
   const [open, setOpen] = useState(!startCollapsed || position === 'inline');
+  const prevOpenForNotifyRef = useRef<boolean | null>(null);
   const [query, setQuery] = useState('');
 
   useEffect(() => {
+    const prev = prevOpenForNotifyRef.current;
+    prevOpenForNotifyRef.current = open;
+    if (prev === open) return;
     onOpenChange?.(open);
   }, [onOpenChange, open]);
 
@@ -248,6 +272,14 @@ export function FaqSearchWidget({
             showCloseButton={position !== 'inline'}
             compact={position === 'inline'}
             autoFocus={open && position !== 'inline'}
+            supportContactUrl={contentOptions.supportContactUrl}
+            supportContactLabel={contentOptions.supportContactLabel}
+            supportPresentation={contentOptions.supportPresentation}
+            supportTicketConfig={config}
+            supportTicketContext={supportTicketContext}
+            resolveSupportTicketContext={resolveSupportTicketContext}
+            supportExternalWidget={contentOptions.supportExternalWidget}
+            supportExternalWidgetLabel={contentOptions.supportExternalWidgetLabel}
           />
         </div>
       )}

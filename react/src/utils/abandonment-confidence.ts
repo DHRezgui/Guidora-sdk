@@ -1,4 +1,6 @@
+import type { FrictionCounters } from '../types';
 import type { AbandonmentIntentPolicy, AbandonmentPredictionClientResult } from '../types/ml';
+import { evaluateFrictionCombination } from './friction-combination';
 
 /** Convert SHAP log-odds baseline to a 0-1 abandonment probability. */
 export function abandonmentLogOddsToProbability(logOdds: number): number {
@@ -64,9 +66,18 @@ function evaluateMlToastEligibility(params: {
   sessionSeconds: number;
   signalCount: number;
   intentPolicy?: AbandonmentIntentPolicy;
+  counters?: FrictionCounters;
 }): AbandonmentToastEligibility {
-  const { result, threshold, minConfidence, proactiveHelp, sessionSeconds, signalCount, intentPolicy } =
-    params;
+  const {
+    result,
+    threshold,
+    minConfidence,
+    proactiveHelp,
+    sessionSeconds,
+    signalCount,
+    intentPolicy,
+    counters,
+  } = params;
 
   if (!proactiveHelp) {
     return { eligible: false, reason: 'aide proactive désactivée' };
@@ -87,6 +98,10 @@ function evaluateMlToastEligibility(params: {
         eligible: false,
         reason: `ML — signaux ${signalCount} < min ${intentPolicy.minSignals} (friction requise)`,
       };
+    }
+    const combination = evaluateToastCombinationGate(intentPolicy, counters);
+    if (combination && !combination.eligible) {
+      return { eligible: false, reason: `ML — ${combination.reason}` };
     }
   }
 
@@ -127,8 +142,9 @@ function evaluateIdleHybridToastEligibility(params: {
   idle: AbandonmentIdleToastParams;
   sessionSeconds: number;
   intentPolicy?: AbandonmentIntentPolicy;
+  counters?: FrictionCounters;
 }): AbandonmentToastEligibility {
-  const { proactiveHelp, threshold, idle, sessionSeconds, intentPolicy } = params;
+  const { proactiveHelp, threshold, idle, sessionSeconds, intentPolicy, counters } = params;
 
   if (!proactiveHelp || idle.enabled === false) {
     return { eligible: false, reason: 'voie idle désactivée' };
@@ -154,6 +170,12 @@ function evaluateIdleHybridToastEligibility(params: {
       reason: `idle — signaux ${idle.signalCount} < min ${minSignals}`,
     };
   }
+
+  const combination = evaluateToastCombinationGate(intentPolicy, counters);
+  if (combination && !combination.eligible) {
+    return { eligible: false, reason: `idle — ${combination.reason}` };
+  }
+
   if (idle.localRisk < minLocalRisk) {
     return {
       eligible: false,
@@ -174,6 +196,20 @@ function evaluateIdleHybridToastEligibility(params: {
   };
 }
 
+/** Phase 4 multi-family gate — skipped when counters missing (legacy callers) or disabled. */
+function evaluateToastCombinationGate(
+  intentPolicy: AbandonmentIntentPolicy | undefined,
+  counters: FrictionCounters | undefined,
+) {
+  if (!intentPolicy || !counters) return null;
+  if (intentPolicy.requireMultiFamilyForToast === false) return null;
+  return evaluateFrictionCombination({
+    counters,
+    minDistinctFamilies: intentPolicy.minDistinctFamilies,
+    allowStrongSingleFamily: intentPolicy.allowStrongSingleFamily,
+  });
+}
+
 export function evaluateAbandonmentToastEligibility(params: {
   result: AbandonmentPredictionClientResult | null;
   threshold: number;
@@ -182,6 +218,8 @@ export function evaluateAbandonmentToastEligibility(params: {
   sessionSeconds: number;
   signalCount: number;
   intentPolicy?: AbandonmentIntentPolicy;
+  /** Phase 4 — when provided, multi-family combination is enforced. */
+  counters?: FrictionCounters;
   idle?: AbandonmentIdleToastParams;
 }): AbandonmentToastEligibility {
   const effectiveThreshold = params.intentPolicy?.threshold ?? params.threshold;
@@ -195,6 +233,7 @@ export function evaluateAbandonmentToastEligibility(params: {
     sessionSeconds: params.sessionSeconds,
     signalCount: params.signalCount,
     intentPolicy: params.intentPolicy,
+    counters: params.counters,
   });
   if (mlVerdict.eligible) {
     return mlVerdict;
@@ -207,6 +246,7 @@ export function evaluateAbandonmentToastEligibility(params: {
       idle: params.idle,
       sessionSeconds: params.sessionSeconds,
       intentPolicy: params.intentPolicy,
+      counters: params.counters,
     });
     if (idleVerdict.eligible) {
       return idleVerdict;

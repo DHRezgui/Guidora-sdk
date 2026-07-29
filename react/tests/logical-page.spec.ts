@@ -1,45 +1,59 @@
 /// <reference types="jest" />
 
-/**
- * @jest-environment jsdom
- */
+import { isLogicalPageKeyStabilization, isSameLogicalPageUrl, resolveFrictionPageIdentity } from '../src/utils/logical-page';
 
-import { getLogicalPageKey } from '../src/utils/logical-page';
+describe('isLogicalPageKeyStabilization', () => {
+  const sep = '\u0001';
 
-describe('getLogicalPageKey', () => {
-  beforeEach(() => {
-    document.title = 'Host App';
-    document.body.innerHTML = '';
-    window.history.replaceState(null, '', '/');
+  it('treats empty→filled landmarks on the same URL as stabilization (refresh)', () => {
+    const beforePaint = [`http://localhost/contacts`, '', '', ''].join(sep);
+    const afterPaint = [`http://localhost/contacts`, 'orbit crm', 'contacts', 'contacts'].join(
+      sep,
+    );
+    expect(isLogicalPageKeyStabilization(beforePaint, afterPaint)).toBe(true);
   });
 
-  it('changes when primary H1 changes without URL change (SPA view swap)', () => {
-    document.body.innerHTML = '<main><h1>Portfolio Overview</h1></main>';
-    const first = getLogicalPageKey();
-
-    document.body.innerHTML = '<main><h1>Settings</h1></main>';
-    const second = getLogicalPageKey();
-
-    expect(first).not.toBe(second);
-    expect(second).toContain('settings');
+  it('treats title refinement on the same URL as stabilization', () => {
+    const before = [`http://localhost/settings`, 'orbit crm', '', ''].join(sep);
+    const after = [`http://localhost/settings`, 'settings | orbit crm', 'settings', 'settings'].join(
+      sep,
+    );
+    expect(isLogicalPageKeyStabilization(before, after)).toBe(true);
   });
 
-  it('ignores TrustDev chrome headings', () => {
-    document.body.innerHTML = `
-      <main><h1>Analytics</h1></main>
-      <div data-trustdev-abandonment-panel="true"><h1>Abandon — debug</h1></div>
-    `;
-    const key = getLogicalPageKey();
-    expect(key).toContain('analytics');
-    expect(key).not.toContain('abandon');
+  it('does not treat a real H1 swap on the same URL as stabilization', () => {
+    const dashboard = [`http://localhost/`, 'app', 'dashboard', 'dashboard'].join(sep);
+    const deals = [`http://localhost/`, 'app', 'deals', 'deals'].join(sep);
+    expect(isLogicalPageKeyStabilization(dashboard, deals)).toBe(false);
   });
 
-  it('includes URL when pathname changes', () => {
-    document.body.innerHTML = '<main><h1>Same Title</h1></main>';
-    window.history.replaceState(null, '', '/a');
-    const first = getLogicalPageKey();
-    window.history.replaceState(null, '', '/b');
-    const second = getLogicalPageKey();
-    expect(first).not.toBe(second);
+  it('does not treat a URL change as stabilization', () => {
+    const a = [`http://localhost/a`, 'app', '', 'a'].join(sep);
+    const b = [`http://localhost/b`, 'app', '', 'b'].join(sep);
+    expect(isLogicalPageKeyStabilization(a, b)).toBe(false);
+  });
+});
+
+describe('isSameLogicalPageUrl', () => {
+  const sep = '\u0001';
+
+  it('compares only the URL segment of logical keys', () => {
+    const a = [`http://localhost/deals`, 'app', 'deals', 'deals'].join(sep);
+    const b = [`http://localhost/deals`, 'app', 'pipeline', 'deals'].join(sep);
+    const c = [`http://localhost/contacts`, 'app', 'contacts', 'contacts'].join(sep);
+    expect(isSameLogicalPageUrl(a, b)).toBe(true);
+    expect(isSameLogicalPageUrl(a, c)).toBe(false);
+  });
+});
+
+describe('resolveFrictionPageIdentity', () => {
+  const sep = '\u0001';
+
+  it('prefers aria-current nav cue over lagging H1 on the same URL', () => {
+    const hybrid = [`/`, 'orbit', 'settings', 'portfolio pulse'].join(sep);
+    const settled = [`/`, 'orbit', 'settings', 'settings'].join(sep);
+    expect(resolveFrictionPageIdentity(hybrid)).toBe(`/\u0001nav:settings`);
+    expect(resolveFrictionPageIdentity(settled)).toBe(`/\u0001nav:settings`);
+    expect(resolveFrictionPageIdentity(hybrid)).toBe(resolveFrictionPageIdentity(settled));
   });
 });

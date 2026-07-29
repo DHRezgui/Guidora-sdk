@@ -7,6 +7,10 @@ export const DEFAULT_ABANDONMENT_MIN_SIGNALS = 2;
 /**
  * Maps SDK friction counters + session signals to backend raw features.
  *
+ * Phase 1–4 advanced counters are intentionally folded into the legacy LightGBM
+ * schema (experimental / lossy — rage→clickMisses, FAQ/slow→hesitations, etc.).
+ * Distinct counters are retained in the Decision Engine and outcome snapshots.
+ *
  * Alignment notes (`backend/src/ml/constants/dataset-schema.ts`):
  * - `timeOnPage` — session dwell seconds (not reset on SPA navigations; train/serve contract).
  * - `pageTime` — current-URL dwell seconds (resets on navigation; additive, optional for ML).
@@ -25,11 +29,27 @@ export function buildAbandonmentRawFeatures(
   return {
     timeOnPage: Math.max(0, Math.floor(signals.elapsedSeconds)),
     scrollDepth: Math.min(100, Math.max(0, Math.round(signals.maxScrollDepth))),
-    clickMisses: Math.max(0, counters.clickMiss),
-    hesitations: Math.max(0, counters.scrollHesitation),
-    helpTriggered: signals.helpTriggered ? 1 : 0,
-    hasError: signals.hasError ? 1 : 0,
-    multiplePages: counters.navigationBack > 0 || signals.pageVisitCount > 1 ? 1 : 0,
+    // Fold rage clicks into clickMisses for train/serve compatibility (same frustrated-click family).
+    clickMisses: Math.max(0, counters.clickMiss) + Math.max(0, counters.rageClick ?? 0),
+    // Fold slow-response waits + FAQ dead-ends into hesitations.
+    hesitations:
+      Math.max(0, counters.scrollHesitation) +
+      Math.max(0, counters.slowResponse ?? 0) +
+      Math.max(0, counters.faqNoResult ?? 0),
+    helpTriggered:
+      signals.helpTriggered ||
+      (counters.faqReopen ?? 0) > 0 ||
+      (counters.failAfterHelp ?? 0) > 0
+        ? 1
+        : 0,
+    hasError: signals.hasError || (counters.errorClick ?? 0) > 0 ? 1 : 0,
+    multiplePages:
+      counters.navigationBack > 0 ||
+      (counters.navigationLoop ?? 0) > 0 ||
+      (counters.uTurn ?? 0) > 0 ||
+      signals.pageVisitCount > 1
+        ? 1
+        : 0,
     idleSeconds: Math.max(0, Math.floor(signals.idleSeconds)),
     pageTime: Math.max(0, Math.floor(signals.pageSeconds ?? signals.elapsedSeconds)),
   };
@@ -57,7 +77,20 @@ export function hasMinimumAbandonmentSignals(
 }
 
 export function countAbandonmentSignals(counters: FrictionCounters): number {
-  return counters.clickMiss + counters.scrollHesitation;
+  // formAbandonment (beforeunload) is excluded — not live help evidence.
+  return (
+    counters.clickMiss +
+    counters.scrollHesitation +
+    (counters.rageClick ?? 0) +
+    (counters.errorClick ?? 0) +
+    (counters.formRetry ?? 0) +
+    (counters.navigationLoop ?? 0) +
+    (counters.uTurn ?? 0) +
+    (counters.slowResponse ?? 0) +
+    (counters.faqNoResult ?? 0) +
+    (counters.faqReopen ?? 0) +
+    (counters.failAfterHelp ?? 0)
+  );
 }
 
 export function buildAbandonmentFeatureFingerprint(features: AbandonmentRawFeatures): string {

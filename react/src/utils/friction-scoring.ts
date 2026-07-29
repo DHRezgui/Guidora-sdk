@@ -6,10 +6,31 @@ const WEIGHT_CLICK_MISS = 2;
 const WEIGHT_SCROLL_HESITATION = 2;
 const WEIGHT_FORM_ABANDONMENT = 3;
 const WEIGHT_NAVIGATION_BACK = 2;
+/** Phase-1: stronger frustration signals. */
+const WEIGHT_RAGE_CLICK = 3;
+const WEIGHT_ERROR_CLICK = 4;
+const WEIGHT_FORM_RETRY = 3;
+/** Phase-2: navigation stagnation + lag after action. */
+const WEIGHT_NAVIGATION_LOOP = 3;
+const WEIGHT_U_TURN = 2;
+const WEIGHT_SLOW_RESPONSE = 3;
+/** Phase-3: FAQ / help loop signals (Guidora differentiator). */
+const WEIGHT_FAQ_NO_RESULT = 3;
+const WEIGHT_FAQ_REOPEN = 2;
+const WEIGHT_FAIL_AFTER_HELP = 4;
 
 /** P3 — cap counted events so a single signal type cannot dominate the score. */
 const CAP_CLICK_MISS_EVENTS = 2;
 const CAP_SCROLL_HESITATION_EVENTS = 2;
+const CAP_RAGE_CLICK_EVENTS = 2;
+const CAP_ERROR_CLICK_EVENTS = 2;
+const CAP_FORM_RETRY_EVENTS = 2;
+const CAP_NAVIGATION_LOOP_EVENTS = 2;
+const CAP_U_TURN_EVENTS = 2;
+const CAP_SLOW_RESPONSE_EVENTS = 2;
+const CAP_FAQ_NO_RESULT_EVENTS = 2;
+const CAP_FAQ_REOPEN_EVENTS = 2;
+const CAP_FAIL_AFTER_HELP_EVENTS = 2;
 
 /**
  * P2 — progressive stall tiers (stored in `counters.timeOnPageExcessive`).
@@ -25,13 +46,22 @@ const TIME_STALL_TIER_POINTS = [2, 3, 3, 4] as const;
 export const TEMPORAL_ML_GATE_MIN_SECONDS = 45;
 export const TEMPORAL_ML_GATE_MAX_SCROLL_DEPTH = 30;
 
-/** P4 — max local score after caps + progressive time (tiers 1–4). */
+/** P4 — max local score after caps + progressive time + phase-1/2/3 signals. */
 export const FRICTION_SCORE_MAX =
   CAP_CLICK_MISS_EVENTS * WEIGHT_CLICK_MISS +
   CAP_SCROLL_HESITATION_EVENTS * WEIGHT_SCROLL_HESITATION +
   TIME_STALL_TIER_POINTS.reduce((sum, points) => sum + points, 0) +
   WEIGHT_FORM_ABANDONMENT +
-  WEIGHT_NAVIGATION_BACK;
+  WEIGHT_NAVIGATION_BACK +
+  CAP_RAGE_CLICK_EVENTS * WEIGHT_RAGE_CLICK +
+  CAP_ERROR_CLICK_EVENTS * WEIGHT_ERROR_CLICK +
+  CAP_FORM_RETRY_EVENTS * WEIGHT_FORM_RETRY +
+  CAP_NAVIGATION_LOOP_EVENTS * WEIGHT_NAVIGATION_LOOP +
+  CAP_U_TURN_EVENTS * WEIGHT_U_TURN +
+  CAP_SLOW_RESPONSE_EVENTS * WEIGHT_SLOW_RESPONSE +
+  CAP_FAQ_NO_RESULT_EVENTS * WEIGHT_FAQ_NO_RESULT +
+  CAP_FAQ_REOPEN_EVENTS * WEIGHT_FAQ_REOPEN +
+  CAP_FAIL_AFTER_HELP_EVENTS * WEIGHT_FAIL_AFTER_HELP;
 
 /**
  * Resolve progressive stall tier from dwell seconds.
@@ -65,17 +95,58 @@ function computeTimeStallScore(tier: number): number {
   return score;
 }
 
+function counterOrZero(value: number | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
 export function computeFrictionScore(counters: FrictionCounters): number {
   const clickScore =
-    Math.min(Math.max(0, counters.clickMiss), CAP_CLICK_MISS_EVENTS) * WEIGHT_CLICK_MISS;
+    Math.min(counterOrZero(counters.clickMiss), CAP_CLICK_MISS_EVENTS) * WEIGHT_CLICK_MISS;
   const scrollScore =
-    Math.min(Math.max(0, counters.scrollHesitation), CAP_SCROLL_HESITATION_EVENTS) *
+    Math.min(counterOrZero(counters.scrollHesitation), CAP_SCROLL_HESITATION_EVENTS) *
     WEIGHT_SCROLL_HESITATION;
-  const timeScore = computeTimeStallScore(counters.timeOnPageExcessive);
-  const formScore = Math.max(0, counters.formAbandonment) * WEIGHT_FORM_ABANDONMENT;
-  const navigationScore = Math.max(0, counters.navigationBack) * WEIGHT_NAVIGATION_BACK;
+  const timeScore = computeTimeStallScore(counterOrZero(counters.timeOnPageExcessive));
+  const formScore = counterOrZero(counters.formAbandonment) * WEIGHT_FORM_ABANDONMENT;
+  const navigationScore = counterOrZero(counters.navigationBack) * WEIGHT_NAVIGATION_BACK;
+  const rageScore =
+    Math.min(counterOrZero(counters.rageClick), CAP_RAGE_CLICK_EVENTS) * WEIGHT_RAGE_CLICK;
+  const errorClickScore =
+    Math.min(counterOrZero(counters.errorClick), CAP_ERROR_CLICK_EVENTS) * WEIGHT_ERROR_CLICK;
+  const formRetryScore =
+    Math.min(counterOrZero(counters.formRetry), CAP_FORM_RETRY_EVENTS) * WEIGHT_FORM_RETRY;
+  const navigationLoopScore =
+    Math.min(counterOrZero(counters.navigationLoop), CAP_NAVIGATION_LOOP_EVENTS) *
+    WEIGHT_NAVIGATION_LOOP;
+  const uTurnScore =
+    Math.min(counterOrZero(counters.uTurn), CAP_U_TURN_EVENTS) * WEIGHT_U_TURN;
+  const slowResponseScore =
+    Math.min(counterOrZero(counters.slowResponse), CAP_SLOW_RESPONSE_EVENTS) *
+    WEIGHT_SLOW_RESPONSE;
+  const faqNoResultScore =
+    Math.min(counterOrZero(counters.faqNoResult), CAP_FAQ_NO_RESULT_EVENTS) *
+    WEIGHT_FAQ_NO_RESULT;
+  const faqReopenScore =
+    Math.min(counterOrZero(counters.faqReopen), CAP_FAQ_REOPEN_EVENTS) * WEIGHT_FAQ_REOPEN;
+  const failAfterHelpScore =
+    Math.min(counterOrZero(counters.failAfterHelp), CAP_FAIL_AFTER_HELP_EVENTS) *
+    WEIGHT_FAIL_AFTER_HELP;
 
-  return clickScore + scrollScore + timeScore + formScore + navigationScore;
+  return (
+    clickScore +
+    scrollScore +
+    timeScore +
+    formScore +
+    navigationScore +
+    rageScore +
+    errorClickScore +
+    formRetryScore +
+    navigationLoopScore +
+    uTurnScore +
+    slowResponseScore +
+    faqNoResultScore +
+    faqReopenScore +
+    failAfterHelpScore
+  );
 }
 
 export function normalizeFrictionScore(score: number): number {

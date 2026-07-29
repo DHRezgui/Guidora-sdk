@@ -1259,6 +1259,24 @@ export interface FrictionCounters {
   timeOnPageExcessive: number;
   formAbandonment: number;
   navigationBack: number;
+  /** ≥3 rapid clicks on the same interactive control. */
+  rageClick: number;
+  /** JS/rejection error shortly after an interactive click. */
+  errorClick: number;
+  /** Repeated failed form submits (validation / blocked submit). */
+  formRetry: number;
+  /** Repeated A↔B transitions without progression (SaaS stagnation). */
+  navigationLoop: number;
+  /** Left a page and returned to the previous one within <5s. */
+  uTurn: number;
+  /** Interactive click with no navigation / follow-up within ~8s. */
+  slowResponse: number;
+  /** FAQ search with no useful match (empty / fallback_top1 / low score). */
+  faqNoResult: number;
+  /** FAQ/help opened again after a prior open in the session. */
+  faqReopen: number;
+  /** Strong friction after the user actually used help (FAQ search), not mere open. */
+  failAfterHelp: number;
 }
 
 export interface OnboardingDebugLog {

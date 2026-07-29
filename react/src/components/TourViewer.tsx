@@ -26,6 +26,14 @@ import {
 import { resolveContextualTourViewerOptions } from '../utils/sdk-auto-defaults';
 import { resolveSdkProjectKey } from '../utils/sdk-project-key';
 import { measureDebugPanelStackOffsets } from '../utils/debug-panel-stack';
+import { buildSupportTicketSessionContext } from '../utils/support-ticket-context';
+import {
+  ensureSupportTicketNavTracking,
+  getSupportTicketRuntimeSignals,
+  recordSupportNavigation,
+} from '../utils/support-ticket-runtime-signals';
+import { resolveSupportEmailBrand } from '../utils/support-email-brand';
+import { normalizeFrictionScore } from '../utils/friction-scoring';
 
 const VALID_INTENTS: TourDraftIntent[] = ['discovery', 'primary-action', 'support-navigation', 'form-flow'];
 const NAVIGATION_CLICK_RESUME_DELAY_MS = 5000;
@@ -906,6 +914,93 @@ export function TourViewer({
     abandonmentPrediction: resolvedAbandonmentPrediction ?? undefined,
   });
 
+  useEffect(() => {
+    ensureSupportTicketNavTracking();
+  }, []);
+
+  const resolveSupportTicketContext = useCallback(() => {
+    if (typeof window === 'undefined') return {};
+    const signals = onboarding.friction.getSignals?.();
+    const projectKey =
+      resolvedFaq?.projectKey ??
+      contextualSuggestions?.flowVersion ??
+      undefined;
+    const runtime = getSupportTicketRuntimeSignals();
+    const tourOpen = Boolean(onboarding.activeTour && onboarding.tour.isOpen);
+    return buildSupportTicketSessionContext({
+      pageUrl: window.location.href,
+      sessionId: onboarding.session.sessionId,
+      projectKey,
+      assistanceState: onboarding.assistanceState,
+      abandonmentRisk: onboarding.abandonmentPrediction.result?.prediction?.abandonmentRisk,
+      frictionScore: normalizeFrictionScore(onboarding.frictionScore.score),
+      timeOnPage: signals?.elapsedSeconds,
+      pageTime: signals?.pageSeconds,
+      supportBrand: resolveSupportEmailBrand({
+        override: resolvedFaq?.supportBrand,
+        referenceSelector: resolvedFaq?.hostThemeReference,
+        projectKey,
+      }),
+      browser: runtime.browser,
+      faqSearchCount: runtime.faqSearchCount,
+      faqLastQuery: runtime.faqLastQuery,
+      activeTourId: tourOpen ? onboarding.activeTour?.id ?? null : null,
+      activeTourStep: tourOpen ? onboarding.tour.currentStepIndex : null,
+      lastCompletedTourId: runtime.lastCompletedTourId,
+      lastCompletedTourName: runtime.lastCompletedTourName,
+      navigationHistory: runtime.navigationHistory,
+      episode: runtime.episode,
+    });
+  }, [
+    onboarding.session.sessionId,
+    onboarding.assistanceState,
+    onboarding.abandonmentPrediction.result,
+    onboarding.frictionScore.score,
+    onboarding.friction,
+    onboarding.activeTour,
+    onboarding.tour.isOpen,
+    onboarding.tour.currentStepIndex,
+    currentPathname,
+    resolvedFaq?.projectKey,
+    resolvedFaq?.supportBrand,
+    resolvedFaq?.hostThemeReference,
+    contextualSuggestions?.flowVersion,
+  ]);
+
+  const handleHelpSidebarOpenChange = useCallback(
+    (open: boolean) => {
+      setHelpSidebarOpen(open);
+      onboarding.assistance.reportFaqOpen(open);
+    },
+    [onboarding.assistance],
+  );
+
+  const handleFaqWidgetOpenChange = useCallback(
+    (open: boolean) => {
+      onboarding.assistance.reportFaqOpen(open);
+    },
+    [onboarding.assistance],
+  );
+
+  // Tour end forces assistance → none; restore FAQ if the sidebar stayed open
+  // (without re-capturing the help episode — lock stays held in useOnboarding).
+  useEffect(() => {
+    if (onboarding.tour.isOpen) return;
+    if (!helpSidebarOpen) return;
+    if (
+      onboarding.assistanceState === 'faq' ||
+      onboarding.assistanceState === 'tour'
+    ) {
+      return;
+    }
+    onboarding.assistance.reportFaqOpen(true);
+  }, [
+    helpSidebarOpen,
+    onboarding.assistance,
+    onboarding.assistanceState,
+    onboarding.tour.isOpen,
+  ]);
+
   resolveTargetRef.current = onboarding.resolver.resolveTarget;
   debugRef.current = onboarding.debug;
   tourRef.current = onboarding.tour;
@@ -1006,6 +1101,7 @@ export function TourViewer({
 
     const updatePath = () => {
       setCurrentPathname(window.location.pathname);
+      recordSupportNavigation(window.location.href);
     };
 
     const originalPushState = window.history.pushState;
@@ -1937,6 +2033,7 @@ export function TourViewer({
           proactiveIdleMinSeconds={resolvedAbandonmentPrediction.proactiveIdleMinSeconds}
           sessionIntent={onboarding.abandonmentSessionIntent}
           intentPolicy={onboarding.abandonmentIntentPolicy}
+          pagePolicyLabel={onboarding.abandonmentPagePolicyLabel}
           assistanceState={onboarding.assistanceState}
           assistanceMlPaused={onboarding.assistanceMlPaused}
           abandonment={onboarding.abandonmentPrediction}
@@ -1967,10 +2064,8 @@ export function TourViewer({
               ...(config ?? {}),
               ...(resolvedFaq.config ?? {}),
             }}
-            onOpenChange={(open) => {
-              setHelpSidebarOpen(open);
-              onboarding.assistance.reportFaqOpen(open);
-            }}
+            onOpenChange={handleHelpSidebarOpenChange}
+            resolveSupportTicketContext={resolveSupportTicketContext}
           />
         ) : (
           <FaqSearchWidget
@@ -1982,9 +2077,8 @@ export function TourViewer({
               ...(config ?? {}),
               ...(resolvedFaq.config ?? {}),
             }}
-            onOpenChange={(open) => {
-              onboarding.assistance.reportFaqOpen(open);
-            }}
+            onOpenChange={handleFaqWidgetOpenChange}
+            resolveSupportTicketContext={resolveSupportTicketContext}
           />
         )
       ) : null}

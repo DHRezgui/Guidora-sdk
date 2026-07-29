@@ -121,11 +121,33 @@ export interface SdkAbandonmentPredictionConfig {
   /** Override inferred session intent (onboarding / exploration / returning). */
   sessionIntent?: AbandonmentSessionIntent;
   /** Per-intent toast + ML gate policies (merged with defaults). */
-  intentPolicies?: Partial<Record<AbandonmentSessionIntent, AbandonmentIntentPolicy>>;
+  intentPolicies?: Partial<Record<AbandonmentSessionIntent, Partial<AbandonmentIntentPolicy>>>;
+  /**
+   * Phase 4 — per-page overrides (matched against URL pathname / logical page key).
+   * First matching rule wins; merged on top of the resolved intent policy.
+   */
+  pagePolicies?: AbandonmentPagePolicy[];
   /** Global minimum session duration before any proactive toast (intent policy may be stricter). */
   proactiveMinSessionSeconds?: number;
   /** Require discrete friction signals before ML proactive toast (default true via intent policies). */
   proactiveRequireFrictionSignals?: boolean;
+  /**
+   * Phase 4 — require distinct friction families for toast (default true via intent policies).
+   * Example: 2× click-miss alone is not enough; click + navigation is.
+   */
+  proactiveRequireMultiFamily?: boolean;
+}
+
+/**
+ * Phase 4 — optional page-scoped policy override.
+ * `match` is a case-insensitive substring or simple `*` wildcard against
+ * pathname, full page URL, or soft-SPA logical key / nav identity.
+ */
+export interface AbandonmentPagePolicy {
+  match: string;
+  /** Debug label (shown in abandonment panel). */
+  label?: string;
+  policy?: Partial<AbandonmentIntentPolicy>;
 }
 
 export type AbandonmentSessionIntent = 'onboarding' | 'exploration' | 'returning';
@@ -146,6 +168,18 @@ export interface AbandonmentIntentPolicy {
   proactiveIdleMinSeconds: number;
   proactiveIdleMinLocalRisk: number;
   proactiveIdleMinSignals: number;
+  /**
+   * Phase 4 — minimum distinct friction families for proactive toast
+   * (when multi-family gate is enabled). Default 2.
+   */
+  minDistinctFamilies: number;
+  /**
+   * Phase 4 — allow a single strong family (error click, nav loop, fail-after-help…)
+   * to satisfy the combination gate without multi-family evidence.
+   */
+  allowStrongSingleFamily: boolean;
+  /** Phase 4 — when false, skip multi-family combination for toast. */
+  requireMultiFamilyForToast: boolean;
 }
 
 export interface FrictionBehaviorSignals {

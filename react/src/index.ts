@@ -38,6 +38,42 @@ export {
   hasMinimumAbandonmentSignals,
 } from './utils/abandonment-features';
 export {
+  DEFAULT_ABANDONMENT_INTENT_POLICIES,
+  matchAbandonmentPagePolicy,
+  resolveAbandonmentIntentPolicy,
+  resolveAbandonmentSessionIntent,
+  resolveEffectiveAbandonmentPolicy,
+} from './utils/abandonment-session-intent';
+export {
+  evaluateFrictionCombination,
+  hasStrongSingleFamilyFriction,
+  resolveActiveFrictionFamilies,
+} from './utils/friction-combination';
+export {
+  evaluateHelpDecision,
+  hasConcreteFrictionEvidence,
+} from './utils/friction-decision-engine';
+export { buildFrictionExplanation } from './utils/friction-explanation';
+export {
+  DEFAULT_FRICTION_SIGNAL_FRESHNESS_MS,
+  filterCountersByFreshness,
+  isFrictionSignalFresh,
+} from './utils/friction-signal-freshness';
+export type { FrictionSignalTimestamps } from './utils/friction-signal-freshness';
+export {
+  clearHelpOutcomesForTests,
+  emitHelpOutcome,
+  getRecentHelpOutcomes,
+  serializeHelpOutcome,
+  subscribeHelpOutcomes,
+} from './utils/friction-help-outcomes';
+export {
+  FRICTION_SIGNAL_CATALOG,
+  hasStrongHelpSignal,
+  listActiveFrictionSignals,
+} from './utils/friction-signal-catalog';
+export { FRICTION_INTERACTIVE_CLICK_SELECTOR } from './utils/friction-advanced-signals';
+export {
   clearAbandonmentPredictionCache,
   predictAbandonment,
 } from './utils/abandonment-prediction-client';
@@ -119,6 +155,25 @@ export {
 } from './utils/sdk-project-key';
 export { resolveFaqProjectKey } from './utils/faq-project-key';
 export {
+  openExternalSupportWidget,
+  type OpenExternalSupportWidgetResult,
+  type SupportExternalWidgetOptions,
+  type SupportExternalWidgetProvider,
+} from './utils/support-external-widget';
+export {
+  buildSupportTicketSessionContext,
+  resolveSupportPresentation,
+  type SupportPresentation,
+} from './utils/support-ticket-context';
+export {
+  ensureSupportTicketNavTracking,
+  getSupportTicketRuntimeSignals,
+  parseBrowserLabel,
+  recordSupportFaqSearch,
+  recordSupportNavigation,
+  sanitizeNavigationUrl,
+} from './utils/support-ticket-runtime-signals';
+export {
   fetchRemoteJourneyBlueprints,
   mergeLocalAndRemoteJourneyBlueprints,
   resolveJourneyBlueprintsRemoteUrl,
@@ -166,3 +221,18 @@ export type {
   FrictionBehaviorSignals,
   SdkAbandonmentPredictionConfig,
 } from './types/ml';
+export type {
+  SupportEmailBrand,
+  SupportHelpEpisode,
+  SupportHelpEpisodeTrigger,
+  SupportTicketSessionContext,
+  CreateSupportTicketRequest,
+  SupportTicketRecord,
+  CreateSupportTicketResponse,
+  SupportTicketSubmitStatus,
+} from './types/support';
+export {
+  detectHostSupportBrand,
+  resolveSupportEmailBrand,
+  type DetectHostSupportBrandOptions,
+} from './utils/support-email-brand';

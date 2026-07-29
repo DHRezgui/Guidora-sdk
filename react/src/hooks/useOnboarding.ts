@@ -9,6 +9,11 @@ import {
 } from '../utils/tour-flow-version';
 import { increaseVisitCount, increaseOrganizationVisitCount, getOrganizationVisitCount } from '../utils/storage';
 import { getCurrentPageUrl } from '../utils/url';
+import {
+  getLogicalPageKey,
+  logicalPageUrl,
+  resolveFrictionPageIdentity,
+} from '../utils/logical-page';
 import { useActiveToursForUrl } from './useActiveToursForUrl';
 import { useFrictionDetection } from './useFrictionDetection';
 import { useFrictionScore } from './useFrictionScore';
@@ -21,17 +26,26 @@ import type {
 import { countAbandonmentSignals } from '../utils/abandonment-features';
 import {
   defaultAbandonmentMinConfidence,
-  evaluateAbandonmentToastEligibility,
 } from '../utils/abandonment-confidence';
 import {
-  resolveAbandonmentIntentPolicy,
   resolveAbandonmentSessionIntent,
+  resolveEffectiveAbandonmentPolicy,
 } from '../utils/abandonment-session-intent';
+import { evaluateHelpDecision } from '../utils/friction-decision-engine';
+import {
+  emitHelpOutcome,
+  type HelpOutcomeCountersSnapshot,
+} from '../utils/friction-help-outcomes';
 import {
   ASSISTANCE_ML_RESUME_DELAY_MS,
   canTransitionAssistance,
 } from '../utils/assistance-orchestrator';
 import { normalizeFrictionScore } from '../utils/friction-scoring';
+import {
+  captureSupportHelpEpisode,
+  mapAssistanceStateToEpisodeTrigger,
+  recordSupportCompletedTour,
+} from '../utils/support-ticket-runtime-signals';
 import { useOnboardingDebug } from './useOnboardingDebug';
 import { useOnboardingSession } from './useOnboardingSession';
 import { useRealtimeToursSync } from './useRealtimeToursSync';
@@ -206,6 +220,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     onComplete: (completedTour) => {
       if (completedTour?.id) {
         dismissedTourIdsRef.current.add(completedTour.id);
+        recordSupportCompletedTour(completedTour.id, completedTour.name);
       }
       // Prevent immediate restart from stale active tours response.
       suppressAutostartUntilRef.current = Date.now() + 12000;
@@ -261,12 +276,37 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     organizationVisitCount,
     friction.counters.navigationBack,
     friction.counters.clickMiss,
+    friction.counters.rageClick,
+    friction.counters.errorClick,
+    friction.counters.formRetry,
+    friction.counters.navigationLoop,
+    friction.counters.uTurn,
+    friction.counters.slowResponse,
+    friction.counters.faqNoResult,
+    friction.counters.faqReopen,
+    friction.counters.failAfterHelp,
   ]);
 
-  const intentPolicy = useMemo(
-    () => resolveAbandonmentIntentPolicy(abandonmentConfig, sessionIntent),
-    [abandonmentConfig, sessionIntent],
+  const pagePolicyContext = useMemo(() => {
+    const logicalKey = getLogicalPageKey();
+    return {
+      url: logicalPageUrl(logicalKey) || getCurrentPageUrl(),
+      logicalKey,
+      identity: resolveFrictionPageIdentity(logicalKey),
+    };
+  }, [
+    friction.counters.navigationBack,
+    friction.counters.navigationLoop,
+    friction.counters.uTurn,
+    pageUrl,
+  ]);
+
+  const resolvedAbandonmentPolicy = useMemo(
+    () =>
+      resolveEffectiveAbandonmentPolicy(abandonmentConfig, sessionIntent, pagePolicyContext),
+    [abandonmentConfig, sessionIntent, pagePolicyContext],
   );
+  const intentPolicy = resolvedAbandonmentPolicy.policy;
 
   /** Orchestrator only when abandonment ML is opted in — otherwise legacy behavior. */
   const orchestrationEnabled = abandonmentConfig?.enabled === true;
@@ -277,6 +317,27 @@ export function useOnboarding(options?: UseOnboardingOptions) {
 
   const [mlPausedUntil, setMlPausedUntil] = useState(0);
   const [, setMlResumeTick] = useState(0);
+  const abandonmentResultRef = useRef<AbandonmentPredictionClientResult | null>(null);
+  /**
+   * Locks the help-episode snapshot after the first `none → assistance` capture.
+   * Stays locked across tour → none/faq so a post-tour FAQ restore cannot overwrite
+   * the original toast/manual trigger with post-reset metrics (0%, ~2s).
+   * Unlocks only when the user dismisses FAQ or the proactive toast.
+   */
+  const helpEpisodeLockedRef = useRef(false);
+  const faqOpenCountRef = useRef(0);
+  /** Blocks re-prompting help (toast) after a recent offer or user dismiss. */
+  const proactiveCooldownUntilRef = useRef(0);
+  const lastHelpOfferRef = useRef<{
+    counters: HelpOutcomeCountersSnapshot;
+    via: string | null;
+    reason: string;
+    frictionLevel: import('../utils/friction-explanation').FrictionLevel;
+    mlRisk: number | null;
+    sessionSeconds: number;
+    pageSeconds: number;
+    idleSeconds: number;
+  } | null>(null);
 
   useEffect(() => {
     if (!orchestrationEnabled) {
@@ -307,10 +368,30 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       if (from === next) return true;
 
       if (from === 'none' && next !== 'none') {
+        const trigger = mapAssistanceStateToEpisodeTrigger(next);
+        if (trigger && !helpEpisodeLockedRef.current) {
+          const signals = friction.getSignals();
+          captureSupportHelpEpisode({
+            trigger,
+            frictionAtTrigger: normalizeFrictionScore(frictionScore.score),
+            riskAtTrigger:
+              abandonmentResultRef.current?.prediction?.abandonmentRisk,
+            timeOnPageAtTrigger: signals.elapsedSeconds,
+            pageTimeAtTrigger: signals.pageSeconds,
+            idleSecondsAtTrigger: signals.idleSeconds,
+          });
+          helpEpisodeLockedRef.current = true;
+        }
         friction.signalHelpTriggered();
       }
 
-      if (from === 'tour' && next === 'none') {
+      if (next === 'faq' && from !== 'faq') {
+        faqOpenCountRef.current += 1;
+        friction.signalFaqReopen(faqOpenCountRef.current);
+      }
+
+      // Leaving a tour always resets friction (avoid immediate re-toast).
+      if (from === 'tour' && next !== 'tour') {
         friction.reset();
         setMlPausedUntil(Date.now() + ASSISTANCE_ML_RESUME_DELAY_MS);
       }
@@ -319,12 +400,63 @@ export function useOnboarding(options?: UseOnboardingOptions) {
         friction.reset();
       }
 
+      // User dismissed help UI → next open starts a fresh episode, and we must
+      // not immediately re-toast "open help" right after they closed it.
+      if (next === 'none' && (from === 'faq' || from === 'proactiveToast')) {
+        const offer = lastHelpOfferRef.current;
+        if (offer && from === 'proactiveToast') {
+          emitHelpOutcome({
+            type: 'help_dismissed',
+            via: offer.via,
+            reason: offer.reason,
+            frictionLevel: offer.frictionLevel,
+            counters: offer.counters,
+            mlRisk: offer.mlRisk,
+            sessionSeconds: offer.sessionSeconds,
+            pageSeconds: offer.pageSeconds,
+            idleSeconds: offer.idleSeconds,
+            at: Date.now(),
+          });
+        }
+        helpEpisodeLockedRef.current = false;
+        setMlPausedUntil(Date.now() + ASSISTANCE_ML_RESUME_DELAY_MS);
+        const cooldownMs = abandonmentConfig?.proactiveCooldownMs ?? 60_000;
+        proactiveCooldownUntilRef.current = Math.max(
+          proactiveCooldownUntilRef.current,
+          Date.now() + cooldownMs,
+        );
+      }
+
+      if (next === 'faq' && from === 'proactiveToast') {
+        const offer = lastHelpOfferRef.current;
+        if (offer) {
+          emitHelpOutcome({
+            type: 'help_accepted',
+            via: offer.via,
+            reason: offer.reason,
+            frictionLevel: offer.frictionLevel,
+            counters: offer.counters,
+            mlRisk: offer.mlRisk,
+            sessionSeconds: offer.sessionSeconds,
+            pageSeconds: offer.pageSeconds,
+            idleSeconds: offer.idleSeconds,
+            at: Date.now(),
+          });
+        }
+      }
+
       assistanceStateRef.current = next;
       setAssistanceState(next);
       debugWarn('Assistance transition', { from, next });
       return true;
     },
-    [debugWarn, friction, orchestrationEnabled],
+    [
+      abandonmentConfig?.proactiveCooldownMs,
+      debugWarn,
+      friction,
+      frictionScore.score,
+      orchestrationEnabled,
+    ],
   );
 
   // Tour owns `assistanceState === 'tour'` while open.
@@ -339,13 +471,15 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     }
   }, [orchestrationEnabled, tour.isOpen, transitionAssistance]);
 
-  // Freeze friction while any assistance channel is active.
+  // Pause friction only during an active guided tour (overlay drives the UI).
+  // FAQ sidebar / proactive toast must keep host detection alive — SDK chrome
+  // is already ignored via FRICTION_SDK_CHROME_SELECTOR.
   useEffect(() => {
     if (!orchestrationEnabled) return;
-    if (assistanceState === 'none') {
-      friction.start();
-    } else {
+    if (assistanceState === 'tour') {
       friction.stop();
+    } else {
+      friction.start();
     }
   }, [assistanceState, friction, orchestrationEnabled]);
 
@@ -384,9 +518,6 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     orchestrationEnabled &&
     (assistanceState !== 'none' || Date.now() < mlPausedUntil);
 
-  const proactiveCooldownUntilRef = useRef(0);
-  const abandonmentResultRef = useRef<AbandonmentPredictionClientResult | null>(null);
-
   const tryProactiveAbandonmentHelp = useCallback(() => {
     if (!abandonmentConfig?.proactiveHelp) return;
 
@@ -400,7 +531,16 @@ export function useOnboarding(options?: UseOnboardingOptions) {
 
     const signals = friction.getSignals();
     const signalCount = countAbandonmentSignals(friction.counters);
-    const verdict = evaluateAbandonmentToastEligibility({
+    const assistanceBlocked =
+      orchestrationEnabled &&
+      (assistanceStateRef.current !== 'none' || Date.now() < mlPausedUntil);
+    const now = Date.now();
+    const cooldownMs = abandonmentConfig.proactiveCooldownMs ?? 60_000;
+    const cooldownActive = now < proactiveCooldownUntilRef.current;
+
+    const verdict = evaluateHelpDecision({
+      counters: friction.counters,
+      signalTimestamps: friction.signalTimestamps,
       result: abandonmentResultRef.current,
       threshold: abandonmentConfig.threshold ?? 0.5,
       minConfidence: abandonmentConfig.minConfidence ?? defaultAbandonmentMinConfidence(),
@@ -408,6 +548,8 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       sessionSeconds: signals.elapsedSeconds,
       signalCount,
       intentPolicy,
+      assistanceBlocked,
+      cooldownActive,
       idle: {
         seconds: signals.idleSeconds,
         localRisk: normalizeFrictionScore(frictionScore.score),
@@ -421,10 +563,6 @@ export function useOnboarding(options?: UseOnboardingOptions) {
 
     if (!verdict.eligible) return;
 
-    const now = Date.now();
-    const cooldownMs = abandonmentConfig.proactiveCooldownMs ?? 60_000;
-    if (now < proactiveCooldownUntilRef.current) return;
-
     if (orchestrationEnabled) {
       const accepted = transitionAssistance('proactiveToast');
       if (!accepted) return;
@@ -434,6 +572,31 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     if (!orchestrationEnabled) {
       friction.signalHelpTriggered();
     }
+
+    const countersSnapshot: HelpOutcomeCountersSnapshot = { ...friction.counters };
+    lastHelpOfferRef.current = {
+      counters: countersSnapshot,
+      via: verdict.via,
+      reason: verdict.reason,
+      frictionLevel: verdict.friction.level,
+      mlRisk: verdict.mlAdvisory.risk,
+      sessionSeconds: signals.elapsedSeconds,
+      pageSeconds: signals.pageSeconds,
+      idleSeconds: signals.idleSeconds,
+    };
+    emitHelpOutcome({
+      type: 'help_offered',
+      via: verdict.via ?? 'friction_only',
+      reason: verdict.reason,
+      frictionLevel: verdict.friction.level,
+      counters: countersSnapshot,
+      mlRisk: verdict.mlAdvisory.risk,
+      sessionSeconds: signals.elapsedSeconds,
+      pageSeconds: signals.pageSeconds,
+      idleSeconds: signals.idleSeconds,
+      at: now,
+    });
+
     requestProactiveHelp({
       message:
         abandonmentConfig.proactiveToastMessage ??
@@ -446,7 +609,9 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       cooldownMs,
       via: verdict.via,
       intent: sessionIntent,
+      pagePolicy: resolvedAbandonmentPolicy.pagePolicyLabel,
       reason: verdict.reason,
+      frictionLevel: verdict.friction.level,
     });
   }, [
     abandonmentConfig,
@@ -456,6 +621,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     intentPolicy,
     mlPausedUntil,
     orchestrationEnabled,
+    resolvedAbandonmentPolicy.pagePolicyLabel,
     sessionIntent,
     tour.isOpen,
     transitionAssistance,
@@ -721,6 +887,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       abandonmentPrediction,
       abandonmentSessionIntent: sessionIntent,
       abandonmentIntentPolicy: intentPolicy,
+      abandonmentPagePolicyLabel: resolvedAbandonmentPolicy.pagePolicyLabel,
       assistanceState,
       assistanceMlPaused: mlAssistancePaused,
       assistance,
@@ -743,6 +910,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       abandonmentPrediction,
       sessionIntent,
       intentPolicy,
+      resolvedAbandonmentPolicy.pagePolicyLabel,
       assistanceState,
       mlAssistancePaused,
       assistance,

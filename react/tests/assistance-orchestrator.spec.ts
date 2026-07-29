@@ -23,6 +23,7 @@ describe('canTransitionAssistance', () => {
   it('allows manual faq open/close from none', () => {
     expect(canTransitionAssistance('none', 'faq')).toBe(true);
     expect(canTransitionAssistance('faq', 'none')).toBe(true);
-    expect(canTransitionAssistance('tour', 'faq')).toBe(false);
+    expect(canTransitionAssistance('tour', 'faq')).toBe(true);
+    expect(canTransitionAssistance('tour', 'none')).toBe(true);
   });
 });

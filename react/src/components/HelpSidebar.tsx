@@ -1,9 +1,10 @@
-import { CSSProperties, useCallback, useEffect, useMemo, useState } from 'react';
+import { CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { subscribeProactiveHelp } from '../utils/proactive-help-bus';
 import { useFaqSemanticSearch, type UseFaqSemanticSearchOptions } from '../hooks/useFaqSemanticSearch';
 import { useFaqFrequentQuestions } from '../hooks/useFaqFrequentQuestions';
 import { useHelpDockSide } from '../hooks/useHelpDockSide';
 import type { FaqContentOptions, FaqPageContext, FaqSemanticSearchResult, SDKConfig } from '../types';
+import type { SupportTicketSessionContext } from '../types/support';
 import {
   buildContextualFaqSuggestions,
   collectFaqPageContext,
@@ -53,6 +54,9 @@ export interface HelpSidebarProps extends UseFaqSemanticSearchOptions, FaqConten
   onDockSideChange?: (side: 'left' | 'right') => void;
   /** When set, skips internal collision resolution (used by `TourViewer` orchestration). */
   resolvedDockSide?: 'left' | 'right';
+  /** Runtime context merged into support ticket `session_data`. */
+  supportTicketContext?: Partial<SupportTicketSessionContext>;
+  resolveSupportTicketContext?: () => Partial<SupportTicketSessionContext>;
 }
 
 export function HelpSidebar({
@@ -95,6 +99,13 @@ export function HelpSidebar({
   frequentQuestionsMode,
   frequentQuestionsLimit,
   projectKey,
+  supportContactUrl,
+  supportContactLabel,
+  supportInlineForm,
+  supportExternalWidget,
+  supportExternalWidgetLabel,
+  supportTicketContext,
+  resolveSupportTicketContext,
 }: HelpSidebarProps) {
   const themeVars = useThemeCssVars(theme);
   const resolvedPushTargetSelector = useMemo(
@@ -118,6 +129,7 @@ export function HelpSidebar({
   });
   const resolvedSide = resolvedDockSide ?? autoDockSide;
   const [open, setOpen] = useState(!startCollapsed);
+  const prevOpenForNotifyRef = useRef<boolean | null>(null);
   // Keep measuring while open so overlay panels can clear an inner host scrollbar.
   const tabEdgeInset = useHelpTabEdgeInset(resolvedSide, enabled, open);
   const [query, setQuery] = useState('');
@@ -171,6 +183,11 @@ export function HelpSidebar({
         starterQuestions,
         frequentQuestionsMode,
         frequentQuestionsLimit,
+        supportContactUrl,
+        supportContactLabel,
+        supportInlineForm,
+        supportExternalWidget,
+        supportExternalWidgetLabel,
       }),
     [
       subtitle,
@@ -182,6 +199,11 @@ export function HelpSidebar({
       starterQuestions,
       frequentQuestionsMode,
       frequentQuestionsLimit,
+      supportContactUrl,
+      supportContactLabel,
+      supportInlineForm,
+      supportExternalWidget,
+      supportExternalWidgetLabel,
     ],
   );
 
@@ -252,6 +274,11 @@ export function HelpSidebar({
   }, [open, resolvedPushTargetSelector, resolvedSide, sidebarLayout]);
 
   useEffect(() => {
+    const prev = prevOpenForNotifyRef.current;
+    prevOpenForNotifyRef.current = open;
+    // Only notify on real open/close transitions — `onOpenChange` identity
+    // changes must not re-fire while the sidebar stays open (e.g. after a tour).
+    if (prev === open) return;
     onOpenChange?.(open);
   }, [onOpenChange, open]);
 
@@ -359,6 +386,14 @@ export function HelpSidebar({
               onClose={closeSidebar}
               showCloseButton
               autoFocus
+              supportContactUrl={contentOptions.supportContactUrl}
+              supportContactLabel={contentOptions.supportContactLabel}
+              supportPresentation={contentOptions.supportPresentation}
+              supportTicketConfig={config}
+              supportTicketContext={supportTicketContext}
+              resolveSupportTicketContext={resolveSupportTicketContext}
+              supportExternalWidget={contentOptions.supportExternalWidget}
+              supportExternalWidgetLabel={contentOptions.supportExternalWidgetLabel}
             />
           </aside>
         </>

@@ -7,15 +7,36 @@ import {
   hasMinimumAbandonmentSignals,
 } from '../src/utils/abandonment-features';
 
+const EMPTY_COUNTERS = {
+  clickMiss: 0,
+  scrollHesitation: 0,
+  timeOnPageExcessive: 0,
+  formAbandonment: 0,
+  navigationBack: 0,
+  rageClick: 0,
+  errorClick: 0,
+  formRetry: 0,
+  navigationLoop: 0,
+  uTurn: 0,
+  slowResponse: 0,
+  faqNoResult: 0,
+  faqReopen: 0,
+  failAfterHelp: 0,
+};
+
 describe('buildAbandonmentRawFeatures', () => {
   it('maps friction counters to backend raw schema units', () => {
     const features = buildAbandonmentRawFeatures(
       {
+        ...EMPTY_COUNTERS,
         clickMiss: 2,
         scrollHesitation: 1,
         timeOnPageExcessive: 1,
-        formAbandonment: 0,
         navigationBack: 1,
+        rageClick: 1,
+        errorClick: 1,
+        slowResponse: 2,
+        faqNoResult: 1,
       },
       {
         elapsedSeconds: 83,
@@ -23,7 +44,7 @@ describe('buildAbandonmentRawFeatures', () => {
         idleSeconds: 12,
         maxScrollDepth: 41.4,
         pageVisitCount: 2,
-        hasError: true,
+        hasError: false,
         helpTriggered: true,
       },
     );
@@ -31,8 +52,8 @@ describe('buildAbandonmentRawFeatures', () => {
     expect(features).toEqual({
       timeOnPage: 83,
       scrollDepth: 41,
-      clickMisses: 2,
-      hesitations: 1,
+      clickMisses: 3,
+      hesitations: 4,
       helpTriggered: 1,
       hasError: 1,
       multiplePages: 1,
@@ -43,13 +64,7 @@ describe('buildAbandonmentRawFeatures', () => {
 
   it('defaults scrollDepth to 0 when user never scrolled', () => {
     const features = buildAbandonmentRawFeatures(
-      {
-        clickMiss: 0,
-        scrollHesitation: 0,
-        timeOnPageExcessive: 0,
-        formAbandonment: 0,
-        navigationBack: 0,
-      },
+      { ...EMPTY_COUNTERS },
       {
         elapsedSeconds: 5,
         pageSeconds: 5,
@@ -65,18 +80,53 @@ describe('buildAbandonmentRawFeatures', () => {
     expect(features.multiplePages).toBe(0);
     expect(features.pageTime).toBe(5);
   });
+
+  it('folds phase-2 nav stagnation into multiplePages', () => {
+    const features = buildAbandonmentRawFeatures(
+      { ...EMPTY_COUNTERS, navigationLoop: 1 },
+      {
+        elapsedSeconds: 20,
+        pageSeconds: 5,
+        idleSeconds: 0,
+        maxScrollDepth: 0,
+        pageVisitCount: 1,
+        hasError: false,
+        helpTriggered: false,
+      },
+    );
+    expect(features.multiplePages).toBe(1);
+  });
 });
 
 describe('abandonment signal gating', () => {
-  it('counts click misses and hesitations as signals', () => {
-    expect(countAbandonmentSignals({ clickMiss: 1, scrollHesitation: 0, timeOnPageExcessive: 0, formAbandonment: 0, navigationBack: 0 })).toBe(1);
-    expect(hasMinimumAbandonmentSignals({ clickMiss: 1, scrollHesitation: 1, timeOnPageExcessive: 0, formAbandonment: 0, navigationBack: 0 }, 2)).toBe(true);
+  it('counts click misses, hesitations and phase-1/2 signals', () => {
+    expect(countAbandonmentSignals({ ...EMPTY_COUNTERS, clickMiss: 1 })).toBe(1);
+    expect(
+      hasMinimumAbandonmentSignals({ ...EMPTY_COUNTERS, clickMiss: 1, scrollHesitation: 1 }, 2),
+    ).toBe(true);
+    expect(countAbandonmentSignals({ ...EMPTY_COUNTERS, rageClick: 1, errorClick: 1 })).toBe(2);
+    expect(
+      countAbandonmentSignals({
+        ...EMPTY_COUNTERS,
+        navigationLoop: 1,
+        uTurn: 1,
+        slowResponse: 1,
+      }),
+    ).toBe(3);
+    expect(
+      countAbandonmentSignals({
+        ...EMPTY_COUNTERS,
+        faqNoResult: 1,
+        faqReopen: 1,
+        failAfterHelp: 1,
+      }),
+    ).toBe(3);
   });
 
   it('opens ML gate on temporal stall only when allowed', () => {
     expect(
       hasMinimumAbandonmentSignals(
-        { clickMiss: 0, scrollHesitation: 0, timeOnPageExcessive: 1, formAbandonment: 0, navigationBack: 0 },
+        { ...EMPTY_COUNTERS, timeOnPageExcessive: 1 },
         2,
         {
           elapsedSeconds: 20,
@@ -93,7 +143,7 @@ describe('abandonment signal gating', () => {
 
     expect(
       hasMinimumAbandonmentSignals(
-        { clickMiss: 0, scrollHesitation: 0, timeOnPageExcessive: 1, formAbandonment: 0, navigationBack: 0 },
+        { ...EMPTY_COUNTERS, timeOnPageExcessive: 1 },
         2,
         {
           elapsedSeconds: 75,

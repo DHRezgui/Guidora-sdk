@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { resolveSDKConfig } from '../core/sdk-state';
 import type { FaqSearchOptions, FaqSemanticSearchResult, SDKConfig } from '../types';
 import { searchFaq } from '../utils/faq-search-client';
+import { emitFaqFriction, isWeakFaqSearch } from '../utils/friction-advanced-signals';
+import { recordSupportFaqSearch } from '../utils/support-ticket-runtime-signals';
 
 export interface UseFaqSemanticSearchOptions extends FaqSearchOptions {
   config?: Partial<SDKConfig>;
@@ -95,6 +97,31 @@ export function useFaqSemanticSearch(
           setResults(response.results);
           setLastStrategyStep(response.strategyStep);
           setLastQuery(response.query);
+          recordSupportFaqSearch(response.query);
+          const queryText = (response.query ?? question).trim();
+          const topScore = response.results[0]?.score ?? null;
+          emitFaqFriction({
+            type: 'search',
+            query: queryText,
+            resultCount: response.results.length,
+            strategyStep: response.strategyStep,
+            topScore,
+          });
+          if (
+            isWeakFaqSearch({
+              resultCount: response.results.length,
+              strategyStep: response.strategyStep,
+              topScore,
+            })
+          ) {
+            emitFaqFriction({
+              type: 'noResult',
+              query: queryText,
+              resultCount: response.results.length,
+              strategyStep: response.strategyStep,
+              topScore,
+            });
+          }
           setError(null);
           return response.results;
         }
@@ -102,6 +129,7 @@ export function useFaqSemanticSearch(
         setResults([]);
         setLastStrategyStep(response.strategyStep);
         setLastQuery(response.query);
+        recordSupportFaqSearch(response.query);
         setError(response.error);
         return [];
       } finally {

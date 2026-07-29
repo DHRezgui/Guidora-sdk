@@ -232,7 +232,12 @@ export function resolveHostFaqTheme(options: ResolveHostFaqThemeOptions = {}): H
     ? window.getComputedStyle(doc.body).fontFamily
     : window.getComputedStyle(doc.documentElement).fontFamily;
   if (fontFamily) {
-    cssVars['--td-font-family'] = fontFamily;
+    // Keep a real sans fallback: unloaded host fonts (e.g. Geist after next/font removal)
+    // otherwise resolve to the browser default serif and break chameleon UI.
+    const hasGenericSans = /sans-serif|system-ui|ui-sans-serif/i.test(fontFamily);
+    cssVars['--td-font-family'] = hasGenericSans
+      ? fontFamily
+      : `${fontFamily}, system-ui, -apple-system, sans-serif`;
     mappedTokenCount += 1;
   }
 

@@ -33,6 +33,8 @@ function isElementVisible(element: Element): boolean {
   if (element.getAttribute('aria-hidden') === 'true') return false;
   const style = window.getComputedStyle(element);
   if (style.display === 'none' || style.visibility === 'hidden') return false;
+  // Framer exit animations keep layout box while opacity → 0; ignore those.
+  if (Number.parseFloat(style.opacity || '1') < 0.1) return false;
   const rect = element.getBoundingClientRect();
   return rect.width > 0 && rect.height > 0;
 }
@@ -99,6 +101,74 @@ export function getLogicalPageKey(): string {
     resolveActiveNavLabel(),
     resolvePrimaryHeading(),
   ].join('\u0001');
+}
+
+/**
+ * True when the key only *enriched* / refined empty title/nav/H1 slots on the same URL
+ * (typical after a hard refresh / first paint). Not a real user navigation.
+ *
+ * Refinement includes cases like title "orbit crm" → "settings | orbit crm".
+ */
+export function logicalPageUrl(key: string): string {
+  return (key.split('\u0001')[0] || '').trim();
+}
+
+export function isSameLogicalPageUrl(a: string, b: string): boolean {
+  const urlA = logicalPageUrl(a);
+  const urlB = logicalPageUrl(b);
+  return Boolean(urlA) && urlA === urlB;
+}
+
+/**
+ * Stable identity for friction nav signals.
+ * On soft SPAs (same URL), prefer `aria-current` nav cue — it updates synchronously
+ * on click, while H1 often lags behind exit animations (Framer AnimatePresence).
+ */
+export function resolveFrictionPageIdentity(fullKey: string): string {
+  const url = logicalPageUrl(fullKey);
+  const parts = fullKey.split('\u0001');
+  const nav = (parts[2] || '').trim();
+  const heading = (parts[3] || '').trim();
+  if (nav) return `${url}\u0001nav:${nav}`;
+  if (heading) return `${url}\u0001h1:${heading}`;
+  return url || fullKey;
+}
+
+export function isLogicalPageKeyStabilization(
+  previousKey: string,
+  nextKey: string,
+): boolean {
+  if (!previousKey || !nextKey || previousKey === nextKey) return false;
+
+  const previousParts = previousKey.split('\u0001');
+  const nextParts = nextKey.split('\u0001');
+  const previousUrl = previousParts[0] || '';
+  const nextUrl = nextParts[0] || '';
+  if (previousUrl !== nextUrl) return false;
+
+  const previousMeta = previousParts.slice(1);
+  const nextMeta = nextParts.slice(1);
+  const slotCount = Math.max(previousMeta.length, nextMeta.length);
+
+  let changedSlots = 0;
+  let conflictingSlots = 0;
+  for (let index = 0; index < slotCount; index += 1) {
+    const previousValue = (previousMeta[index] || '').trim();
+    const nextValue = (nextMeta[index] || '').trim();
+    if (previousValue === nextValue) continue;
+    changedSlots += 1;
+    if (isLandmarkRefinement(previousValue, nextValue)) continue;
+    conflictingSlots += 1;
+  }
+
+  return changedSlots > 0 && conflictingSlots === 0;
+}
+
+function isLandmarkRefinement(previousValue: string, nextValue: string): boolean {
+  if (!previousValue && nextValue) return true;
+  if (previousValue && !nextValue) return false;
+  if (!previousValue && !nextValue) return true;
+  return nextValue.includes(previousValue) || previousValue.includes(nextValue);
 }
 
 /**

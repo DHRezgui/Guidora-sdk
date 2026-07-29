@@ -27,3 +27,4 @@ export * from './useTourTargetResolver';
 export * from './useTourTriggerConditions';
 export * from './useTrackBatch';
 export * from './useTrackEvent';
+export * from './useSupportTicketSubmit';

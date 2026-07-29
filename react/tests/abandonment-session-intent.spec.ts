@@ -63,6 +63,8 @@ describe('resolveAbandonmentIntentPolicy', () => {
 
     expect(policy.threshold).toBe(0.4);
     expect(policy.minSessionSeconds).toBe(150);
+    expect(policy.minDistinctFamilies).toBe(2);
+    expect(policy.requireMultiFamilyForToast).toBe(true);
     expect(policy.allowTemporalMlGate).toBe(
       DEFAULT_ABANDONMENT_INTENT_POLICIES.onboarding.allowTemporalMlGate,
     );

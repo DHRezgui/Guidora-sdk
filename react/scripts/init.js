@@ -278,18 +278,22 @@ function formatFaqBlock() {
         // hostThemeReference: '[data-tour-id="your-anchor"]',
         // avoidSelectors: ['[data-tour-id="your-anchor"]'],
         // pageContext: { suggestionKeywords: ['keyword-one', 'keyword-two'] },
+        // supportContactUrl: process.env.NEXT_PUBLIC_TRUSTDEV_SUPPORT_URL, // mailto: or https://
+        // supportContactLabel: 'Contacter le support',
       }}`;
 }
 
 /**
  * Universal abandonment wiring for lab/e2e scaffolds.
  * - Friction listeners already run with TourViewer; this opts into ML + toast + debug panel.
- * - No host-specific thresholds (unlike ad-hoc test_13 lab tuning) — SDK intent policies apply.
+ * - Thresholds = SDK intent policies + Phase 4 combination defaults (no host bias).
+ * - Optional host overrides (`intentPolicies`, `pagePolicies`) only when the product needs them.
  * - Kill-switch: NEXT_PUBLIC_TRUSTDEV_ABANDONMENT=false
  */
 function formatAbandonmentConfigLines() {
   return `      // Friction tracking is always on with TourViewer; this enables ML predict + proactive toast.
-      // Thresholds/confidence come from SDK intent policies (no host-specific bias).
+      // Thresholds/confidence/combination come from SDK intent policies (no host-specific bias).
+      // Optional later: intentPolicies / pagePolicies for product-specific calibration.
       // Disable: NEXT_PUBLIC_TRUSTDEV_ABANDONMENT=false
       abandonmentPrediction: {
         enabled: process.env.NEXT_PUBLIC_TRUSTDEV_ABANDONMENT !== 'false',

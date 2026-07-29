@@ -5,6 +5,9 @@ import type {
   FaqFrequentQuestionsMode,
   FaqPageContext,
 } from '../types/faq';
+import type { SupportExternalWidgetOptions } from '../types/support';
+import { normalizeSupportContactUrl } from './support-contact';
+import { resolveSupportPresentation, type SupportPresentation } from './support-ticket-context';
 
 export interface ResolvedFaqContentOptions {
   subtitle: string;
@@ -16,6 +19,12 @@ export interface ResolvedFaqContentOptions {
   frequentQuestionsMode: FaqFrequentQuestionsMode;
   frequentQuestionsLimit: number;
   starterQuestions: string[];
+  supportContactUrl: string | null;
+  supportContactLabel: string;
+  supportInlineForm: boolean;
+  supportPresentation: SupportPresentation;
+  supportExternalWidget: SupportExternalWidgetOptions | null;
+  supportExternalWidgetLabel: string;
 }
 
 export const DEFAULT_END_USER_FAQ_SUBTITLE =
@@ -23,6 +32,21 @@ export const DEFAULT_END_USER_FAQ_SUBTITLE =
 
 export const DEFAULT_DEVELOPER_FAQ_SUBTITLE =
   'Recherche sémantique sur la base d’aide de votre organisation';
+
+export const DEFAULT_SUPPORT_CONTACT_LABEL = 'Contacter le support';
+export const DEFAULT_SUPPORT_EXTERNAL_WIDGET_LABEL = 'Ouvrir le chat';
+
+function resolveExternalWidget(
+  options?: SupportExternalWidgetOptions | null,
+): SupportExternalWidgetOptions | null {
+  if (!options?.provider) return null;
+  if (!['intercom', 'crisp', 'custom'].includes(options.provider)) return null;
+  return {
+    provider: options.provider,
+    openSelector: options.openSelector?.trim() || undefined,
+    openUrl: options.openUrl?.trim() || undefined,
+  };
+}
 
 const GENERIC_PAGE_TITLES = /^v0 app$|^next\.js|^localhost|^untitled/i;
 
@@ -91,6 +115,8 @@ export function resolveFaqContentOptions(
   const audience = options.audience ?? 'end-user';
   const isEndUser = audience === 'end-user';
 
+  const supportContactUrl = normalizeSupportContactUrl(options.supportContactUrl);
+
   return {
     subtitle:
       options.subtitle ??
@@ -103,5 +129,16 @@ export function resolveFaqContentOptions(
     frequentQuestionsMode: options.frequentQuestionsMode ?? (isEndUser ? 'auto' : 'off'),
     frequentQuestionsLimit: options.frequentQuestionsLimit ?? 4,
     starterQuestions: options.starterQuestions ?? [],
+    supportContactUrl,
+    supportContactLabel:
+      options.supportContactLabel?.trim() || DEFAULT_SUPPORT_CONTACT_LABEL,
+    supportInlineForm: options.supportInlineForm === true,
+    supportPresentation: resolveSupportPresentation({
+      supportInlineForm: options.supportInlineForm,
+      supportContactUrl,
+    }),
+    supportExternalWidget: resolveExternalWidget(options.supportExternalWidget),
+    supportExternalWidgetLabel:
+      options.supportExternalWidgetLabel?.trim() || DEFAULT_SUPPORT_EXTERNAL_WIDGET_LABEL,
   };
 }

@@ -1,6 +1,6 @@
 import type { AssistanceState } from '../types/ml';
 
-/** Delay before ML polling resumes after a guided tour ends. */
+/** Delay before ML / proactive toast can resume after help UI is dismissed. */
 export const ASSISTANCE_ML_RESUME_DELAY_MS = 5_000;
 
 export const ASSISTANCE_STATE_LABELS: Record<AssistanceState, string> = {
@@ -23,7 +23,8 @@ export function canTransitionAssistance(
   if (from === 'none' && (to === 'faq' || to === 'proactiveToast')) return true;
   if (from === 'proactiveToast' && (to === 'faq' || to === 'none')) return true;
   if (from === 'faq' && to === 'none') return true;
-  if (from === 'tour' && to === 'none') return true;
+  // Tour end may restore FAQ while the help sidebar stayed open.
+  if (from === 'tour' && (to === 'none' || to === 'faq')) return true;
   return false;
 }
 

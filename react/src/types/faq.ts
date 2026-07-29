@@ -91,6 +91,31 @@ export interface FaqContentOptions {
   frequentQuestionsLimit?: number;
   /** Manual prompts when `frequentQuestionsMode` is `manual`. */
   starterQuestions?: string[];
+  /**
+   * Direct support CTA URL shown at the bottom of the help panel
+   * (`mailto:…`, `https://…`, or `tel:…`). Omit to hide the button.
+   */
+  supportContactUrl?: string;
+  /** Label for the support CTA (default: « Contacter le support »). */
+  supportContactLabel?: string;
+  /**
+   * When `true`, shows an inline ticket form instead of the external link.
+   * Also shown when `supportContactUrl` is omitted.
+   */
+  supportInlineForm?: boolean;
+  /**
+   * Opens a host Intercom / Crisp / custom chat launcher from the support section.
+   * Does not embed third-party scripts — the host must already load the widget.
+   */
+  supportExternalWidget?: import('./support').SupportExternalWidgetOptions;
+  /** Label for the external chat button (default: « Ouvrir le chat »). */
+  supportExternalWidgetLabel?: string;
+  /**
+   * Optional partial override for support email branding.
+   * By default the SDK auto-detects product name, accent colors and logo from the host
+   * (document title / meta / CSS tokens / favicon) — same chameleon idea as FAQ `themeMode: 'host'`.
+   */
+  supportBrand?: import('./support').SupportEmailBrand;
 }
 
 /** Options for `FaqSearchWidget`, `HelpSidebar`, and `TourViewer` prop `faq`. */

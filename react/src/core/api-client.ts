@@ -241,4 +241,14 @@ export const sdkApiClient = {
     const qs = search.toString();
     return request(config, `/faq/suggestions${qs ? `?${qs}` : ''}`, { method: 'GET' });
   },
+
+  createSupportTicket(
+    config: NormalizedSDKConfig,
+    payload: import('../types/support').CreateSupportTicketRequest,
+  ): Promise<import('../types/support').CreateSupportTicketResponse> {
+    return request(config, '/support/tickets', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
 };

@@ -1,10 +1,13 @@
-import { FormEvent, KeyboardEvent, useCallback, useEffect, useRef } from 'react';
+import { FormEvent, KeyboardEvent, useCallback, useEffect, useRef, useState } from 'react';
 import type { UseFaqSemanticSearchResult } from '../hooks/useFaqSemanticSearch';
 import type { FaqAudienceMode } from '../types/faq';
 import type { ContextualFaqSuggestion } from '../utils/faq-context';
 import type { FaqPageContext, FaqSemanticSearchResult, SDKConfig } from '../types';
 import { formatFaqCategoryLabel } from '../utils/faq-content';
 import { useFaqResultUsageTracking, type FaqFeedbackChoice } from '../hooks/useFaqResultUsageTracking';
+import { SupportTicketForm } from './SupportTicketForm';
+import type { SupportPresentation } from '../utils/support-ticket-context';
+import type { SupportExternalWidgetOptions, SupportTicketSessionContext } from '../types/support';
 
 function formatScore(score: number): string {
   return `${Math.round(Math.max(0, Math.min(1, score)) * 100)}%`;
@@ -128,6 +131,15 @@ export interface FaqSearchPanelProps {
   showCloseButton?: boolean;
   compact?: boolean;
   autoFocus?: boolean;
+  /** Safe mailto/https/tel URL — hides the CTA when null/undefined. */
+  supportContactUrl?: string | null;
+  supportContactLabel?: string;
+  supportPresentation?: SupportPresentation;
+  supportTicketConfig?: Partial<SDKConfig>;
+  supportTicketContext?: Partial<SupportTicketSessionContext>;
+  resolveSupportTicketContext?: () => Partial<SupportTicketSessionContext>;
+  supportExternalWidget?: SupportExternalWidgetOptions | null;
+  supportExternalWidgetLabel?: string;
 }
 
 export function FaqSearchPanel({
@@ -161,8 +173,17 @@ export function FaqSearchPanel({
   showCloseButton = false,
   compact = false,
   autoFocus = false,
+  supportContactUrl = null,
+  supportContactLabel = 'Contacter le support',
+  supportPresentation = 'none',
+  supportTicketConfig,
+  supportTicketContext,
+  resolveSupportTicketContext,
+  supportExternalWidget = null,
+  supportExternalWidgetLabel = 'Ouvrir le chat',
 }: FaqSearchPanelProps) {
   const inputRef = useRef<HTMLInputElement>(null);
+  const [supportOpen, setSupportOpen] = useState(false);
   const resolvedShowResultFeedback =
     showResultFeedback ?? (audience === 'end-user' && Boolean(trackingConfig));
   const { submitFeedback, getFeedbackForResult } = useFaqResultUsageTracking(
@@ -176,6 +197,13 @@ export function FaqSearchPanel({
     const timer = window.setTimeout(() => inputRef.current?.focus(), 80);
     return () => window.clearTimeout(timer);
   }, [autoFocus]);
+
+  // Open support only when FAQ search clearly failed — keep the form collapsed otherwise.
+  useEffect(() => {
+    if (!faq.isLoading && faq.lastQuery && faq.results.length === 0 && !faq.error) {
+      setSupportOpen(true);
+    }
+  }, [faq.error, faq.isLoading, faq.lastQuery, faq.results.length]);
 
   const onSubmit = (event: FormEvent) => {
     event.preventDefault();
@@ -222,11 +250,13 @@ export function FaqSearchPanel({
     showFrequentQuestionsSection &&
     !frequentQuestionsLoading &&
     starterQuestions.length > 0 &&
-    !faq.lastQuery &&
     !faq.isLoading &&
-    faq.results.length === 0;
+    !faq.lastQuery &&
+    faq.results.length === 0 &&
+    !faq.error;
 
-  return (    <section
+  return (
+    <section
       className={['trustdev-faq-panel', compact ? 'trustdev-faq-panel--compact' : ''].filter(Boolean).join(' ')}
       role="search"
       aria-label={title}
@@ -263,105 +293,190 @@ export function FaqSearchPanel({
         </div>
       ) : null}
 
-      {showStarterQuestions ? (
-        <div className="trustdev-faq-panel__suggestions">
-          <p className="trustdev-faq-panel__suggestions-label">Questions fréquentes</p>
-          <div className="trustdev-faq-panel__suggestion-list">
-            {starterQuestions.map((question) => (
-              <button
-                key={question}
-                type="button"
-                className="trustdev-faq-panel__suggestion-chip"
-                disabled={faq.isLoading}
-                onClick={() => handleStarterQuestion(question)}
-              >
-                {question}
-              </button>
-            ))}
-          </div>
-        </div>
-      ) : null}
+      <div className="trustdev-faq-panel__section trustdev-faq-panel__section--faq">
+        <p className="trustdev-faq-panel__section-label">Trouver une réponse</p>
 
-      {showSuggestions && suggestions.length > 0 ? (
-        <div className="trustdev-faq-panel__suggestions">
-          <p className="trustdev-faq-panel__suggestions-label">{suggestionsLabel}</p>          <div className="trustdev-faq-panel__suggestion-list">
-            {suggestions.map((suggestion) => (
-              <button
-                key={`${suggestion.label}-${suggestion.query}`}
-                type="button"
-                className="trustdev-faq-panel__suggestion-chip"
-                title={suggestion.reason}
-                disabled={faq.isLoading}
-                onClick={() => handleSuggestion(suggestion)}
-              >
-                {suggestion.label}
-              </button>
-            ))}
+        {showStarterQuestions ? (
+          <div className="trustdev-faq-panel__suggestions">
+            <p className="trustdev-faq-panel__suggestions-label">Questions fréquentes</p>
+            <div className="trustdev-faq-panel__suggestion-list">
+              {starterQuestions.map((question) => (
+                <button
+                  key={question}
+                  type="button"
+                  className="trustdev-faq-panel__suggestion-chip"
+                  disabled={faq.isLoading}
+                  onClick={() => handleStarterQuestion(question)}
+                >
+                  {question}
+                </button>
+              ))}
+            </div>
           </div>
-        </div>
-      ) : null}
+        ) : null}
 
-      <form className="trustdev-faq-panel__form" onSubmit={onSubmit}>
-        <input
-          ref={inputRef}
-          type="search"
-          className="trustdev-faq-panel__input"
-          value={query}
-          placeholder={placeholder}
-          aria-label="Question FAQ"
-          autoComplete="off"
-          onChange={(event) => handleQueryChange(event.target.value)}
-          onKeyDown={onInputKeyDown}
-        />
-        <button
-          type="submit"
-          className="trustdev-faq-panel__submit td-btn td-btn--primary"
-          disabled={faq.isLoading || query.trim().length === 0}
+        {showSuggestions && suggestions.length > 0 ? (
+          <div className="trustdev-faq-panel__suggestions">
+            <p className="trustdev-faq-panel__suggestions-label">{suggestionsLabel}</p>
+            <div className="trustdev-faq-panel__suggestion-list">
+              {suggestions.map((suggestion) => (
+                <button
+                  key={`${suggestion.label}-${suggestion.query}`}
+                  type="button"
+                  className="trustdev-faq-panel__suggestion-chip"
+                  title={suggestion.reason}
+                  disabled={faq.isLoading}
+                  onClick={() => handleSuggestion(suggestion)}
+                >
+                  {suggestion.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
+
+        <form className="trustdev-faq-panel__form" onSubmit={onSubmit}>
+          <input
+            ref={inputRef}
+            type="search"
+            className="trustdev-faq-panel__input"
+            value={query}
+            placeholder={placeholder}
+            aria-label="Question FAQ"
+            autoComplete="off"
+            onChange={(event) => handleQueryChange(event.target.value)}
+            onKeyDown={onInputKeyDown}
+          />
+          <button
+            type="submit"
+            className="trustdev-faq-panel__submit td-btn td-btn--primary"
+            disabled={faq.isLoading || query.trim().length === 0}
+          >
+            {faq.isLoading ? '…' : 'Rechercher'}
+          </button>
+        </form>
+
+        {faq.error ? (
+          <p className="trustdev-faq-panel__status trustdev-faq-panel__status--error" role="alert">
+            {faq.error}
+          </p>
+        ) : null}
+
+        {faq.isLoading ? (
+          <p className="trustdev-faq-panel__status" aria-live="polite">
+            Recherche en cours…
+            {showDetailedLoadingHint ? ' Première requête parfois plus longue.' : null}
+          </p>
+        ) : null}
+        {!faq.isLoading && faq.lastQuery && faq.results.length === 0 && !faq.error ? (
+          <p className="trustdev-faq-panel__status" aria-live="polite">
+            Aucune réponse pertinente. Reformulez votre question.
+          </p>
+        ) : null}
+
+        {faq.results.length > 0 ? (
+          <ul className="trustdev-faq-panel__results" aria-live="polite">
+            {faq.results.map((result) => (
+              <li key={result.id}>
+                <FaqSearchResultCard
+                  result={result}
+                  audience={audience}
+                  showResultScore={showResultScore}
+                  showResultFeedback={resolvedShowResultFeedback}
+                  feedbackChoice={getFeedbackForResult(result.id)}
+                  onFeedback={(helpful) => submitFeedback(result.id, helpful)}
+                  onResultClick={onResultClick}
+                />
+              </li>
+            ))}
+          </ul>
+        ) : null}
+
+        {showStrategyFootnote && faq.lastStrategyStep ? (
+          <p className="trustdev-faq-panel__footnote">
+            Stratégie : {faq.lastStrategyStep.replace(/_/g, ' ')}
+          </p>
+        ) : null}
+      </div>
+
+      {supportPresentation === 'form' ? (
+        <div
+          className={[
+            'trustdev-faq-panel__support',
+            supportOpen ? 'trustdev-faq-panel__support--open' : 'trustdev-faq-panel__support--collapsed',
+          ].join(' ')}
         >
-          {faq.isLoading ? '…' : 'Rechercher'}
-        </button>
-      </form>
-
-      {faq.error ? (
-        <p className="trustdev-faq-panel__status trustdev-faq-panel__status--error" role="alert">
-          {faq.error}
-        </p>
-      ) : null}
-
-      {faq.isLoading ? (
-        <p className="trustdev-faq-panel__status" aria-live="polite">
-          Recherche en cours…
-          {showDetailedLoadingHint ? ' (la première requête peut prendre jusqu’à 2 min)' : null}
-        </p>
-      ) : null}
-      {!faq.isLoading && faq.lastQuery && faq.results.length === 0 && !faq.error ? (
-        <p className="trustdev-faq-panel__status" aria-live="polite">
-          Aucune réponse pertinente. Reformulez votre question.
-        </p>
-      ) : null}
-
-      {faq.results.length > 0 ? (
-        <ul className="trustdev-faq-panel__results" aria-live="polite">
-          {faq.results.map((result) => (
-            <li key={result.id}>
-              <FaqSearchResultCard
-                result={result}
-                audience={audience}
-                showResultScore={showResultScore}
-                showResultFeedback={resolvedShowResultFeedback}
-                feedbackChoice={getFeedbackForResult(result.id)}
-                onFeedback={(helpful) => submitFeedback(result.id, helpful)}
-                onResultClick={onResultClick}
+          <button
+            type="button"
+            className="trustdev-faq-panel__support-toggle"
+            aria-expanded={supportOpen}
+            onClick={() => setSupportOpen((open) => !open)}
+          >
+            <span className="trustdev-faq-panel__support-toggle-lead" aria-hidden>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8">
+                <path
+                  d="M8 10h8M8 14h5"
+                  strokeLinecap="round"
+                />
+                <path
+                  d="M20 12a8 8 0 0 1-11.3 7.3L5 20l.8-3.5A8 8 0 1 1 20 12Z"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </span>
+            <span className="trustdev-faq-panel__support-toggle-copy">
+              <span className="trustdev-faq-panel__support-toggle-title">
+                {supportOpen ? 'Masquer le formulaire' : 'Contacter le support'}
+              </span>
+              {!supportOpen ? (
+                <span className="trustdev-faq-panel__support-toggle-hint">
+                  Pas trouvé ? Envoyez-nous un message
+                </span>
+              ) : null}
+            </span>
+            <span
+              className={[
+                'trustdev-faq-panel__support-toggle-chevron',
+                supportOpen ? 'trustdev-faq-panel__support-toggle-chevron--open' : '',
+              ]
+                .filter(Boolean)
+                .join(' ')}
+              aria-hidden
+            >
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2.2">
+                <path d="M6 9l6 6 6-6" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </span>
+          </button>
+          {supportOpen ? (
+            <div className="trustdev-faq-panel__support-body">
+              <SupportTicketForm
+                config={supportTicketConfig ?? trackingConfig}
+                sessionContext={supportTicketContext}
+                resolveSessionContext={resolveSupportTicketContext}
+                title=""
+                externalWidget={supportExternalWidget}
+                externalWidgetLabel={supportExternalWidgetLabel}
               />
-            </li>
-          ))}
-        </ul>
+            </div>
+          ) : null}
+        </div>
       ) : null}
 
-      {showStrategyFootnote && faq.lastStrategyStep ? (
-        <p className="trustdev-faq-panel__footnote">
-          Stratégie : {faq.lastStrategyStep.replace(/_/g, ' ')}
-        </p>
-      ) : null}    </section>
+      {supportPresentation === 'link' && supportContactUrl ? (
+        <div className="trustdev-faq-panel__support">
+          <p className="trustdev-faq-panel__section-label">Contacter le support</p>
+          <a
+            className="trustdev-faq-panel__support-link"
+            href={supportContactUrl}
+            target={supportContactUrl.startsWith('http') ? '_blank' : undefined}
+            rel={supportContactUrl.startsWith('http') ? 'noopener noreferrer' : undefined}
+          >
+            {supportContactLabel}
+          </a>
+        </div>
+      ) : null}
+    </section>
   );
 }

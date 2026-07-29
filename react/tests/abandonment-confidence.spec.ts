@@ -134,6 +134,9 @@ describe('abandonment toast eligibility', () => {
         proactiveIdleMinSeconds: 150,
         proactiveIdleMinLocalRisk: 0.5,
         proactiveIdleMinSignals: 2,
+        minDistinctFamilies: 2,
+        allowStrongSingleFamily: true,
+        requireMultiFamilyForToast: true,
       },
     });
 
@@ -167,5 +170,93 @@ describe('abandonment toast eligibility', () => {
 
     expect(verdict.eligible).toBe(false);
     expect(verdict.reason).toContain('voie ML');
+  });
+
+  it('blocks ML toast when counters are same-family only (Phase 4)', () => {
+    const verdict = evaluateAbandonmentToastEligibility({
+      result: baseResult,
+      threshold: 0.4,
+      minConfidence: 0.3,
+      proactiveHelp: true,
+      sessionSeconds: 180,
+      signalCount: 2,
+      counters: {
+        clickMiss: 2,
+        scrollHesitation: 0,
+        timeOnPageExcessive: 0,
+        formAbandonment: 0,
+        navigationBack: 0,
+        rageClick: 0,
+        errorClick: 0,
+        formRetry: 0,
+        navigationLoop: 0,
+        uTurn: 0,
+        slowResponse: 0,
+        faqNoResult: 0,
+        faqReopen: 0,
+        failAfterHelp: 0,
+      },
+      intentPolicy: {
+        threshold: 0.4,
+        minConfidence: 0.3,
+        minSessionSeconds: 60,
+        minSignals: 2,
+        requireFrictionSignalsForMlToast: true,
+        allowTemporalMlGate: true,
+        proactiveIdleMinSeconds: 120,
+        proactiveIdleMinLocalRisk: 0.45,
+        proactiveIdleMinSignals: 2,
+        minDistinctFamilies: 2,
+        allowStrongSingleFamily: true,
+        requireMultiFamilyForToast: true,
+      },
+    });
+
+    expect(verdict.eligible).toBe(false);
+    expect(verdict.reason).toContain('combinaison');
+  });
+
+  it('allows ML toast with multi-family counters (Phase 4)', () => {
+    const verdict = evaluateAbandonmentToastEligibility({
+      result: baseResult,
+      threshold: 0.4,
+      minConfidence: 0.3,
+      proactiveHelp: true,
+      sessionSeconds: 180,
+      signalCount: 2,
+      counters: {
+        clickMiss: 1,
+        scrollHesitation: 0,
+        timeOnPageExcessive: 0,
+        formAbandonment: 0,
+        navigationBack: 0,
+        rageClick: 0,
+        errorClick: 0,
+        formRetry: 0,
+        navigationLoop: 0,
+        uTurn: 1,
+        slowResponse: 0,
+        faqNoResult: 0,
+        faqReopen: 0,
+        failAfterHelp: 0,
+      },
+      intentPolicy: {
+        threshold: 0.4,
+        minConfidence: 0.3,
+        minSessionSeconds: 60,
+        minSignals: 2,
+        requireFrictionSignalsForMlToast: true,
+        allowTemporalMlGate: true,
+        proactiveIdleMinSeconds: 120,
+        proactiveIdleMinLocalRisk: 0.45,
+        proactiveIdleMinSignals: 2,
+        minDistinctFamilies: 2,
+        allowStrongSingleFamily: true,
+        requireMultiFamilyForToast: true,
+      },
+    });
+
+    expect(verdict.eligible).toBe(true);
+    expect(verdict.via).toBe('ml');
   });
 });

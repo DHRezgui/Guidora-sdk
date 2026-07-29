@@ -6,12 +6,18 @@ import type { FrictionBehaviorSignals } from '../types/ml';
 import { countAbandonmentSignals } from '../utils/abandonment-features';
 import {
   defaultAbandonmentMinConfidence,
-  evaluateAbandonmentToastEligibility,
   resolveAbandonmentBaseProbability,
-  type AbandonmentToastEligibility,
 } from '../utils/abandonment-confidence';
 import { formatAbandonmentSessionIntent } from '../utils/abandonment-session-intent';
 import { formatAssistanceState } from '../utils/assistance-orchestrator';
+import {
+  evaluateFrictionCombination,
+  FRICTION_SIGNAL_FAMILY_LABELS,
+} from '../utils/friction-combination';
+import {
+  evaluateHelpDecision,
+  type HelpDecisionResult,
+} from '../utils/friction-decision-engine';
 import { normalizeFrictionScore } from '../utils/friction-scoring';
 import { AbandonmentRiskBadge } from './AbandonmentRiskBadge';
 
@@ -42,11 +48,14 @@ export interface AbandonmentDebugPanelProps {
   proactiveIdleMinSeconds?: number;
   sessionIntent?: import('../types/ml').AbandonmentSessionIntent;
   intentPolicy?: import('../types/ml').AbandonmentIntentPolicy;
+  /** Phase 4 — matched page policy label (if any). */
+  pagePolicyLabel?: string | null;
   assistanceState?: import('../types/ml').AssistanceState;
   assistanceMlPaused?: boolean;
   abandonment: UseAbandonmentPredictionResult;
   friction: {
     counters: FrictionCounters;
+    signalTimestamps?: import('../utils/friction-signal-freshness').FrictionSignalTimestamps;
     getSignals: () => FrictionBehaviorSignals;
   };
   frictionScore: FrictionScoreResult;
@@ -100,6 +109,7 @@ export function AbandonmentDebugPanel({
   proactiveIdleMinSeconds,
   sessionIntent,
   intentPolicy,
+  pagePolicyLabel,
   assistanceState,
   assistanceMlPaused = false,
   abandonment,
@@ -110,19 +120,31 @@ export function AbandonmentDebugPanel({
   // The friction hook updates `elapsedSeconds` based on time, but the debug panel only re-renders
   // when other state changes happen (prediction refresh / friction counters tier).
   // We force a 1s tick so the "Temps (s)" display increments smoothly while expanded.
-  const [, setTick] = useState(0);
+  const [tick, setTick] = useState(0);
 
   const signals = friction.getSignals();
   const signalCount = countAbandonmentSignals(friction.counters);
+  const combination = useMemo(
+    () =>
+      evaluateFrictionCombination({
+        counters: friction.counters,
+        minDistinctFamilies: intentPolicy?.minDistinctFamilies,
+        allowStrongSingleFamily: intentPolicy?.allowStrongSingleFamily,
+      }),
+    [friction.counters, intentPolicy?.minDistinctFamilies, intentPolicy?.allowStrongSingleFamily],
+  );
   const effectiveThreshold = intentPolicy?.threshold ?? threshold;
   const effectiveMinConfidence = intentPolicy?.minConfidence ?? minConfidence;
   const localRisk = useMemo(
     () => normalizeFrictionScore(frictionScore.score),
     [frictionScore.score],
   );
-  const toastEligibility = useMemo(
+  const helpDecision = useMemo(
     () =>
-      evaluateAbandonmentToastEligibility({
+      evaluateHelpDecision({
+        counters: friction.counters,
+        signalTimestamps: friction.signalTimestamps,
+        now: Date.now(),
         result: abandonment.result,
         threshold: effectiveThreshold,
         minConfidence: effectiveMinConfidence,
@@ -130,6 +152,7 @@ export function AbandonmentDebugPanel({
         sessionSeconds: signals.elapsedSeconds,
         signalCount,
         intentPolicy,
+        assistanceBlocked: assistanceMlPaused || assistanceState === 'tour' || assistanceState === 'faq',
         idle: {
           seconds: signals.idleSeconds,
           localRisk,
@@ -149,11 +172,16 @@ export function AbandonmentDebugPanel({
       proactiveIdleToast,
       proactiveIdleMinSeconds,
       intentPolicy,
+      friction.counters,
+      friction.signalTimestamps,
       signals.elapsedSeconds,
       signals.pageSeconds,
       signals.idleSeconds,
       localRisk,
       signalCount,
+      assistanceMlPaused,
+      assistanceState,
+      tick,
     ],
   );
   const explanation = abandonment.result?.prediction?.explanation;
@@ -264,15 +292,68 @@ export function AbandonmentDebugPanel({
             <Stat label="Inactivité (s)" value={Math.floor(signals.idleSeconds)} />
             <Stat label="Palier temps" value={friction.counters.timeOnPageExcessive} />
             <Stat label="Click-miss" value={friction.counters.clickMiss} />
+            <Stat label="Rage click" value={friction.counters.rageClick ?? 0} />
+            <Stat label="Error click" value={friction.counters.errorClick ?? 0} />
+            <Stat label="Form retry" value={friction.counters.formRetry ?? 0} />
+            <Stat label="Nav loop" value={friction.counters.navigationLoop ?? 0} />
+            <Stat label="U-turn" value={friction.counters.uTurn ?? 0} />
+            <Stat label="Slow resp." value={friction.counters.slowResponse ?? 0} />
+            <Stat label="FAQ faible" value={friction.counters.faqNoResult ?? 0} />
+            <Stat label="FAQ reopen" value={friction.counters.faqReopen ?? 0} />
+            <Stat label="Fail after help" value={friction.counters.failAfterHelp ?? 0} />
             <Stat label="Scroll hésit." value={friction.counters.scrollHesitation} />
-            <Stat label="Signaux" value={signalCount} />
             <Stat label="Scroll max" value={`${Math.round(signals.maxScrollDepth)}%`} />
+            <Stat
+              label="Familles"
+              value={
+                combination.familyCount > 0
+                  ? `${combination.familyCount}: ${combination.families
+                      .map((family) => FRICTION_SIGNAL_FAMILY_LABELS[family])
+                      .join(', ')}`
+                  : '0'
+              }
+            />
+            <Stat
+              label="Combinaison"
+              value={combination.eligible ? (combination.viaStrongSingle ? 'OK (fort)' : 'OK') : 'bloquée'}
+            />
+            {pagePolicyLabel ? <Stat label="Page policy" value={pagePolicyLabel} /> : null}
+            <Stat label="Signaux" value={signalCount} />
             <Stat label="Score local" value={`${Math.round(localRisk * 100)}%`} />
+            <Stat label="Friction" value={helpDecision.friction.levelLabel} />
+            <Stat
+              label="Raisons friction"
+              value={
+                helpDecision.friction.reasons.length > 0
+                  ? helpDecision.friction.reasons.slice(0, 3).join(' · ')
+                  : '—'
+              }
+            />
             <Stat label="Seuil toast" value={`${Math.round(effectiveThreshold * 100)}%`} />
             <Stat label="Min confiance" value={`${Math.round(effectiveMinConfidence * 100)}%`} />
           </div>
 
-          <ToastEligibilityCard eligibility={toastEligibility} />
+          <div
+            style={{
+              borderRadius: 8,
+              border: PHOENIX_SURFACE_BORDER,
+              background: PHOENIX_SURFACE_BG,
+              padding: '8px 10px',
+              fontSize: 12,
+              lineHeight: 1.45,
+            }}
+          >
+            <div style={{ fontWeight: 700, marginBottom: 4 }}>Risque ML (expérimental)</div>
+            <div style={{ opacity: 0.85, fontSize: 11 }}>
+              {abandonment.result?.prediction
+                ? `${Math.round(abandonment.result.prediction.abandonmentRisk * 100)}% · source ${
+                    abandonment.result.source
+                  } — n’ouvre pas l’aide seul`
+                : 'aucune prédiction'}
+            </div>
+          </div>
+
+          <HelpDecisionCard decision={helpDecision} />
 
           <div
             style={{
@@ -372,22 +453,32 @@ function Stat({ label, value }: { label: string; value: string | number }) {
   );
 }
 
-function splitToastReasons(reason: string): string[] {
-  return reason
-    .split(/\s*;\s*/)
-    .map((part) => part.trim())
-    .filter(Boolean);
-}
-
 function formatToastReasonLine(line: string): { label: string; detail: string } {
-  if (line.startsWith('idle —') || line.startsWith('idle -')) {
-    return { label: 'Idle', detail: line.replace(/^idle\s*[—-]\s*/i, '') };
+  if (line.startsWith('idle —') || line.startsWith('idle -') || line.includes('friction+idle')) {
+    return { label: 'Idle', detail: line.replace(/^(voie friction\+idle|idle)\s*[—-]?\s*/i, '') };
   }
-  if (line.startsWith('voie idle')) {
-    return { label: 'Idle', detail: line.replace(/^voie idle\s*[—-]?\s*/i, '') };
+  if (line.startsWith('voie friction seule') || line.startsWith('friction seule')) {
+    return {
+      label: 'Friction',
+      detail: line.replace(/^(voie friction seule|friction seule)\s*[—-]?\s*/i, ''),
+    };
   }
-  if (line.startsWith('voie ML') || line.startsWith('ML —') || line.startsWith('ML -')) {
-    return { label: 'ML', detail: line.replace(/^(voie ML|ML)\s*[—-]?\s*/i, '') };
+  if (line.startsWith('fraîcheur')) {
+    return { label: 'Fraîcheur', detail: line.replace(/^fraîcheur\s*[—-]?\s*/i, '') };
+  }
+  if (
+    line.startsWith('voie friction+ML') ||
+    line.startsWith('voie ML') ||
+    line.startsWith('ML —') ||
+    line.startsWith('ML -')
+  ) {
+    return {
+      label: 'ML',
+      detail: line.replace(/^(voie friction\+ML|voie ML|ML)\s*[—-]?\s*/i, ''),
+    };
+  }
+  if (line.startsWith('friction concrète') || line.startsWith('combinaison')) {
+    return { label: 'Friction', detail: line };
   }
   if (/^session\s+\d/i.test(line)) {
     return { label: 'Session', detail: line };
@@ -395,15 +486,23 @@ function formatToastReasonLine(line: string): { label: string; detail: string } 
   return { label: 'Gate', detail: line };
 }
 
-function ToastEligibilityCard({ eligibility }: { eligibility: AbandonmentToastEligibility }) {
-  const reasons = splitToastReasons(eligibility.reason).map(formatToastReasonLine);
-  const statusColor = eligibility.eligible ? '#86efac' : '#fda4af';
-  const statusBg = eligibility.eligible ? 'rgba(34,197,94,0.18)' : 'rgba(244,63,94,0.16)';
-  const statusBorder = eligibility.eligible
+function HelpDecisionCard({ decision }: { decision: HelpDecisionResult }) {
+  const reasons = (decision.reasons.length > 0 ? decision.reasons : [decision.reason]).map(
+    formatToastReasonLine,
+  );
+  const statusColor = decision.eligible ? '#86efac' : '#fda4af';
+  const statusBg = decision.eligible ? 'rgba(34,197,94,0.18)' : 'rgba(244,63,94,0.16)';
+  const statusBorder = decision.eligible
     ? '1px solid rgba(134,239,172,0.35)'
     : '1px solid rgba(253,164,175,0.35)';
   const viaLabel =
-    eligibility.via === 'ml' ? 'ML' : eligibility.via === 'idle_hybrid' ? 'Idle' : null;
+    decision.via === 'friction_ml'
+      ? 'Friction+ML'
+      : decision.via === 'friction_idle'
+        ? 'Friction+Idle'
+        : decision.via === 'friction_only'
+          ? 'Friction seule'
+          : null;
 
   return (
     <div
@@ -425,7 +524,7 @@ function ToastEligibilityCard({ eligibility }: { eligibility: AbandonmentToastEl
         }}
       >
         <div style={{ fontSize: 11, opacity: 0.8, fontWeight: 600, letterSpacing: '0.04em' }}>
-          TOAST PROACTIF
+          DÉCISION AIDE
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
           {viaLabel ? (
@@ -435,14 +534,10 @@ function ToastEligibilityCard({ eligibility }: { eligibility: AbandonmentToastEl
                 fontWeight: 700,
                 letterSpacing: '0.04em',
                 textTransform: 'uppercase',
-                padding: '3px 7px',
-                borderRadius: 999,
-                border: '1px solid rgba(255,255,255,0.22)',
-                background: 'rgba(15,23,42,0.55)',
-                color: '#e2e8f0',
+                opacity: 0.85,
               }}
             >
-              via {viaLabel}
+              VIA {viaLabel}
             </span>
           ) : null}
           <span
@@ -450,51 +545,26 @@ function ToastEligibilityCard({ eligibility }: { eligibility: AbandonmentToastEl
               fontSize: 11,
               fontWeight: 800,
               letterSpacing: '0.06em',
-              padding: '3px 8px',
-              borderRadius: 999,
-              border: statusBorder,
-              background: statusBg,
               color: statusColor,
+              background: statusBg,
+              border: statusBorder,
+              borderRadius: 999,
+              padding: '2px 8px',
             }}
           >
-            {eligibility.eligible ? 'OUI' : 'NON'}
+            {decision.eligible ? 'OUI' : 'NON'}
           </span>
         </div>
       </div>
-
-      <div style={{ display: 'grid', gap: 6 }}>
-        {reasons.map((row) => (
-          <div
-            key={`${row.label}-${row.detail}`}
-            style={{
-              display: 'grid',
-              gridTemplateColumns: '52px 1fr',
-              gap: 8,
-              alignItems: 'start',
-            }}
-          >
-            <span
-              style={{
-                fontSize: 10,
-                fontWeight: 700,
-                letterSpacing: '0.04em',
-                textTransform: 'uppercase',
-                color: 'rgba(248,250,252,0.72)',
-                paddingTop: 1,
-              }}
-            >
-              {row.label}
-            </span>
-            <span
-              style={{
-                fontSize: 12,
-                lineHeight: 1.4,
-                color: '#f8fafc',
-                wordBreak: 'break-word',
-              }}
-            >
-              {row.detail}
-            </span>
+      <div style={{ fontSize: 11, opacity: 0.75 }}>
+        Friction concrète : {decision.concreteFriction ? 'oui' : 'non'} · niveau{' '}
+        {decision.friction.levelLabel}
+      </div>
+      <div style={{ display: 'grid', gap: 4 }}>
+        {reasons.map((row, index) => (
+          <div key={`${row.label}-${index}`} style={{ fontSize: 11, lineHeight: 1.4 }}>
+            <span style={{ fontWeight: 700, opacity: 0.85 }}>{row.label}:</span>{' '}
+            <span style={{ opacity: 0.9 }}>{row.detail}</span>
           </div>
         ))}
       </div>

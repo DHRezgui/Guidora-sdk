@@ -20,5 +20,14 @@ export function useFrictionScore(counters: FrictionCounters): FrictionScoreResul
     counters.navigationBack,
     counters.scrollHesitation,
     counters.timeOnPageExcessive,
+    counters.rageClick,
+    counters.errorClick,
+    counters.formRetry,
+    counters.navigationLoop,
+    counters.uTurn,
+    counters.slowResponse,
+    counters.faqNoResult,
+    counters.faqReopen,
+    counters.failAfterHelp,
   ]);
 }
