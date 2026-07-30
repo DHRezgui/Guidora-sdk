@@ -609,8 +609,12 @@ export function useFrictionDetection(options?: UseFrictionDetectionOptions) {
       lastScrollDirectionRef.current = 0;
       scrollReversalTimesRef.current = [];
       scrollSurfaceRef.current = null;
-      setCounters((prev) => ({ ...prev, timeOnPageExcessive: 0 }));
-      setSignalVersion((v) => v + 1);
+      // Defer React updates: Next.js may call history.pushState during useInsertionEffect
+      // (CSS-in-JS / Turbopack), and setState in that phase throws.
+      window.setTimeout(() => {
+        setCounters((prev) => ({ ...prev, timeOnPageExcessive: 0 }));
+        setSignalVersion((v) => v + 1);
+      }, 0);
     };
 
     const clearSoftNavTimer = () => {
@@ -753,6 +757,16 @@ export function useFrictionDetection(options?: UseFrictionDetectionOptions) {
       }, SOFT_SPA_NAV_SETTLE_MS);
     };
 
+    /** Escape React commit / useInsertionEffect when host routers mutate history. */
+    let trackPageVisitTimer: number | null = null;
+    const scheduleTrackPageVisit = () => {
+      if (trackPageVisitTimer != null) return;
+      trackPageVisitTimer = window.setTimeout(() => {
+        trackPageVisitTimer = null;
+        trackPageVisit();
+      }, 0);
+    };
+
     /**
      * Soft SPA navigations often commit React state before the new H1 is painted.
      * Re-check shortly after a host click (excluding SDK chrome).
@@ -801,7 +815,7 @@ export function useFrictionDetection(options?: UseFrictionDetectionOptions) {
       const original = history[method].bind(history) as typeof history.pushState;
       history[method] = ((...args: Parameters<typeof history.pushState>) => {
         const result = original(...args);
-        trackPageVisit();
+        scheduleTrackPageVisit();
         return result;
       }) as typeof history.pushState;
       return () => {
@@ -821,15 +835,19 @@ export function useFrictionDetection(options?: UseFrictionDetectionOptions) {
     document.addEventListener('scroll', onScroll, { passive: true, capture: true });
     document.addEventListener('submit', onSubmitCapture, true);
     window.addEventListener('popstate', onPopState);
-    window.addEventListener('popstate', trackPageVisit);
-    window.addEventListener('hashchange', trackPageVisit);
-    window.addEventListener(TRUSTDEV_LOCATION_CHANGE_EVENT, trackPageVisit);
+    window.addEventListener('popstate', scheduleTrackPageVisit);
+    window.addEventListener('hashchange', scheduleTrackPageVisit);
+    window.addEventListener(TRUSTDEV_LOCATION_CHANGE_EVENT, scheduleTrackPageVisit);
     window.addEventListener('beforeunload', onBeforeUnload);
     window.addEventListener('error', onError);
     window.addEventListener('unhandledrejection', onUnhandledRejection);
 
     return () => {
       window.clearInterval(interval);
+      if (trackPageVisitTimer != null) {
+        window.clearTimeout(trackPageVisitTimer);
+        trackPageVisitTimer = null;
+      }
       clearSlowResponseTimer();
       clearSoftNavTimer();
       unwrapPush();
@@ -842,9 +860,9 @@ export function useFrictionDetection(options?: UseFrictionDetectionOptions) {
       document.removeEventListener('scroll', onScroll, { capture: true });
       document.removeEventListener('submit', onSubmitCapture, true);
       window.removeEventListener('popstate', onPopState);
-      window.removeEventListener('popstate', trackPageVisit);
-      window.removeEventListener('hashchange', trackPageVisit);
-      window.removeEventListener(TRUSTDEV_LOCATION_CHANGE_EVENT, trackPageVisit);
+      window.removeEventListener('popstate', scheduleTrackPageVisit);
+      window.removeEventListener('hashchange', scheduleTrackPageVisit);
+      window.removeEventListener(TRUSTDEV_LOCATION_CHANGE_EVENT, scheduleTrackPageVisit);
       window.removeEventListener('beforeunload', onBeforeUnload);
       window.removeEventListener('error', onError);
       window.removeEventListener('unhandledrejection', onUnhandledRejection);

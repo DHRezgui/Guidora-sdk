@@ -6,8 +6,10 @@ import type { FaqPageContext, FaqSemanticSearchResult, SDKConfig } from '../type
 import { formatFaqCategoryLabel } from '../utils/faq-content';
 import { useFaqResultUsageTracking, type FaqFeedbackChoice } from '../hooks/useFaqResultUsageTracking';
 import { SupportTicketForm } from './SupportTicketForm';
+import { GuidesPanel } from './GuidesPanel';
 import type { SupportPresentation } from '../utils/support-ticket-context';
 import type { SupportExternalWidgetOptions, SupportTicketSessionContext } from '../types/support';
+import type { PageGuideItem } from '../utils/page-guides';
 
 function formatScore(score: number): string {
   return `${Math.round(Math.max(0, Math.min(1, score)) * 100)}%`;
@@ -140,6 +142,12 @@ export interface FaqSearchPanelProps {
   resolveSupportTicketContext?: () => Partial<SupportTicketSessionContext>;
   supportExternalWidget?: SupportExternalWidgetOptions | null;
   supportExternalWidgetLabel?: string;
+  /** When true, shows the on-demand Guides section above Support. */
+  guidesEnabled?: boolean;
+  guides?: PageGuideItem[];
+  guidesLoading?: boolean;
+  guidesLaunchingId?: string | null;
+  onLaunchGuide?: (guide: PageGuideItem) => void;
 }
 
 export function FaqSearchPanel({
@@ -181,9 +189,15 @@ export function FaqSearchPanel({
   resolveSupportTicketContext,
   supportExternalWidget = null,
   supportExternalWidgetLabel = 'Ouvrir le chat',
+  guidesEnabled = false,
+  guides = [],
+  guidesLoading = false,
+  guidesLaunchingId = null,
+  onLaunchGuide,
 }: FaqSearchPanelProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [supportOpen, setSupportOpen] = useState(false);
+  const [guidesOpen, setGuidesOpen] = useState(false);
   const resolvedShowResultFeedback =
     showResultFeedback ?? (audience === 'end-user' && Boolean(trackingConfig));
   const { submitFeedback, getFeedbackForResult } = useFaqResultUsageTracking(
@@ -257,7 +271,14 @@ export function FaqSearchPanel({
 
   return (
     <section
-      className={['trustdev-faq-panel', compact ? 'trustdev-faq-panel--compact' : ''].filter(Boolean).join(' ')}
+      className={[
+        'trustdev-faq-panel',
+        compact ? 'trustdev-faq-panel--compact' : '',
+        supportOpen ? 'trustdev-faq-panel--support-open' : '',
+        guidesOpen ? 'trustdev-faq-panel--guides-open' : '',
+      ]
+        .filter(Boolean)
+        .join(' ')}
       role="search"
       aria-label={title}
     >
@@ -398,6 +419,17 @@ export function FaqSearchPanel({
           </p>
         ) : null}
       </div>
+
+      {guidesEnabled ? (
+        <GuidesPanel
+          guides={guides}
+          loading={guidesLoading}
+          launchingId={guidesLaunchingId}
+          onLaunch={onLaunchGuide}
+          open={guidesOpen}
+          onOpenChange={setGuidesOpen}
+        />
+      ) : null}
 
       {supportPresentation === 'form' ? (
         <div

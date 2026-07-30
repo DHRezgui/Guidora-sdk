@@ -259,7 +259,11 @@ function detectThemeFromRenderedBackground(doc: Document): HostThemeDetectionRes
   return null;
 }
 
-/** Multi-signal host theme detection (explicit tokens first, OS preference last). */
+/**
+ * Multi-signal host theme detection.
+ * Prefer explicit app signals (tokens/classes) and painted surfaces (CSS vars / background)
+ * before browser `color-scheme`, which often mirrors OS preference while the app stays light.
+ */
 export function detectHostAppTheme(root?: Document): HostThemeDetectionResult | null {
   if (typeof window === 'undefined' || typeof document === 'undefined') return null;
 
@@ -268,10 +272,10 @@ export function detectHostAppTheme(root?: Document): HostThemeDetectionResult | 
   return (
     detectThemeFromTokens(doc) ??
     detectThemeFromClasses(doc) ??
-    detectThemeFromColorSchemeProperty(doc) ??
-    detectThemeFromMetaColorScheme(doc) ??
     detectThemeFromCssVariables(doc) ??
-    detectThemeFromRenderedBackground(doc)
+    detectThemeFromRenderedBackground(doc) ??
+    detectThemeFromColorSchemeProperty(doc) ??
+    detectThemeFromMetaColorScheme(doc)
   );
 }
 

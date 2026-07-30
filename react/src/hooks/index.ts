@@ -1,4 +1,5 @@
 export * from './useActiveToursForUrl';
+export * from './useGuideToursForUrl';
 export * from './useFaqSemanticSearch';
 export * from './useFaqFrequentQuestions';
 export * from './useFaqResultUsageTracking';

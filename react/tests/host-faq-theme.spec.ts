@@ -19,7 +19,7 @@ function installHostThemeMock(cssVariables: Record<string, string>): Document {
     querySelector: () => null,
   } as unknown as Document;
 
-  globalThis.getComputedStyle = ((element: Element) => {
+  const getComputedStyleMock = ((element: Element) => {
     const isHtml = element === html;
     const isBody = element === body;
     return {
@@ -32,18 +32,32 @@ function installHostThemeMock(cssVariables: Record<string, string>): Document {
     } as CSSStyleDeclaration;
   }) as typeof getComputedStyle;
 
+  globalThis.getComputedStyle = getComputedStyleMock;
+  (globalThis as { window: typeof globalThis }).window = Object.assign(globalThis, {
+    getComputedStyle: getComputedStyleMock,
+  }) as typeof globalThis & Window;
+  (globalThis as { document: Document }).document = doc;
+
   return doc;
 }
 
 describe('host-faq-theme', () => {
   let originalGetComputedStyle: typeof getComputedStyle;
+  let originalWindow: typeof globalThis.window | undefined;
 
   beforeEach(() => {
     originalGetComputedStyle = globalThis.getComputedStyle;
+    originalWindow = globalThis.window;
   });
 
   afterEach(() => {
     globalThis.getComputedStyle = originalGetComputedStyle;
+    if (originalWindow === undefined) {
+      Reflect.deleteProperty(globalThis, 'window');
+      Reflect.deleteProperty(globalThis, 'document');
+    } else {
+      globalThis.window = originalWindow;
+    }
   });
 
   it('maps shadcn host tokens onto FAQ CSS variables', () => {
@@ -88,6 +102,24 @@ describe('host-faq-theme', () => {
     expect(snapshot.cssVars['--td-faq-title']).toBe('hsl(222.2 84% 4.9%)');
   });
 
+  it('forces high-contrast accent text when host foreground clashes with primary', () => {
+    const doc = installHostThemeMock({
+      '--background': '#FAFBFC',
+      '--foreground': '#0F172A',
+      '--primary': '#0066FF',
+      // Same as primary — unusable on accent fills (Rechercher / "?").
+      '--primary-foreground': '#0066FF',
+      '--card': '#FFFFFF',
+      '--accent': '#EFF6FF',
+    });
+
+    const snapshot = resolveHostFaqTheme({ root: doc });
+
+    expect(snapshot.cssVars['--td-faq-accent']).toBe('#0066FF');
+    expect(snapshot.cssVars['--td-faq-accent-text']).toBe('#ffffff');
+    expect(snapshot.cssVars['--td-faq-chip-text']).toBe('#0066FF');
+  });
+
   it('derives readable chip text when accent and chip background are similar', () => {
     const doc = installHostThemeMock({
       '--background': '#0a1f0a',
@@ -104,7 +136,7 @@ describe('host-faq-theme', () => {
     const snapshot = resolveHostFaqTheme({ root: doc });
 
     expect(snapshot.cssVars['--td-faq-chip-bg']).toBe('#166534');
-    expect(snapshot.cssVars['--td-faq-chip-text']).toBe('#ecfdf5');
+    expect(snapshot.cssVars['--td-faq-accent-text']).toBe('#ffffff');
     expect(snapshot.cssVars['--td-faq-chip-text']).not.toBe(snapshot.cssVars['--td-faq-chip-bg']);
   });
 });

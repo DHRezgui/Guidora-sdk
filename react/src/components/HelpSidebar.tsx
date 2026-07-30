@@ -57,6 +57,11 @@ export interface HelpSidebarProps extends UseFaqSemanticSearchOptions, FaqConten
   /** Runtime context merged into support ticket `session_data`. */
   supportTicketContext?: Partial<SupportTicketSessionContext>;
   resolveSupportTicketContext?: () => Partial<SupportTicketSessionContext>;
+  /** On-demand guides for the current page (from TourViewer / useOnboarding). */
+  guides?: import('../utils/page-guides').PageGuideItem[];
+  guidesLoading?: boolean;
+  guidesLaunchingId?: string | null;
+  onLaunchGuide?: (guide: import('../utils/page-guides').PageGuideItem) => void;
 }
 
 export function HelpSidebar({
@@ -104,8 +109,13 @@ export function HelpSidebar({
   supportInlineForm,
   supportExternalWidget,
   supportExternalWidgetLabel,
+  guidesEnabled,
   supportTicketContext,
   resolveSupportTicketContext,
+  guides,
+  guidesLoading,
+  guidesLaunchingId,
+  onLaunchGuide,
 }: HelpSidebarProps) {
   const themeVars = useThemeCssVars(theme);
   const resolvedPushTargetSelector = useMemo(
@@ -183,6 +193,7 @@ export function HelpSidebar({
         starterQuestions,
         frequentQuestionsMode,
         frequentQuestionsLimit,
+        guidesEnabled,
         supportContactUrl,
         supportContactLabel,
         supportInlineForm,
@@ -199,6 +210,7 @@ export function HelpSidebar({
       starterQuestions,
       frequentQuestionsMode,
       frequentQuestionsLimit,
+      guidesEnabled,
       supportContactUrl,
       supportContactLabel,
       supportInlineForm,
@@ -394,6 +406,11 @@ export function HelpSidebar({
               resolveSupportTicketContext={resolveSupportTicketContext}
               supportExternalWidget={contentOptions.supportExternalWidget}
               supportExternalWidgetLabel={contentOptions.supportExternalWidgetLabel}
+              guidesEnabled={contentOptions.guidesEnabled}
+              guides={guides}
+              guidesLoading={guidesLoading}
+              guidesLaunchingId={guidesLaunchingId}
+              onLaunchGuide={onLaunchGuide}
             />
           </aside>
         </>

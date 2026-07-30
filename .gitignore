@@ -1,0 +1,12 @@
+# Dependencies / build
+node_modules/
+dist/
+coverage/
+*.tgz
+*.log
+.DS_Store
+
+# Env (keep examples if any)
+.env
+.env.*
+!.env.example

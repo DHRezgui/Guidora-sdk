@@ -92,6 +92,11 @@ export interface FaqContentOptions {
   /** Manual prompts when `frequentQuestionsMode` is `manual`. */
   starterQuestions?: string[];
   /**
+   * When `true` (default), shows a Guides section in Aide with on-demand tour launch.
+   * Set `false` to hide the section.
+   */
+  guidesEnabled?: boolean;
+  /**
    * Direct support CTA URL shown at the bottom of the help panel
    * (`mailto:…`, `https://…`, or `tel:…`). Omit to hide the button.
    */

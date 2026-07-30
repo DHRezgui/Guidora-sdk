@@ -18,6 +18,7 @@ export * from './ContextualSuggestionsPublisher';
 export * from './FaqSearchWidget';
 export * from './FaqSearchPanel';
 export * from './HelpSidebar';
+export * from './GuidesPanel';
 export * from './AbandonmentRiskBadge';
 export * from './AbandonmentDebugPanel';
 export * from './ProactiveHelpToast';

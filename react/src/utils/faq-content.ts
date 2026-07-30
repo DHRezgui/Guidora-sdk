@@ -19,6 +19,7 @@ export interface ResolvedFaqContentOptions {
   frequentQuestionsMode: FaqFrequentQuestionsMode;
   frequentQuestionsLimit: number;
   starterQuestions: string[];
+  guidesEnabled: boolean;
   supportContactUrl: string | null;
   supportContactLabel: string;
   supportInlineForm: boolean;
@@ -129,6 +130,7 @@ export function resolveFaqContentOptions(
     frequentQuestionsMode: options.frequentQuestionsMode ?? (isEndUser ? 'auto' : 'off'),
     frequentQuestionsLimit: options.frequentQuestionsLimit ?? 4,
     starterQuestions: options.starterQuestions ?? [],
+    guidesEnabled: options.guidesEnabled !== false,
     supportContactUrl,
     supportContactLabel:
       options.supportContactLabel?.trim() || DEFAULT_SUPPORT_CONTACT_LABEL,

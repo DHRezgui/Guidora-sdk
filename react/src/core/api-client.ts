@@ -1,5 +1,6 @@
 import {
   ActiveToursResponse,
+  GuideToursResponse,
   ContextualFeedbackAggregatesResponse,
   FaqSemanticSearchRequest,
   FaqSemanticSearchResponse,
@@ -95,6 +96,14 @@ export const sdkApiClient = {
     // Use a query cache-buster instead of no-store headers to avoid CORS preflight issues.
     const cacheBuster = Date.now();
     return request<ActiveToursResponse>(config, `/tours/active/url?url=${encodedUrl}&_ts=${cacheBuster}`, {
+      method: 'GET',
+    });
+  },
+
+  getGuideToursForUrl(config: NormalizedSDKConfig, url: string): Promise<GuideToursResponse> {
+    const encodedUrl = encodeURIComponent(url);
+    const cacheBuster = Date.now();
+    return request<GuideToursResponse>(config, `/tours/guides/url?url=${encodedUrl}&_ts=${cacheBuster}`, {
       method: 'GET',
     });
   },

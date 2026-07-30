@@ -74,6 +74,19 @@ export {
 } from './utils/friction-signal-catalog';
 export { FRICTION_INTERACTIVE_CLICK_SELECTOR } from './utils/friction-advanced-signals';
 export {
+  buildPageGuides,
+  buildPageGuidesScopeKey,
+  clearRememberedPageGuideToursForTests,
+  filterToursForPageGuides,
+  getRememberedPageGuideTours,
+  mergeToursForPageGuides,
+  pageGuideCtaLabel,
+  pageGuideStatusLabel,
+  rememberPageGuideTours,
+  DEFAULT_PAGE_GUIDES_LIMIT,
+} from './utils/page-guides';
+export type { PageGuideItem, PageGuideStatus } from './utils/page-guides';
+export {
   clearAbandonmentPredictionCache,
   predictAbandonment,
 } from './utils/abandonment-prediction-client';

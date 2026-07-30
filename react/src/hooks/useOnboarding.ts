@@ -15,6 +15,7 @@ import {
   resolveFrictionPageIdentity,
 } from '../utils/logical-page';
 import { useActiveToursForUrl } from './useActiveToursForUrl';
+import { useGuideToursForUrl } from './useGuideToursForUrl';
 import { useFrictionDetection } from './useFrictionDetection';
 import { useFrictionScore } from './useFrictionScore';
 import { useAbandonmentPrediction } from './useAbandonmentPrediction';
@@ -211,6 +212,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
   const activeFlowVersion = options?.activeFlowVersion?.trim() || undefined;
   const activeTourSessionKey = getActiveTourSessionStorageKey(activeFlowVersion);
   const activeTours = useActiveToursForUrl(options?.config, { autoFetch: true, url: pageUrl });
+  const guideTours = useGuideToursForUrl(options?.config, { autoFetch: true, url: pageUrl });
   const toursForFlow = useMemo(() => {
     const forFlow = filterActiveToursByFlowVersion(activeTours.tours, activeFlowVersion);
     return forFlow.filter((item) => !isTourFinishedLocally(item));
@@ -228,6 +230,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       setActiveTour(null);
       void deactivateTour(completedTour, 'complete');
       void activeTours.refresh(pageUrl).catch(() => undefined);
+      void guideTours.refresh(pageUrl).catch(() => undefined);
     },
     onSkip: (skippedTour) => {
       if (skippedTour?.id) {
@@ -239,6 +242,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       setActiveTour(null);
       void deactivateTour(skippedTour, 'skip');
       void activeTours.refresh(pageUrl).catch(() => undefined);
+      void guideTours.refresh(pageUrl).catch(() => undefined);
     },
   });
   const tourProgress = useTourProgress(activeTour?.id);
@@ -732,6 +736,62 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     debugInfo('Tour stopped');
   }, [activeTourSessionKey, debugInfo, tour.closeTour]);
 
+  const launchGuide = useCallback(
+    async (tourToStart: GuidedTour, startIndex = 0) => {
+      if (!tourToStart?.steps?.length) {
+        debugWarn('Cannot launch guide without steps');
+        return;
+      }
+
+      if (tourToStart.id) {
+        dismissedTourIdsRef.current.delete(tourToStart.id);
+        clearTourFinishedForAudience(tourToStart.id, 'sandbox');
+        clearTourFinishedForAudience(tourToStart.id, 'production');
+      }
+
+      // Manual launch always wins over autostart suppression.
+      suppressAutostartUntilRef.current = 0;
+
+      if (tour.isOpen) {
+        tour.closeTour();
+      }
+
+      const maxIdx = Math.max(0, tourToStart.steps.length - 1);
+      const safeIndex = Math.max(0, Math.min(startIndex, maxIdx));
+
+      setActiveTour(tourToStart);
+      increaseVisitCount(pageUrl);
+      if (tourToStart.id) {
+        displaysRef.current[tourToStart.id] = (displaysRef.current[tourToStart.id] || 0) + 1;
+      }
+
+      tour.startTour(tourToStart, safeIndex);
+      debugInfo('Guide launched manually', { tourId: tourToStart.id, startIndex: safeIndex });
+
+      const step = tourToStart.steps[safeIndex];
+      if (step?.targetSelector) {
+        const target = await resolver.resolveTarget(step.targetSelector, {
+          retries: 8,
+          intervalMs: 250,
+        });
+        if (!target) {
+          debugWarn('Target selector not found for launched guide step', {
+            selector: step.targetSelector,
+          });
+        }
+      }
+    },
+    [
+      debugInfo,
+      debugWarn,
+      pageUrl,
+      resolver.resolveTarget,
+      tour.closeTour,
+      tour.isOpen,
+      tour.startTour,
+    ],
+  );
+
   useEffect(() => {
     if (!activeTour?.id) return;
     tourProgress.setStepIndex(tour.currentStepIndex);
@@ -859,10 +919,20 @@ export function useOnboarding(options?: UseOnboardingOptions) {
   }, []);
 
   const refresh = useCallback(async () => {
-    const tours = filterActiveToursByFlowVersion(await activeTours.refresh(pageUrl), activeFlowVersion);
-    syncLocalFinishMarks(tours);
-    return tours;
-  }, [activeFlowVersion, activeTours.refresh, pageUrl, syncLocalFinishMarks]);
+    const [tours] = await Promise.all([
+      activeTours.refresh(pageUrl),
+      guideTours.refresh(pageUrl).catch(() => [] as GuidedTour[]),
+    ]);
+    const forFlow = filterActiveToursByFlowVersion(tours, activeFlowVersion);
+    syncLocalFinishMarks(forFlow);
+    return forFlow;
+  }, [
+    activeFlowVersion,
+    activeTours.refresh,
+    guideTours.refresh,
+    pageUrl,
+    syncLocalFinishMarks,
+  ]);
 
   useRealtimeToursSync({
     enabled: options?.config?.syncEnabled,
@@ -880,6 +950,8 @@ export function useOnboarding(options?: UseOnboardingOptions) {
     () => ({
       session,
       tours: activeTours.tours,
+      guideTours: guideTours.tours,
+      guideToursLoading: guideTours.loading,
       activeTour,
       tour,
       friction,
@@ -898,10 +970,14 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       error: activeTours.error,
       start,
       stop,
+      launchGuide,
       refresh,
     }),
     [
       session,
+      activeTours.tours,
+      guideTours.tours,
+      guideTours.loading,
       toursForFlow,
       activeTour,
       tour,
@@ -926,6 +1002,7 @@ export function useOnboarding(options?: UseOnboardingOptions) {
       activeTours.error,
       start,
       stop,
+      launchGuide,
       refresh,
     ],
   );

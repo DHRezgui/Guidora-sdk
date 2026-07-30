@@ -298,7 +298,6 @@ export function useContextualTourSuggestions(
           return null;
         }
 
-        console.info('[SDK] Publishing sanitized drafts:', sanitizedDrafts);
         // Default to false so newly-generated tours are inactive on the dashboard.
         // The developer decides which ones to activate from the dashboard UI.
         const response = await sdkApiClient.publishContextualDrafts(resolvedConfig, {
@@ -306,7 +305,6 @@ export function useContextualTourSuggestions(
           drafts: sanitizedDrafts,
           autoActivate: currentOptions?.autoActivatePublishedDrafts ?? false,
         });
-        console.info('[SDK] Publish response report:', response.report);
         setLastPublishReport(response.report);
 
         const canRetry =
@@ -456,9 +454,6 @@ export function useContextualTourSuggestions(
       if (autoPublishInFlightRef.current) return;
       const candidates = selectAutoPublishCandidates(allDrafts);
       if (candidates.length === 0) {
-        console.info(
-          '[SDK] Auto-publish skipped: nothing new to publish (deduped or session cap reached).',
-        );
         setLastPublishReport({
           processed: 0,
           created: 0,

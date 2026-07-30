@@ -11,6 +11,7 @@ import {
 } from '../src/utils/faq-theme';
 
 let originalGetComputedStyle: typeof getComputedStyle;
+let originalWindow: typeof globalThis.window | undefined;
 
 function installComputedStyleMock(partial: {
   html?: Partial<{ token: string | null; className: string }>;
@@ -45,7 +46,7 @@ function installComputedStyleMock(partial: {
         : null,
   } as unknown as Document;
 
-  globalThis.getComputedStyle = ((element: Element) => {
+  const getComputedStyleMock = ((element: Element) => {
     const cssVariables = partial.cssVariables ?? {};
     const isHtml = element === html;
     const isBody = element === body;
@@ -57,16 +58,31 @@ function installComputedStyleMock(partial: {
     } as CSSStyleDeclaration;
   }) as typeof getComputedStyle;
 
+  globalThis.getComputedStyle = getComputedStyleMock;
+  // Node test env has no DOM window; theme helpers read `window.getComputedStyle`.
+  (globalThis as { window: typeof globalThis }).window = Object.assign(globalThis, {
+    getComputedStyle: getComputedStyleMock,
+    matchMedia: (globalThis as { matchMedia?: typeof matchMedia }).matchMedia,
+  }) as typeof globalThis & Window;
+  (globalThis as { document: Document }).document = doc;
+
   return doc;
 }
 
 describe('faq-theme', () => {
   beforeEach(() => {
     originalGetComputedStyle = globalThis.getComputedStyle;
+    originalWindow = globalThis.window;
   });
 
   afterEach(() => {
     globalThis.getComputedStyle = originalGetComputedStyle;
+    if (originalWindow === undefined) {
+      Reflect.deleteProperty(globalThis, 'window');
+      Reflect.deleteProperty(globalThis, 'document');
+    } else {
+      globalThis.window = originalWindow;
+    }
   });
 
   it('keeps dark as the default legacy palette', () => {
@@ -83,6 +99,20 @@ describe('faq-theme', () => {
     const doc = installComputedStyleMock({ html: { token: 'light' } });
     expect(detectHostDocumentTheme(doc)).toBe('light');
     expect(detectHostAppTheme(doc)).toEqual({ appearance: 'light', source: 'token' });
+  });
+
+  it('detects light from host CSS background variables before color-scheme', () => {
+    const doc = installComputedStyleMock({
+      colorScheme: 'dark',
+      cssVariables: {
+        '--background': '#FAFBFC',
+      },
+    });
+
+    expect(detectHostAppTheme(doc)).toEqual({
+      appearance: 'light',
+      source: 'css-variable',
+    });
   });
 
   it('detects light from host CSS background variables before system preference', () => {

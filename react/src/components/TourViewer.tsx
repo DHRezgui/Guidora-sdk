@@ -34,6 +34,14 @@ import {
 } from '../utils/support-ticket-runtime-signals';
 import { resolveSupportEmailBrand } from '../utils/support-email-brand';
 import { normalizeFrictionScore } from '../utils/friction-scoring';
+import {
+  buildPageGuides,
+  buildPageGuidesScopeKey,
+  getRememberedPageGuideTours,
+  mergeToursForPageGuides,
+  rememberPageGuideTours,
+  type PageGuideItem,
+} from '../utils/page-guides';
 
 const VALID_INTENTS: TourDraftIntent[] = ['discovery', 'primary-action', 'support-navigation', 'form-flow'];
 const NAVIGATION_CLICK_RESUME_DELAY_MS = 5000;
@@ -980,6 +988,81 @@ export function TourViewer({
       onboarding.assistance.reportFaqOpen(open);
     },
     [onboarding.assistance],
+  );
+
+  const [guidesLaunchingId, setGuidesLaunchingId] = useState<string | null>(null);
+
+  const pageGuidesScopeKey = useMemo(
+    () =>
+      buildPageGuidesScopeKey({
+        organizationId: config?.organizationId,
+        flowVersion:
+          contextualSuggestions?.flowVersion ?? resolvedFaq?.projectKey ?? undefined,
+        // Pathname only — soft-SPA title/nav noise must not split the Relancer cache.
+        pageKey: currentPathname || '/',
+      }),
+    [
+      config?.organizationId,
+      contextualSuggestions?.flowVersion,
+      resolvedFaq?.projectKey,
+      currentPathname,
+    ],
+  );
+
+  useEffect(() => {
+    if (onboarding.guideTours.length > 0) {
+      rememberPageGuideTours(pageGuidesScopeKey, onboarding.guideTours);
+    }
+    if (onboarding.activeTour?.showInGuides === true) {
+      rememberPageGuideTours(pageGuidesScopeKey, [onboarding.activeTour]);
+    }
+  }, [onboarding.guideTours, onboarding.activeTour, pageGuidesScopeKey]);
+
+  const pageGuides = useMemo(() => {
+    const merged = mergeToursForPageGuides({
+      liveTours: onboarding.guideTours,
+      rememberedTours: getRememberedPageGuideTours(pageGuidesScopeKey),
+      activeTour: onboarding.tour.isOpen ? onboarding.activeTour : null,
+    });
+    return buildPageGuides({
+      tours: merged,
+      flowVersion:
+        contextualSuggestions?.flowVersion ?? resolvedFaq?.projectKey ?? undefined,
+      activeTourId: onboarding.tour.isOpen ? onboarding.activeTour?.id : null,
+    });
+  }, [
+    onboarding.guideTours,
+    onboarding.tour.isOpen,
+    onboarding.activeTour,
+    pageGuidesScopeKey,
+    contextualSuggestions?.flowVersion,
+    resolvedFaq?.projectKey,
+  ]);
+
+  const handleLaunchGuide = useCallback(
+    async (guide: PageGuideItem) => {
+      if (!guide?.tour || guidesLaunchingId) return;
+      setGuidesLaunchingId(guide.id);
+      try {
+        rememberPageGuideTours(pageGuidesScopeKey, [guide.tour]);
+        setHelpSidebarOpen(false);
+        onboarding.assistance.reportFaqOpen(false);
+        const startIndex =
+          guide.status === 'in_progress'
+            ? Math.max(0, onboarding.tour.currentStepIndex || 0)
+            : 0;
+        await onboarding.launchGuide(guide.tour, startIndex);
+      } finally {
+        setGuidesLaunchingId(null);
+      }
+    },
+    [
+      guidesLaunchingId,
+      onboarding.assistance,
+      onboarding.launchGuide,
+      onboarding.tour.currentStepIndex,
+      pageGuidesScopeKey,
+    ],
   );
 
   // Tour end forces assistance → none; restore FAQ if the sidebar stayed open
@@ -2066,6 +2149,10 @@ export function TourViewer({
             }}
             onOpenChange={handleHelpSidebarOpenChange}
             resolveSupportTicketContext={resolveSupportTicketContext}
+            guides={pageGuides}
+            guidesLoading={onboarding.guideToursLoading}
+            guidesLaunchingId={guidesLaunchingId}
+            onLaunchGuide={handleLaunchGuide}
           />
         ) : (
           <FaqSearchWidget

@@ -1,5 +1,6 @@
 import type { CSSProperties } from 'react';
 import {
+  appearanceFromRgb,
   detectHostAppTheme,
   normalizeHostColorToken,
   parseCssColorToRgb,
@@ -36,11 +37,11 @@ const HOST_FAQ_TOKEN_MAPPINGS: HostTokenMapping[] = [
   { faqVar: '--td-faq-title', hostVars: ['--foreground', '--card-foreground', '--text'] },
   { faqVar: '--td-faq-text', hostVars: ['--foreground', '--card-foreground'] },
   { faqVar: '--td-faq-muted', hostVars: ['--muted-foreground', '--secondary-foreground'] },
-  { faqVar: '--td-faq-accent', hostVars: ['--primary'] },
-  { faqVar: '--td-faq-accent-text', hostVars: ['--primary-foreground', '--accent-foreground'] },
+  { faqVar: '--td-faq-accent', hostVars: ['--primary', '--color-primary', '--sidebar-primary', '--ring', '--brand'] },
+  { faqVar: '--td-faq-accent-text', hostVars: ['--primary-foreground', '--color-primary-foreground', '--sidebar-primary-foreground'] },
   { faqVar: '--td-faq-border', hostVars: ['--border'] },
   { faqVar: '--td-faq-border-soft', hostVars: ['--border', '--input'] },
-  { faqVar: '--td-faq-border-accent', hostVars: ['--primary', '--ring', '--border'] },
+  { faqVar: '--td-faq-border-accent', hostVars: ['--primary', '--color-primary', '--ring', '--border'] },
   { faqVar: '--td-faq-input-bg', hostVars: ['--background', '--input'] },
   { faqVar: '--td-faq-input-border', hostVars: ['--input', '--border'] },
   { faqVar: '--td-faq-chip-bg', hostVars: ['--accent', '--secondary', '--muted'] },
@@ -52,8 +53,8 @@ const LIGHT_FALLBACK: Record<string, string> = {
   '--td-faq-text': '#334155',
   '--td-faq-title': '#0f172a',
   '--td-faq-muted': '#64748b',
-  '--td-faq-accent': '#2563eb',
-  '--td-faq-accent-text': '#1e3a8a',
+  '--td-faq-accent': '#0066ff',
+  '--td-faq-accent-text': '#ffffff',
   '--td-faq-surface': '#f8fafc',
   '--td-faq-surface-hover': '#f1f5f9',
   '--td-faq-surface-panel': '#ffffff',
@@ -67,8 +68,8 @@ const LIGHT_FALLBACK: Record<string, string> = {
   '--td-faq-input-border': '#cbd5e1',
   '--td-faq-backdrop': 'rgba(15, 23, 42, 0.12)',
   '--td-faq-error': '#e11d48',
-  '--td-faq-chip-bg': '#f1f5f9',
-  '--td-faq-chip-text': '#1e3a8a',
+  '--td-faq-chip-bg': '#eff6ff',
+  '--td-faq-chip-text': '#0066ff',
   '--td-faq-shadow': '0 14px 36px rgba(15, 23, 42, 0.12)',
   '--td-faq-launcher-text': '#0f172a',
 };
@@ -77,8 +78,8 @@ const DARK_FALLBACK: Record<string, string> = {
   '--td-faq-text': '#e2e8f0',
   '--td-faq-title': '#f8fafc',
   '--td-faq-muted': 'rgba(148, 163, 184, 0.95)',
-  '--td-faq-accent': '#60a5fa',
-  '--td-faq-accent-text': '#dbeafe',
+  '--td-faq-accent': '#3b82f6',
+  '--td-faq-accent-text': '#ffffff',
   '--td-faq-surface': 'rgba(15, 23, 42, 0.55)',
   '--td-faq-surface-hover': 'rgba(30, 41, 59, 0.62)',
   '--td-faq-surface-panel': 'rgba(15, 23, 42, 0.92)',
@@ -87,13 +88,13 @@ const DARK_FALLBACK: Record<string, string> = {
   '--td-faq-surface-launcher': 'rgba(15, 23, 42, 0.92)',
   '--td-faq-border': 'rgba(255, 255, 255, 0.22)',
   '--td-faq-border-soft': 'rgba(148, 163, 184, 0.25)',
-  '--td-faq-border-accent': 'rgba(96, 165, 250, 0.45)',
+  '--td-faq-border-accent': 'rgba(59, 130, 246, 0.45)',
   '--td-faq-input-bg': 'rgba(15, 23, 42, 0.75)',
   '--td-faq-input-border': 'rgba(148, 163, 184, 0.35)',
   '--td-faq-backdrop': 'rgba(2, 6, 23, 0.45)',
   '--td-faq-error': '#fda4af',
   '--td-faq-chip-bg': 'rgba(30, 41, 59, 0.72)',
-  '--td-faq-chip-text': '#e2e8f0',
+  '--td-faq-chip-text': '#93c5fd',
   '--td-faq-shadow': '0 14px 36px rgba(2, 6, 23, 0.5)',
   '--td-faq-launcher-text': '#f8fafc',
 };
@@ -158,6 +159,33 @@ function deriveShadow(appearance: FaqThemeAppearance): string {
   return appearance === 'light' ? LIGHT_FALLBACK['--td-faq-shadow'] : DARK_FALLBACK['--td-faq-shadow'];
 }
 
+/** WCAG contrast ratio between two sRGB colors. */
+function contrastRatio(a: [number, number, number], b: [number, number, number]): number {
+  const l1 = rgbRelativeLuminance(a);
+  const l2 = rgbRelativeLuminance(b);
+  const lighter = Math.max(l1, l2);
+  const darker = Math.min(l1, l2);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+/**
+ * Text/icon color on accent fills (Rechercher, "?"). Prefer host primary-foreground when
+ * contrast is strong; otherwise force white/near-black for legibility.
+ */
+function resolveAccentForeground(accent: string | undefined, mappedForeground: string | undefined): string {
+  const readable = pickReadableTextColor(accent, {
+    lightText: '#ffffff',
+    darkText: '#0f172a',
+  });
+  if (!mappedForeground || !accent) return readable;
+
+  const accentRgb = parseCssColorToRgb(accent);
+  const fgRgb = parseCssColorToRgb(mappedForeground);
+  if (!accentRgb || !fgRgb) return readable;
+
+  return contrastRatio(accentRgb, fgRgb) >= 4.5 ? mappedForeground : readable;
+}
+
 const PANEL_SURFACE_VARS = new Set(['--td-faq-surface-sidebar', '--td-faq-surface-panel']);
 
 function assignMappedHostColor(
@@ -180,16 +208,18 @@ function assignMappedHostColor(
 
 /** Maps host design tokens to FAQ CSS variables for chameleon theming. */
 export function resolveHostFaqTheme(options: ResolveHostFaqThemeOptions = {}): HostFaqThemeSnapshot {
+  // SSR / no DOM: light chameleon seed (matches `resolveFaqThemeAppearanceInitial('host')`).
+  // Never seed Phoenix dark here — that caused help chrome to hydrate dark on light hosts.
   if (typeof window === 'undefined' || typeof document === 'undefined') {
     return {
-      appearance: 'dark',
-      cssVars: { ...DARK_FALLBACK },
+      appearance: 'light',
+      cssVars: { ...LIGHT_FALLBACK },
       mappedTokenCount: 0,
     };
   }
 
   const doc = options.root ?? document;
-  const appearance = detectHostAppTheme(doc)?.appearance ?? resolveAutoFaqThemeAppearance(doc).appearance;
+  let appearance = detectHostAppTheme(doc)?.appearance ?? resolveAutoFaqThemeAppearance(doc).appearance;
   const fallback = appearance === 'light' ? LIGHT_FALLBACK : DARK_FALLBACK;
 
   const styleSources: CSSStyleDeclaration[] = [window.getComputedStyle(doc.documentElement)];
@@ -250,24 +280,44 @@ export function resolveHostFaqTheme(options: ResolveHostFaqThemeOptions = {}): H
 
   const surfaceBackground =
     cssVars['--td-faq-surface-sidebar'] ?? cssVars['--td-faq-surface-panel'] ?? cssVars['--td-faq-surface'];
-  cssVars['--td-faq-backdrop'] = deriveBackdrop(surfaceBackground, appearance);
-  cssVars['--td-faq-shadow'] = deriveShadow(appearance);
 
-  if (cssVars['--td-faq-accent'] && cssVars['--td-faq-accent-text']) {
-    const accentRgb = parseCssColorToRgb(cssVars['--td-faq-accent']);
-    const accentTextRgb = parseCssColorToRgb(cssVars['--td-faq-accent-text']);
-    if (accentRgb && accentTextRgb) {
-      const contrastDelta = Math.abs(rgbRelativeLuminance(accentRgb) - rgbRelativeLuminance(accentTextRgb));
-      if (contrastDelta < 0.2) {
-        cssVars['--td-faq-accent-text'] = appearance === 'light' ? cssVars['--td-faq-title'] : cssVars['--td-faq-text'];
+  // Prefer mapped panel surface luminance over OS/color-scheme guesses.
+  const surfaceRgb = surfaceBackground ? parseCssColorToRgb(surfaceBackground) : null;
+  if (surfaceRgb) {
+    const surfaceAppearance = appearanceFromRgb(surfaceRgb);
+    if (surfaceAppearance !== appearance) {
+      const previousFallback = fallback;
+      appearance = surfaceAppearance;
+      const surfaceFallback = appearance === 'light' ? LIGHT_FALLBACK : DARK_FALLBACK;
+      for (const [key, value] of Object.entries(surfaceFallback)) {
+        if (cssVars[key] == null || cssVars[key] === previousFallback[key]) {
+          cssVars[key] = value;
+        }
       }
     }
   }
 
-  cssVars['--td-faq-chip-text'] = pickReadableTextColor(cssVars['--td-faq-chip-bg'], {
-    lightText: cssVars['--td-faq-text'] ?? fallback['--td-faq-text'],
-    darkText: cssVars['--td-faq-title'] ?? fallback['--td-faq-title'],
+  cssVars['--td-faq-backdrop'] = deriveBackdrop(surfaceBackground, appearance);
+  cssVars['--td-faq-shadow'] = deriveShadow(appearance);
+
+  cssVars['--td-faq-accent-text'] = resolveAccentForeground(
+    cssVars['--td-faq-accent'],
+    cssVars['--td-faq-accent-text'],
+  );
+
+  // Pale chips (Guides / Support): prefer host accent icon color when contrast is OK.
+  const chipFallbackText = pickReadableTextColor(cssVars['--td-faq-chip-bg'], {
+    lightText: '#ffffff',
+    darkText: cssVars['--td-faq-title'] ?? (appearance === 'light' ? LIGHT_FALLBACK : DARK_FALLBACK)['--td-faq-title'],
   });
+  cssVars['--td-faq-chip-text'] = chipFallbackText;
+  if (cssVars['--td-faq-accent'] && cssVars['--td-faq-chip-bg']) {
+    const chipRgb = parseCssColorToRgb(cssVars['--td-faq-chip-bg']);
+    const accentRgb = parseCssColorToRgb(cssVars['--td-faq-accent']);
+    if (chipRgb && accentRgb && contrastRatio(chipRgb, accentRgb) >= 3) {
+      cssVars['--td-faq-chip-text'] = cssVars['--td-faq-accent'];
+    }
+  }
 
   return {
     appearance,

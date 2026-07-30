@@ -1074,6 +1074,8 @@ export interface GuidedTour {
   targetUrl: string;
   isActive?: boolean;
   isSandboxTestActive?: boolean;
+  /** Admin opt-in: appears in Aide > Guides catalog. */
+  showInGuides?: boolean;
   environment?: string;
   priority?: number;
   triggerConditions?: TriggerConditions;
@@ -1121,6 +1123,9 @@ export interface ActiveToursResponse {
   count: number;
   tours: GuidedTour[];
 }
+
+/** Same payload shape as active tours; filtered to showInGuides catalog. */
+export type GuideToursResponse = ActiveToursResponse;
 
 export interface PublishContextualDraftStep {
   title: string;

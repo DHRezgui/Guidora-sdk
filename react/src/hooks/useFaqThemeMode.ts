@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties } from 'react';
+import { useLayoutEffect, useState, type CSSProperties } from 'react';
 import {
   buildFaqThemeClassName,
   resolveAutoFaqThemeAppearance,
@@ -14,17 +14,43 @@ export interface FaqThemeSnapshot {
   cssVars: CSSProperties;
 }
 
+function createHostFaqThemeSnapshot(hostThemeReference?: string): FaqThemeSnapshot {
+  const hostTheme = resolveHostFaqTheme({ referenceSelector: hostThemeReference });
+  return {
+    appearance: hostTheme.appearance,
+    className: buildFaqThemeClassName(hostTheme.appearance, 'host'),
+    cssVars: hostFaqThemeCssVarsToStyle(hostTheme.cssVars as Record<string, string>),
+  };
+}
+
+function createInitialFaqThemeSnapshot(
+  themeMode?: FaqThemeMode,
+  hostThemeReference?: string,
+): FaqThemeSnapshot {
+  // Resolve host/chameleon tokens synchronously on the client so the help tab
+  // never paints with Phoenix orange before the first effect runs.
+  if (themeMode === 'host') {
+    return createHostFaqThemeSnapshot(hostThemeReference);
+  }
+
+  const appearance = resolveFaqThemeAppearanceInitial(themeMode);
+  return {
+    appearance,
+    className: buildFaqThemeClassName(appearance, themeMode),
+    cssVars: {},
+  };
+}
+
 export function useFaqTheme(
   themeMode?: FaqThemeMode,
   hostThemeReference?: string,
 ): FaqThemeSnapshot {
-  const [snapshot, setSnapshot] = useState<FaqThemeSnapshot>(() => ({
-    appearance: resolveFaqThemeAppearanceInitial(themeMode),
-    className: buildFaqThemeClassName(resolveFaqThemeAppearanceInitial(themeMode), themeMode),
-    cssVars: {},
-  }));
+  const [snapshot, setSnapshot] = useState<FaqThemeSnapshot>(() =>
+    createInitialFaqThemeSnapshot(themeMode, hostThemeReference),
+  );
 
-  useEffect(() => {
+  // useLayoutEffect: apply before browser paint to avoid orange → blue FOUC.
+  useLayoutEffect(() => {
     if (!themeMode || themeMode === 'dark') {
       const appearance = 'dark';
       setSnapshot({
@@ -51,12 +77,7 @@ export function useFaqTheme(
       let rafId: number | null = null;
 
       const applyHostTheme = () => {
-        const hostTheme = resolveHostFaqTheme({ referenceSelector: hostThemeReference });
-        setSnapshot({
-          appearance: hostTheme.appearance,
-          className: buildFaqThemeClassName(hostTheme.appearance, 'host'),
-          cssVars: hostFaqThemeCssVarsToStyle(hostTheme.cssVars as Record<string, string>),
-        });
+        setSnapshot(createHostFaqThemeSnapshot(hostThemeReference));
       };
 
       const scheduleUpdate = () => {
@@ -67,7 +88,8 @@ export function useFaqTheme(
         });
       };
 
-      scheduleUpdate();
+      // Immediate first apply (no rAF) so paint already has chameleon accents.
+      applyHostTheme();
 
       const media = window.matchMedia('(prefers-color-scheme: dark)');
       media.addEventListener('change', scheduleUpdate);
@@ -117,7 +139,7 @@ export function useFaqTheme(
       });
     };
 
-    scheduleUpdate();
+    update();
 
     const media = window.matchMedia('(prefers-color-scheme: dark)');
     media.addEventListener('change', scheduleUpdate);
