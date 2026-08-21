@@ -557,13 +557,13 @@
 }
 
 /* Host chameleon mode — modern help chrome, host-mapped tokens.
-   Light + blue defaults beat Phoenix dark/orange until JS host tokens apply. */
+   Seed accent from tour `--td-primary-color` until JS maps host `--primary`. */
 .trustdev-faq-ui--host {
   font-family: var(--td-font-family);
   --td-faq-text: #334155;
   --td-faq-title: #0f172a;
   --td-faq-muted: #64748b;
-  --td-faq-accent: #0066ff;
+  --td-faq-accent: var(--td-primary-color, #0f766e);
   --td-faq-accent-text: #ffffff;
   --td-faq-surface: #f8fafc;
   --td-faq-surface-hover: #f1f5f9;
@@ -573,11 +573,11 @@
   --td-faq-surface-launcher: #ffffff;
   --td-faq-border: #e2e8f0;
   --td-faq-border-soft: #e2e8f0;
-  --td-faq-border-accent: #cbd5e1;
+  --td-faq-border-accent: color-mix(in srgb, var(--td-faq-accent) 35%, var(--td-faq-border));
   --td-faq-input-bg: #ffffff;
   --td-faq-input-border: #cbd5e1;
-  --td-faq-chip-bg: #eff6ff;
-  --td-faq-chip-text: #0066ff;
+  --td-faq-chip-bg: #ecfdf5;
+  --td-faq-chip-text: var(--td-faq-accent);
   --td-faq-launcher-text: #0f172a;
   --td-faq-shadow: 0 14px 36px rgba(15, 23, 42, 0.12);
 }

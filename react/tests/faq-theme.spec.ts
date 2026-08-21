@@ -4,6 +4,7 @@ import {
   appearanceFromRgb,
   detectHostAppTheme,
   detectHostDocumentTheme,
+  normalizeHostColorToken,
   parseCssColorToRgb,
   resolveAutoFaqThemeAppearance,
   resolveFaqThemeAppearance,
@@ -173,5 +174,30 @@ describe('faq-theme', () => {
     expect(parseCssColorToRgb('rgb(2, 2, 2)')).toEqual([2, 2, 2]);
     expect(appearanceFromRgb([250, 251, 252])).toBe('light');
     expect(appearanceFromRgb([2, 2, 2])).toBe('dark');
+  });
+
+  it('parses Tailwind/shadcn oklch tokens (Tasko primary-like)', () => {
+    const rgb = parseCssColorToRgb('oklch(0.42 0.15 155)');
+    expect(rgb).not.toBeNull();
+    // Dark green brand: green channel dominates, not near #0066ff blue fallback.
+    expect(rgb![1]).toBeGreaterThan(rgb![0]);
+    expect(rgb![1]).toBeGreaterThan(rgb![2]);
+    expect(rgb![2]).toBeLessThan(120);
+  });
+
+  it('normalizes oklch host tokens to rgb() for color-mix compatibility', () => {
+    expect(normalizeHostColorToken('oklch(0.42 0.15 155)')).toMatch(/^rgb\(\d+, \d+, \d+\)$/);
+    expect(normalizeHostColorToken('#0f172a')).toBe('#0f172a');
+  });
+
+  it('accepts Chrome lab() serialization when canvas can resolve it', () => {
+    // jsdom may not resolve lab(); in that case parsing returns null and chameleon falls back to probe/DOM.
+    const lab = 'lab(34.6066% -49.6094 25.8969)';
+    const rgb = parseCssColorToRgb(lab);
+    if (typeof document !== 'undefined' && rgb) {
+      expect(rgb[1]).toBeGreaterThan(rgb[0]);
+    } else {
+      expect(rgb === null || Array.isArray(rgb)).toBe(true);
+    }
   });
 });

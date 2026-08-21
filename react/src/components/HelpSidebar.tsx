@@ -1,4 +1,12 @@
-import { CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  CSSProperties,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { subscribeProactiveHelp } from '../utils/proactive-help-bus';
 import { useFaqSemanticSearch, type UseFaqSemanticSearchOptions } from '../hooks/useFaqSemanticSearch';
 import { useFaqFrequentQuestions } from '../hooks/useFaqFrequentQuestions';
@@ -23,6 +31,7 @@ import {
   detectHostThemeReference,
   detectPushTargetSelector,
 } from '../utils/sdk-auto-defaults';
+import { resolveHostFaqTheme } from '../utils/host-faq-theme';
 import { OnboardingTheme, useThemeCssVars } from './theme';
 import { type FaqThemeMode } from '../utils/faq-theme';
 
@@ -131,6 +140,7 @@ export function HelpSidebar({
     [hostThemeReference, themeMode],
   );
   const faqTheme = useFaqTheme(themeMode, resolvedHostThemeReference);
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const autoDockSide = useHelpDockSide({
     preferredSide: side,
     avoidSelectors,
@@ -140,6 +150,44 @@ export function HelpSidebar({
   const resolvedSide = resolvedDockSide ?? autoDockSide;
   const [open, setOpen] = useState(!startCollapsed);
   const prevOpenForNotifyRef = useRef<boolean | null>(null);
+
+  const applyHostCssVars = useCallback(() => {
+    if (!enabled || themeMode !== 'host') return;
+    if (typeof window === 'undefined') return;
+    const el = rootRef.current;
+    if (!el) return;
+    const hostTheme = resolveHostFaqTheme({
+      referenceSelector: resolvedHostThemeReference,
+    });
+    for (const [key, value] of Object.entries(hostTheme.cssVars)) {
+      if (typeof value === 'string' && value) {
+        el.style.setProperty(key, value);
+      }
+    }
+  }, [enabled, resolvedHostThemeReference, themeMode]);
+
+  // Re-apply after every commit: React rewrites inline `style` from hydrated SSR
+  // fallback / themeVars and would otherwise clobber host primary with SDK teal.
+  useLayoutEffect(() => {
+    applyHostCssVars();
+  });
+
+  useLayoutEffect(() => {
+    if (!enabled || themeMode !== 'host' || typeof window === 'undefined') return undefined;
+
+    const retryTimers = [50, 200, 600, 1200].map((ms) => window.setTimeout(applyHostCssVars, ms));
+    const headObserver = new MutationObserver(applyHostCssVars);
+    if (document.head) {
+      headObserver.observe(document.head, { childList: true, subtree: true });
+    }
+    window.addEventListener('load', applyHostCssVars);
+
+    return () => {
+      for (const timer of retryTimers) window.clearTimeout(timer);
+      headObserver.disconnect();
+      window.removeEventListener('load', applyHostCssVars);
+    };
+  }, [applyHostCssVars, enabled, themeMode]);
   // Keep measuring while open so overlay panels can clear an inner host scrollbar.
   const tabEdgeInset = useHelpTabEdgeInset(resolvedSide, enabled, open);
   const [query, setQuery] = useState('');
@@ -323,6 +371,7 @@ export function HelpSidebar({
 
   return (
     <div
+      ref={rootRef}
       className={rootClass}
       data-tour-id="trustdev-help-sidebar"
       data-trustdev-help-sidebar="true"

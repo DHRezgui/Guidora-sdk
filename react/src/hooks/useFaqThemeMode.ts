@@ -91,6 +91,9 @@ export function useFaqTheme(
       // Immediate first apply (no rAF) so paint already has chameleon accents.
       applyHostTheme();
 
+      // Host CSS (Tailwind/Next) can land after first paint — retry briefly for demos.
+      const retryTimers = [50, 200, 600].map((ms) => window.setTimeout(applyHostTheme, ms));
+
       const media = window.matchMedia('(prefers-color-scheme: dark)');
       media.addEventListener('change', scheduleUpdate);
 
@@ -109,10 +112,18 @@ export function useFaqTheme(
       window.addEventListener('load', scheduleUpdate);
       window.addEventListener('resize', scheduleUpdate);
 
+      // Next/Tailwind may inject theme CSS after mount — re-apply when stylesheets appear.
+      const headObserver = new MutationObserver(scheduleUpdate);
+      if (document.head) {
+        headObserver.observe(document.head, { childList: true, subtree: true });
+      }
+
       return () => {
         if (rafId != null) window.cancelAnimationFrame(rafId);
+        for (const timer of retryTimers) window.clearTimeout(timer);
         media.removeEventListener('change', scheduleUpdate);
         mutationObserver.disconnect();
+        headObserver.disconnect();
         window.removeEventListener('load', scheduleUpdate);
         window.removeEventListener('resize', scheduleUpdate);
       };

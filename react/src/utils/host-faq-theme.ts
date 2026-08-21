@@ -53,7 +53,8 @@ const LIGHT_FALLBACK: Record<string, string> = {
   '--td-faq-text': '#334155',
   '--td-faq-title': '#0f172a',
   '--td-faq-muted': '#64748b',
-  '--td-faq-accent': '#0066ff',
+  // Align with SDK tour `--td-primary-color` (not Phoenix orange / not hard-coded blue).
+  '--td-faq-accent': '#0f766e',
   '--td-faq-accent-text': '#ffffff',
   '--td-faq-surface': '#f8fafc',
   '--td-faq-surface-hover': '#f1f5f9',
@@ -63,13 +64,13 @@ const LIGHT_FALLBACK: Record<string, string> = {
   '--td-faq-surface-launcher': '#ffffff',
   '--td-faq-border': '#e2e8f0',
   '--td-faq-border-soft': '#e2e8f0',
-  '--td-faq-border-accent': '#cbd5e1',
+  '--td-faq-border-accent': '#99f6e4',
   '--td-faq-input-bg': '#ffffff',
   '--td-faq-input-border': '#cbd5e1',
   '--td-faq-backdrop': 'rgba(15, 23, 42, 0.12)',
   '--td-faq-error': '#e11d48',
-  '--td-faq-chip-bg': '#eff6ff',
-  '--td-faq-chip-text': '#0066ff',
+  '--td-faq-chip-bg': '#ecfdf5',
+  '--td-faq-chip-text': '#0f766e',
   '--td-faq-shadow': '0 14px 36px rgba(15, 23, 42, 0.12)',
   '--td-faq-launcher-text': '#0f172a',
 };
@@ -78,8 +79,8 @@ const DARK_FALLBACK: Record<string, string> = {
   '--td-faq-text': '#e2e8f0',
   '--td-faq-title': '#f8fafc',
   '--td-faq-muted': 'rgba(148, 163, 184, 0.95)',
-  '--td-faq-accent': '#3b82f6',
-  '--td-faq-accent-text': '#ffffff',
+  '--td-faq-accent': '#2dd4bf',
+  '--td-faq-accent-text': '#042f2e',
   '--td-faq-surface': 'rgba(15, 23, 42, 0.55)',
   '--td-faq-surface-hover': 'rgba(30, 41, 59, 0.62)',
   '--td-faq-surface-panel': 'rgba(15, 23, 42, 0.92)',
@@ -88,23 +89,156 @@ const DARK_FALLBACK: Record<string, string> = {
   '--td-faq-surface-launcher': 'rgba(15, 23, 42, 0.92)',
   '--td-faq-border': 'rgba(255, 255, 255, 0.22)',
   '--td-faq-border-soft': 'rgba(148, 163, 184, 0.25)',
-  '--td-faq-border-accent': 'rgba(59, 130, 246, 0.45)',
+  '--td-faq-border-accent': 'rgba(45, 212, 191, 0.45)',
   '--td-faq-input-bg': 'rgba(15, 23, 42, 0.75)',
   '--td-faq-input-border': 'rgba(148, 163, 184, 0.35)',
   '--td-faq-backdrop': 'rgba(2, 6, 23, 0.45)',
   '--td-faq-error': '#fda4af',
   '--td-faq-chip-bg': 'rgba(30, 41, 59, 0.72)',
-  '--td-faq-chip-text': '#93c5fd',
+  '--td-faq-chip-text': '#5eead4',
   '--td-faq-shadow': '0 14px 36px rgba(2, 6, 23, 0.5)',
   '--td-faq-launcher-text': '#f8fafc',
 };
+
+/** Accent keys: omit from inline seed so CSS can use `var(--td-primary-color)` until host maps. */
+const DEFERRED_ACCENT_VARS = [
+  '--td-faq-accent',
+  '--td-faq-accent-text',
+  '--td-faq-chip-text',
+  '--td-faq-border-accent',
+] as const;
 
 function readCssVariable(styles: CSSStyleDeclaration, name: string): string | null {
   const value = styles.getPropertyValue(name).trim();
   return value || null;
 }
 
-function readFirstHostToken(stylesList: CSSStyleDeclaration[], hostVars: string[]): string | null {
+/**
+ * Resolves a CSS variable to a concrete color (rgb/hex).
+ * Uses a probe element so `oklch()`, `var(--token)`, and late-injected themes all work.
+ */
+function resolveCssVariableColor(
+  varName: string,
+  styleSources: CSSStyleDeclaration[],
+  doc: Document,
+): string | null {
+  let raw: string | null = null;
+  for (const styles of styleSources) {
+    raw = readCssVariable(styles, varName);
+    if (raw) break;
+  }
+
+  if (raw) {
+    const normalized = normalizeHostColorToken(raw);
+    if (normalized && parseCssColorToRgb(normalized)) {
+      return normalized;
+    }
+  }
+
+  if (typeof window === 'undefined' || typeof doc.createElement !== 'function') {
+    return raw ? normalizeHostColorToken(raw) : null;
+  }
+
+  const mountParent = doc.documentElement ?? doc.body;
+  if (!mountParent || typeof (mountParent as ParentNode).appendChild !== 'function') {
+    return raw ? normalizeHostColorToken(raw) : null;
+  }
+
+  try {
+    const probe = doc.createElement('div');
+    probe.setAttribute('data-trustdev-theme-probe', 'true');
+    probe.style.cssText =
+      'position:absolute;left:-99999px;top:0;width:1px;height:1px;pointer-events:none;visibility:hidden;';
+    mountParent.appendChild(probe);
+    probe.style.setProperty('color', raw && !/^var\(/i.test(raw) ? raw : `var(${varName})`);
+    const computed = window.getComputedStyle(probe).color;
+    probe.remove();
+
+    const fromComputed = normalizeHostColorToken(computed);
+    if (fromComputed && parseCssColorToRgb(fromComputed)) {
+      // Ignore fully transparent / default black when var failed to resolve.
+      const rgb = parseCssColorToRgb(fromComputed);
+      if (rgb && !(rgb[0] === 0 && rgb[1] === 0 && rgb[2] === 0 && !raw)) {
+        return fromComputed;
+      }
+      if (rgb && raw) return fromComputed;
+    }
+  } catch {
+    // Probe unavailable (tests / constrained DOM) — fall through.
+  }
+
+  return raw ? normalizeHostColorToken(raw) : null;
+}
+
+/**
+ * Last-resort accent: sample a painted host primary control (e.g. Tailwind `bg-primary`).
+ * Used when CSS variables are late or not readable via getPropertyValue.
+ */
+function sampleHostPrimaryFromDom(doc: Document): string | null {
+  if (typeof window === 'undefined') return null;
+
+  const selectors = [
+    '.bg-primary',
+    'button.bg-primary',
+    '[class~="bg-primary"]',
+    '.bg-sidebar-primary',
+    '[data-active="true"].bg-primary',
+  ];
+
+  for (const selector of selectors) {
+    try {
+      const nodes = doc.querySelectorAll(selector);
+      for (const node of nodes) {
+        if (!(node instanceof HTMLElement)) continue;
+        if (node.closest('[data-trustdev-help-sidebar], [data-trustdev-faq-panel], [data-trustdev-theme-probe]')) {
+          continue;
+        }
+        const bg = window.getComputedStyle(node).backgroundColor;
+        const rgb = parseCssColorToRgb(bg);
+        if (!rgb) continue;
+        // Skip near-white / near-black / grey surfaces.
+        const [r, g, b] = rgb;
+        const max = Math.max(r, g, b);
+        const min = Math.min(r, g, b);
+        if (max < 25 || min > 245) continue;
+        if (max - min < 15) continue;
+        return `rgb(${r}, ${g}, ${b})`;
+      }
+    } catch {
+      // invalid selector in this environment
+    }
+  }
+
+  return null;
+}
+
+function readFirstHostToken(
+  stylesList: CSSStyleDeclaration[],
+  hostVars: string[],
+  doc?: Document,
+): string | null {
+  if (doc) {
+    for (const hostVar of hostVars) {
+      const resolved = resolveCssVariableColor(hostVar, stylesList, doc);
+      if (resolved) return resolved;
+    }
+    return null;
+  }
+
+  for (const styles of stylesList) {
+    for (const hostVar of hostVars) {
+      const value = readCssVariable(styles, hostVar);
+      if (value) return value;
+    }
+  }
+  return null;
+}
+
+/** Raw CSS variable read (lengths, fonts, etc.) — never runs the color pipeline. */
+function readFirstHostTokenRaw(
+  stylesList: CSSStyleDeclaration[],
+  hostVars: string[],
+): string | null {
   for (const styles of stylesList) {
     for (const hostVar of hostVars) {
       const value = readCssVariable(styles, hostVar);
@@ -137,7 +271,15 @@ function readReferenceSurface(reference: Element): Partial<Record<string, string
 function normalizeRadius(raw: string): string | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
+  // Guard: color pipeline must never feed radius (e.g. `rgb(0,0,0)` → square corners).
+  if (
+    /^(#|rgba?\(|hsla?\(|lab\(|oklch\(|oklab\(|color\()/i.test(trimmed) ||
+    /^[a-z]+$/i.test(trimmed)
+  ) {
+    return null;
+  }
   if (/^\d+(\.\d+)?$/.test(trimmed)) return `${trimmed}px`;
+  if (/^\d+(\.\d+)?(px|rem|em|%)$/i.test(trimmed)) return trimmed;
   return trimmed;
 }
 
@@ -234,11 +376,16 @@ export function resolveHostFaqTheme(options: ResolveHostFaqThemeOptions = {}): H
     }
   }
 
+  // Reference last: theme tokens live on :root; reference is for painted surface only.
   if (referenceElement) {
-    styleSources.unshift(window.getComputedStyle(referenceElement));
+    styleSources.push(window.getComputedStyle(referenceElement));
   }
 
   const cssVars: Record<string, string> = { ...fallback };
+  // Do not inline-seed accent: CSS uses `var(--td-primary-color)` until host `--primary` maps.
+  for (const key of DEFERRED_ACCENT_VARS) {
+    delete cssVars[key];
+  }
   let mappedTokenCount = 0;
 
   if (referenceElement) {
@@ -251,9 +398,18 @@ export function resolveHostFaqTheme(options: ResolveHostFaqThemeOptions = {}): H
   }
 
   for (const mapping of HOST_FAQ_TOKEN_MAPPINGS) {
-    const value = readFirstHostToken(styleSources, mapping.hostVars);
+    const value = readFirstHostToken(styleSources, mapping.hostVars, doc);
     if (!value) continue;
     if (assignMappedHostColor(cssVars, mapping.faqVar, value, fallback)) {
+      mappedTokenCount += 1;
+    }
+  }
+
+  // Demo-critical: if CSS vars were late/unread, sample a painted primary control.
+  if (!cssVars['--td-faq-accent']) {
+    const sampledPrimary = sampleHostPrimaryFromDom(doc);
+    if (sampledPrimary) {
+      cssVars['--td-faq-accent'] = sampledPrimary;
       mappedTokenCount += 1;
     }
   }
@@ -271,7 +427,7 @@ export function resolveHostFaqTheme(options: ResolveHostFaqThemeOptions = {}): H
     mappedTokenCount += 1;
   }
 
-  const radius = readFirstHostToken(styleSources, ['--radius', '--border-radius']);
+  const radius = readFirstHostTokenRaw(styleSources, ['--radius', '--border-radius']);
   const normalizedRadius = radius ? normalizeRadius(radius) : null;
   if (normalizedRadius) {
     cssVars['--td-faq-radius'] = normalizedRadius;
@@ -290,6 +446,9 @@ export function resolveHostFaqTheme(options: ResolveHostFaqThemeOptions = {}): H
       appearance = surfaceAppearance;
       const surfaceFallback = appearance === 'light' ? LIGHT_FALLBACK : DARK_FALLBACK;
       for (const [key, value] of Object.entries(surfaceFallback)) {
+        if (DEFERRED_ACCENT_VARS.includes(key as (typeof DEFERRED_ACCENT_VARS)[number])) {
+          continue;
+        }
         if (cssVars[key] == null || cssVars[key] === previousFallback[key]) {
           cssVars[key] = value;
         }
@@ -300,12 +459,28 @@ export function resolveHostFaqTheme(options: ResolveHostFaqThemeOptions = {}): H
   cssVars['--td-faq-backdrop'] = deriveBackdrop(surfaceBackground, appearance);
   cssVars['--td-faq-shadow'] = deriveShadow(appearance);
 
+  // If host never mapped accent, seed from fallback so contrast helpers still run.
+  if (!cssVars['--td-faq-accent']) {
+    cssVars['--td-faq-accent'] = fallback['--td-faq-accent'];
+  }
+  if (!cssVars['--td-faq-accent-text']) {
+    cssVars['--td-faq-accent-text'] = fallback['--td-faq-accent-text'];
+  }
+
   cssVars['--td-faq-accent-text'] = resolveAccentForeground(
     cssVars['--td-faq-accent'],
     cssVars['--td-faq-accent-text'],
   );
 
+  // Keep tour chrome + help accent in sync (overrides SDK default teal/orange).
+  if (cssVars['--td-faq-accent']) {
+    cssVars['--td-primary-color'] = cssVars['--td-faq-accent'];
+  }
+
   // Pale chips (Guides / Support): prefer host accent icon color when contrast is OK.
+  if (!cssVars['--td-faq-chip-bg']) {
+    cssVars['--td-faq-chip-bg'] = fallback['--td-faq-chip-bg'];
+  }
   const chipFallbackText = pickReadableTextColor(cssVars['--td-faq-chip-bg'], {
     lightText: '#ffffff',
     darkText: cssVars['--td-faq-title'] ?? (appearance === 'light' ? LIGHT_FALLBACK : DARK_FALLBACK)['--td-faq-title'],
@@ -317,6 +492,10 @@ export function resolveHostFaqTheme(options: ResolveHostFaqThemeOptions = {}): H
     if (chipRgb && accentRgb && contrastRatio(chipRgb, accentRgb) >= 3) {
       cssVars['--td-faq-chip-text'] = cssVars['--td-faq-accent'];
     }
+  }
+
+  if (!cssVars['--td-faq-border-accent']) {
+    cssVars['--td-faq-border-accent'] = fallback['--td-faq-border-accent'];
   }
 
   return {

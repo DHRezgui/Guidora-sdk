@@ -82,6 +82,33 @@ describe('host-faq-theme', () => {
     expect(snapshot.mappedTokenCount).toBeGreaterThan(5);
   });
 
+  it('maps host --radius lengths without running the color pipeline', () => {
+    const doc = installHostThemeMock({
+      '--background': '#FAFBFC',
+      '--foreground': '#0F172A',
+      '--primary': '#0066FF',
+      '--primary-foreground': '#FFFFFF',
+      '--radius': '1rem',
+      '--card': '#FFFFFF',
+    });
+
+    const snapshot = resolveHostFaqTheme({ root: doc });
+    expect(snapshot.cssVars['--td-faq-radius']).toBe('1rem');
+  });
+
+  it('ignores non-length values for --td-faq-radius', () => {
+    const doc = installHostThemeMock({
+      '--background': '#FAFBFC',
+      '--foreground': '#0F172A',
+      '--primary': '#0066FF',
+      '--radius': 'rgb(0, 0, 0)',
+      '--card': '#FFFFFF',
+    });
+
+    const snapshot = resolveHostFaqTheme({ root: doc });
+    expect(snapshot.cssVars['--td-faq-radius']).toBeUndefined();
+  });
+
   it('normalizes shadcn hsl token components into valid FAQ surface colors', () => {
     const doc = installHostThemeMock({
       '--background': '0 0% 100%',

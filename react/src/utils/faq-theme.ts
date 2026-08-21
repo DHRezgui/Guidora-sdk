@@ -125,6 +125,49 @@ function parseHexColor(value: string): [number, number, number] | null {
   return null;
 }
 
+/** CSS Color 4: L is 0–1 or %, C is number or % (100% = 0.4), H is degrees. */
+function parseOklchChannel(raw: string, percentIsHundred: boolean): number {
+  if (raw.endsWith('%')) {
+    const pct = Number.parseFloat(raw);
+    return percentIsHundred ? pct / 100 : (pct / 100) * 0.4;
+  }
+  return Number.parseFloat(raw);
+}
+
+function parseCssAlpha(raw: string | undefined): number {
+  if (raw == null) return 1;
+  if (raw.endsWith('%')) return Number.parseFloat(raw) / 100;
+  return Number.parseFloat(raw);
+}
+
+/** OKLCH → sRGB (CSS Color 4 / Björn Ottosson). */
+function oklchToRgb(L: number, C: number, H: number): [number, number, number] {
+  const hRad = (H * Math.PI) / 180;
+  const a = C * Math.cos(hRad);
+  const b = C * Math.sin(hRad);
+
+  const l_ = L + 0.3963377774 * a + 0.2158037573 * b;
+  const m_ = L - 0.1055613458 * a - 0.0638541728 * b;
+  const s_ = L - 0.0894841775 * a - 1.291485548 * b;
+
+  const l = l_ * l_ * l_;
+  const m = m_ * m_ * m_;
+  const s = s_ * s_ * s_;
+
+  const rLin = 4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s;
+  const gLin = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
+  const bLin = -0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s;
+
+  const toSrgb8 = (channel: number): number => {
+    const clipped = Math.min(Math.max(channel, 0), 1);
+    const encoded =
+      clipped <= 0.0031308 ? 12.92 * clipped : 1.055 * clipped ** (1 / 2.4) - 0.055;
+    return Math.round(Math.min(Math.max(encoded, 0), 1) * 255);
+  };
+
+  return [toSrgb8(rLin), toSrgb8(gLin), toSrgb8(bLin)];
+}
+
 export function parseCssColorToRgb(color: string): [number, number, number] | null {
   const trimmed = color.trim().toLowerCase();
   if (!trimmed || trimmed === 'transparent') return null;
@@ -153,17 +196,80 @@ export function parseCssColorToRgb(color: string): [number, number, number] | nu
     );
   }
 
+  // Tailwind v4 / shadcn: oklch(0.42 0.15 155) or oklch(42% 0.15 155 / 0.9)
+  const oklchMatch = trimmed.match(
+    /^oklch\(\s*([+-]?[\d.]+%?)\s+([+-]?[\d.]+%?)\s+([+-]?[\d.]+)(?:deg)?(?:\s*\/\s*([+-]?[\d.]+%?))?\s*\)$/,
+  );
+  if (oklchMatch) {
+    const alpha = parseCssAlpha(oklchMatch[4]);
+    if (alpha <= 0.04) return null;
+    const L = parseOklchChannel(oklchMatch[1], true);
+    const C = parseOklchChannel(oklchMatch[2], false);
+    const H = Number.parseFloat(oklchMatch[3]);
+    if (![L, C, H].every((n) => Number.isFinite(n))) return null;
+    return oklchToRgb(L, C, H);
+  }
+
+  // Chrome often serializes theme tokens as lab()/oklab()/color() — resolve via canvas.
+  if (
+    typeof document !== 'undefined' &&
+    /^(lab|oklab|oklch|color)\(/i.test(trimmed)
+  ) {
+    const fromCanvas = resolveCssColorViaCanvas(color.trim());
+    if (fromCanvas) return fromCanvas;
+  }
+
+  return null;
+}
+
+/**
+ * Browser-only: rasterize any CSS color (incl. Chrome `lab()` / `oklch()` /
+ * `color()`) to sRGB. Reading `fillStyle` is not enough — Chrome often keeps
+ * the `lab(...)` serialization; `getImageData` yields the painted RGB.
+ */
+function resolveCssColorViaCanvas(color: string): [number, number, number] | null {
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = 1;
+    canvas.height = 1;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return null;
+    ctx.clearRect(0, 0, 1, 1);
+    ctx.fillStyle = '#000000';
+    ctx.fillStyle = color;
+    ctx.fillRect(0, 0, 1, 1);
+    const data = ctx.getImageData(0, 0, 1, 1).data;
+    const alpha = data[3] / 255;
+    if (alpha <= 0.04) return null;
+    return [data[0], data[1], data[2]];
+  } catch {
+    // canvas / color unsupported
+  }
   return null;
 }
 
 const SHADCN_HSL_COMPONENTS = /^(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?%)\s+(\d+(?:\.\d+)?%)$/;
 
-/** Normalizes host tokens (e.g. shadcn `0 0% 100%`) into valid CSS colors. */
+/**
+ * Normalizes host tokens (e.g. shadcn `0 0% 100%`, Tailwind `oklch(...)`, Chrome `lab(...)`) into valid CSS colors.
+ * Wide-gamut forms are converted to `rgb()` so FAQ `color-mix(in srgb, …)` and contrast helpers stay reliable.
+ */
 export function normalizeHostColorToken(value: string): string | null {
   const trimmed = value.trim();
   if (!trimmed) return null;
-  if (/^(#|rgb|hsl|oklch|lab|color\()/i.test(trimmed)) return trimmed;
-  if (SHADCN_HSL_COMPONENTS.test(trimmed)) return `hsl(${trimmed})`;
+
+  if (SHADCN_HSL_COMPONENTS.test(trimmed)) {
+    return `hsl(${trimmed})`;
+  }
+
+  if (/^(oklch|lab|oklab|color)\(/i.test(trimmed)) {
+    const rgb = parseCssColorToRgb(trimmed);
+    if (rgb) {
+      return `rgb(${Math.round(rgb[0])}, ${Math.round(rgb[1])}, ${Math.round(rgb[2])})`;
+    }
+  }
+
+  if (/^(#|rgb|hsl|oklch|lab|oklab|color\()/i.test(trimmed)) return trimmed;
   return trimmed;
 }
 
